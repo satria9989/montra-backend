@@ -12,6 +12,8 @@ from data import get_ticker, get_ohlcv, get_multi_tickers
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
 
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,6 +26,9 @@ app.add_middleware(
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ================= BASIC =================
+@app.get("/")
+def root():
+    return {"status": "MONTRA backend running 🚀"}
 
 @app.get("/")
 def home():
