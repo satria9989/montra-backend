@@ -1,4 +1,6 @@
 import os
+import requests
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -6,6 +8,7 @@ load_dotenv()
 from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from binance.client import Client
 
 from data import get_ticker, get_ohlcv, get_multi_tickers
 
@@ -24,6 +27,22 @@ app.add_middleware(
 
 # 🔥 OPENAI CLIENT
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+binance = Client(
+    os.getenv("BINANCE_API_KEY"),
+    os.getenv("BINANCE_SECRET")
+)
+
+def send_telegram(msg: str):
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": msg
+    })
 
 # ================= BASIC =================
 @app.get("/")
@@ -122,3 +141,41 @@ Confidence: XX%
             "result": "NO TRADE\nConfidence: 0%",
             "error": str(e),
         }
+
+@app.post("/notify")
+def notify(payload: dict = Body(...)):
+    try:
+        msg = payload.get("text", "")
+        send_telegram(msg)
+        return {"status": "sent"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/notify-image")
+def notify_image(payload: dict = Body(...)):
+    try:
+        text = payload.get("text", "")
+        image = payload.get("image", "")
+
+        token = os.getenv("TELEGRAM_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+        img_data = base64.b64decode(image.split(",")[1])
+
+        files = {
+            "photo": ("chart.png", img_data)
+        }
+
+        data = {
+            "chat_id": chat_id,
+            "caption": text
+        }
+
+        requests.post(url, files=files, data=data)
+
+        return {"status": "sent"}
+
+    except Exception as e:
+        return {"error": str(e)}
