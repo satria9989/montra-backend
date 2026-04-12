@@ -9,6 +9,7 @@ from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from binance.client import Client
+from binance.enums import *  # ✅ 1 — IMPORT BINANCE ENUM
 
 from data import get_ticker, get_ohlcv, get_multi_tickers
 
@@ -43,6 +44,56 @@ def send_telegram(msg: str):
         "chat_id": chat_id,
         "text": msg
     })
+
+# ✅ 2 — FUNCTION EXECUTE ORDER
+def place_futures_order(symbol, side, quantity, sl, tp):
+    try:
+        order = binance.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+
+        # SL
+        binance.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=sl,
+            closePosition=True
+        )
+
+        # TP
+        binance.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
+            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=tp,
+            closePosition=True
+        )
+
+        return {"status": "FILLED", "order": order}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# ✅ 4 — SPLIT TP (OPSIONAL PRO)
+def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
+    side_close = SIDE_SELL if side == "BUY" else SIDE_BUY
+
+    q1 = round(quantity * 0.4, 3)
+    q2 = round(quantity * 0.3, 3)
+    q3 = round(quantity * 0.3, 3)
+
+    for tp, q in [(tp1, q1), (tp2, q2), (tp3, q3)]:
+        binance.futures_create_order(
+            symbol=symbol,
+            side=side_close,
+            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=tp,
+            quantity=q
+        )
 
 # ================= BASIC =================
 @app.get("/")
@@ -180,10 +231,54 @@ def notify_image(payload: dict = Body(...)):
     except Exception as e:
         return {"error": str(e)}
 
-# ================= TRADE EXECUTION =================
-
+# ✅ 3 — UPGRADE ENDPOINT /trade
 @app.post("/trade")
 def trade(payload: dict = Body(...)):
-    # DISINI nanti bisa connect ke Binance API
-    print("EXECUTE:", payload)
-    return {"status": "ok"}
+    try:
+        symbol = payload.get("symbol")
+        side = payload.get("type")
+        entry = float(payload.get("entry"))
+        sl = float(payload.get("sl"))
+        tp = float(payload.get("tp"))
+        risk_percent = float(payload.get("risk", 1))
+
+        # BALANCE
+        balance_info = binance.futures_account_balance()
+        usdt_balance = next(
+            (b for b in balance_info if b["asset"] == "USDT"), None
+        )
+
+        balance = float(usdt_balance["balance"]) if usdt_balance else 0
+
+        # POSITION SIZE
+        risk_amount = balance * (risk_percent / 100)
+        stop_distance = abs(entry - sl)
+
+        quantity = round(risk_amount / stop_distance, 3)
+
+        result = place_futures_order(symbol, side, quantity, sl, tp)
+
+        send_telegram(f"""
+🚀 TRADE EXECUTED
+{symbol} {side}
+Qty: {quantity}
+SL: {sl}
+TP: {tp}
+""")
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# ✅ 5 — TRAILING BACKEND (BASIC)
+import time
+
+def monitor_position(symbol, entry, side):
+    while True:
+        try:
+            pos = binance.futures_position_information(symbol=symbol)
+            print("Monitoring...", pos)
+            time.sleep(5)
+        except:
+            break
