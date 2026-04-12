@@ -179,3 +179,11 @@ def notify_image(payload: dict = Body(...)):
 
     except Exception as e:
         return {"error": str(e)}
+
+# ================= TRADE EXECUTION =================
+
+@app.post("/trade")
+def trade(payload: dict = Body(...)):
+    # DISINI nanti bisa connect ke Binance API
+    print("EXECUTE:", payload)
+    return {"status": "ok"}
