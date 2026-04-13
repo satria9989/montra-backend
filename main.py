@@ -9,14 +9,12 @@ from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from binance.client import Client
-from binance.enums import *  # ✅ 1 — IMPORT BINANCE ENUM
+from binance.enums import *
 
 from data import get_ticker, get_ohlcv, get_multi_tickers
 
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
-
-app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +43,6 @@ def send_telegram(msg: str):
         "text": msg
     })
 
-# ✅ 2 — FUNCTION EXECUTE ORDER
 def place_futures_order(symbol, side, quantity, sl, tp):
     try:
         order = binance.futures_create_order(
@@ -78,7 +75,6 @@ def place_futures_order(symbol, side, quantity, sl, tp):
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ 4 — SPLIT TP (OPSIONAL PRO)
 def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
     side_close = SIDE_SELL if side == "BUY" else SIDE_BUY
 
@@ -95,12 +91,24 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
             quantity=q
         )
 
+def update_stop_loss(symbol, side, new_sl):
+    try:
+        binance.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=new_sl,
+            closePosition=True
+        )
+    except Exception as e:
+        print("SL update error:", e)
+
 # ================= BASIC =================
 @app.get("/")
 def root():
     return {"status": "MONTRA backend running 🚀"}
 
-@app.get("/")
+@app.get("/home")
 def home():
     return {"message": "MONTRA BACKEND RUNNING 🔥"}
 
@@ -231,7 +239,6 @@ def notify_image(payload: dict = Body(...)):
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ 3 — UPGRADE ENDPOINT /trade
 @app.post("/trade")
 def trade(payload: dict = Body(...)):
     try:
@@ -271,14 +278,69 @@ TP: {tp}
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ 5 — TRAILING BACKEND (BASIC)
-import time
+# ✅ 1 — GET POSISI REAL
+@app.get("/positions")
+def get_positions():
+    try:
+        positions = binance.futures_position_information()
 
-def monitor_position(symbol, entry, side):
+        active = []
+        for p in positions:
+            amt = float(p["positionAmt"])
+            if amt != 0:
+                active.append({
+                    "symbol": p["symbol"],
+                    "side": "BUY" if amt > 0 else "SELL",
+                    "entry": float(p["entryPrice"]),
+                    "size": abs(amt),
+                    "unrealized": float(p["unRealizedProfit"])
+                })
+
+        return {"positions": active}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# ✅ 3 — TRAILING SMART ENGINE
+def smart_trailing():
+    import time
+
     while True:
         try:
-            pos = binance.futures_position_information(symbol=symbol)
-            print("Monitoring...", pos)
+            positions = binance.futures_position_information()
+
+            for p in positions:
+                amt = float(p["positionAmt"])
+                if amt == 0:
+                    continue
+
+                symbol = p["symbol"]
+                entry = float(p["entryPrice"])
+                price = float(p["markPrice"])
+                side = "BUY" if amt > 0 else "SELL"
+
+                move = abs(price - entry)
+
+                # 🎯 BREAK EVEN
+                if move > entry * 0.003:
+                    update_stop_loss(symbol, side, entry)
+
+                # 🎯 TRAILING PROFIT
+                if move > entry * 0.006:
+                    if side == "BUY":
+                        new_sl = price - (move * 0.3)
+                    else:
+                        new_sl = price + (move * 0.3)
+
+                    update_stop_loss(symbol, side, new_sl)
+
             time.sleep(5)
-        except:
-            break
+
+        except Exception as e:
+            print("Trailing error:", e)
+            time.sleep(5)
+
+# ✅ 4 — TRAILING ENGINE (jalankan di background)
+import threading
+
+threading.Thread(target=smart_trailing, daemon=True).start()
