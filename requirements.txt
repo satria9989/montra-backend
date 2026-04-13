@@ -6,14 +6,12 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
 attrs==26.1.0
-ccxt==4.5.46
 certifi==2026.2.25
 cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.3.2
 coincurve==21.0.0
 colorama==0.4.6
-cryptography==46.0.6
 dateparser==1.4.0
 distro==1.9.0
 fastapi==0.135.3
@@ -24,9 +22,7 @@ httpx==0.28.1
 idna==3.11
 jiter==0.13.0
 multidict==6.7.1
-numpy==2.4.4
 openai==2.30.0
-pandas==3.0.2
 propcache==0.4.1
 pycares==5.0.1
 pycparser==3.0
