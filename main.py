@@ -348,6 +348,25 @@ def root():
 def home():
     return {"message": "MONTRA BACKEND RUNNING 🔥"}
 
+@app.get("/trend/{symbol}")
+def get_trend(symbol: str):
+    try:
+        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=50)
+        closes = [float(k[4]) for k in klines]
+
+        # simple trend logic
+        if closes[-1] > closes[0]:
+            trend = "BULLISH"
+        elif closes[-1] < closes[0]:
+            trend = "BEARISH"
+        else:
+            trend = "SIDEWAYS"
+
+        return {"symbol": symbol, "trend": trend}
+
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/symbols")
 def symbols():
     return {
