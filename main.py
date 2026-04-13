@@ -5,6 +5,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+AUTO_MODE = True
+SCAN_INTERVAL = 15  # detik
+MIN_SCORE = 80
+
 from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
@@ -102,6 +106,19 @@ def update_stop_loss(symbol, side, new_sl):
         )
     except Exception as e:
         print("SL update error:", e)
+
+def adjust_precision(symbol, qty, price):
+    info = binance.futures_exchange_info()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            step = float(next(f["stepSize"] for f in s["filters"] if f["filterType"] == "LOT_SIZE"))
+            tick = float(next(f["tickSize"] for f in s["filters"] if f["filterType"] == "PRICE_FILTER"))
+            # adjust qty
+            qty = round(qty / step) * step
+            # adjust price
+            price = round(price / tick) * tick
+            return qty, price
+    return qty, price
 
 # ================= BASIC =================
 @app.get("/")
@@ -278,7 +295,6 @@ TP: {tp}
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ 1 — GET POSISI REAL
 @app.get("/positions")
 def get_positions():
     try:
@@ -301,7 +317,24 @@ def get_positions():
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ 3 — TRAILING SMART ENGINE
+# ✅ POSITION DETAIL + TRADES (new endpoint)
+@app.get("/position-detail/{symbol}")
+def position_detail(symbol: str):
+    try:
+        positions = binance.futures_position_information(symbol=symbol)
+        trades = binance.futures_account_trades(symbol=symbol)
+
+        # Cari posisi yang sedang aktif (positionAmt != 0)
+        pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
+
+        return {
+            "position": pos,
+            "trades": trades[-50:]  # ambil 50 transaksi terakhir
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
 def smart_trailing():
     import time
 
@@ -340,7 +373,90 @@ def smart_trailing():
             print("Trailing error:", e)
             time.sleep(5)
 
-# ✅ 4 — TRAILING ENGINE (jalankan di background)
+def auto_trader():
+    while True:
+        try:
+            if not AUTO_MODE:
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # 🔥 contoh pair (bisa expand)
+            pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+            for symbol in pairs:
+                try:
+                    # ambil data
+                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    closes = [float(c[4]) for c in ohlcv]
+                    last_price = closes[-1]
+
+                    # 🧠 dummy signal (sementara, nanti bisa connect logic lo)
+                    signal = {
+                        "symbol": symbol,
+                        "type": "BUY" if closes[-1] > closes[-2] else "SELL",
+                        "entry": last_price,
+                        "sl": last_price * 0.995,
+                        "tp": last_price * 1.01,
+                        "score": 85
+                    }
+
+                    # 🎯 filter
+                    if signal["score"] < MIN_SCORE:
+                        continue
+
+                    # 4 — LIMIT DUPLICATE TRADE
+                    positions = binance.futures_position_information(symbol=symbol)
+                    pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
+                    if pos:
+                        continue  # skip kalau sudah ada posisi
+
+                    # 5 — RISK SIMPLE + MIN NOTIONAL + PRECISION FIX
+                    balance_info = binance.futures_account_balance()
+                    usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
+                    balance = float(usdt["balance"]) if usdt else 0
+
+                    price = signal["entry"]
+                    risk_amount = balance * 0.01
+                    stop_distance = abs(signal["entry"] - signal["sl"])
+                    qty = risk_amount / stop_distance
+
+                    # 🔥 pastikan minimal $100
+                    notional = qty * price
+                    if notional < 100:
+                        qty = 100 / price
+
+                    # precision fix
+                    qty, price = adjust_precision(symbol, qty, price)
+
+                    # 🚀 execute
+                    result = place_futures_order(
+                        symbol=signal["symbol"],
+                        side=signal["type"],
+                        quantity=qty,
+                        sl=signal["sl"],
+                        tp=signal["tp"]
+                    )
+
+                    send_telegram(f"""
+🤖 AUTO TRADE
+{symbol} {signal['type']}
+Score: {signal['score']}
+""")
+                    print("AUTO EXEC:", result)
+
+                except Exception as e:
+                    print("Pair error:", symbol, e)
+
+        except Exception as e:
+            print("AUTO LOOP ERROR:", e)
+
+        time.sleep(SCAN_INTERVAL)
+
+# Jalankan trailing engine di background
 import threading
 
 threading.Thread(target=smart_trailing, daemon=True).start()
+
+# 3 — JALANKAN AUTO BOT
+if AUTO_MODE:
+    threading.Thread(target=auto_trader, daemon=True).start()
