@@ -288,7 +288,23 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
 def update_stop_loss(symbol, side, new_sl):
     try:
         new_sl = normalize_price(symbol, new_sl)
+        
+        current_price = float(binance.futures_symbol_ticker(symbol=symbol)["price"])
+        
+        if side == "BUY" and new_sl >= current_price:
+            return
 
+        if side == "SELL" and new_sl <= current_price:
+            return
+            
+        buffer = current_price * 0.001  # 0.1%
+        
+        if side == "BUY" and new_sl >= current_price - buffer:
+            return
+        
+        if side == "SELL" and new_sl <= current_price + buffer:
+            return
+    
         last = LAST_STOP_PRICE.get(symbol)
         tick = EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0)
 
