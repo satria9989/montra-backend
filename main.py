@@ -72,6 +72,17 @@ print("🔥 ACTIVE ACCOUNTS:", len(CLIENTS))
 
 ACCOUNT_PROFIT = {}
 
+# ===== SAFETY =====
+KILL_SWITCH = False
+
+START_EQUITY = None
+MAX_DRAWDOWN_PCT = 10   # stop kalau -10%
+
+DAILY_START_EQUITY = None
+DAILY_LOSS_PCT = 3      # stop kalau -3% harian
+
+LAST_DAY = None
+
 EXCHANGE_CACHE = {}
 LAST_STOP_PRICE = {}
 
@@ -339,6 +350,76 @@ def update_stop_loss(symbol, side, new_sl):
     except Exception as e:
         print("SL update error:", e)
 
+# ================= TOTAL EQUITY & SAFETY =================
+def get_total_equity():
+    total = 0
+    for acc in CLIENTS:
+        try:
+            c = acc["client"]
+            balance_info = c.futures_account_balance()
+            usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
+
+            balance = float(usdt["balance"]) if usdt else 0
+            unreal = float(usdt["crossUnPnl"]) if usdt else 0
+
+            total += (balance + unreal)
+        except:
+            pass
+    return total
+
+def safety_check():
+    global KILL_SWITCH, DAILY_START_EQUITY, LAST_DAY
+
+    now_day = time.strftime("%Y-%m-%d")
+
+    eq = get_total_equity()
+
+    # reset harian
+    if now_day != LAST_DAY:
+        DAILY_START_EQUITY = eq
+        LAST_DAY = now_day
+        print("🌅 RESET DAILY EQUITY:", eq)
+
+    # drawdown total
+    dd = ((START_EQUITY - eq) / START_EQUITY) * 100
+
+    if dd >= MAX_DRAWDOWN_PCT:
+        KILL_SWITCH = True
+        send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
+        return False
+
+    # loss harian
+    daily_loss = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
+
+    if daily_loss >= DAILY_LOSS_PCT:
+        KILL_SWITCH = True
+        send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss:.2f}% → BOT STOP")
+        return False
+
+    return True
+
+def check_telegram_commands():
+    token = os.getenv("TELEGRAM_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+
+    try:
+        res = requests.get(url).json()
+
+        for u in res.get("result", []):
+            text = u.get("message", {}).get("text", "")
+
+            if "/stop" in text:
+                global KILL_SWITCH
+                KILL_SWITCH = True
+                send_telegram("🛑 BOT STOPPED via Telegram")
+
+            if "/start" in text:
+                KILL_SWITCH = False
+                send_telegram("🚀 BOT RESUMED via Telegram")
+
+    except:
+        pass
+
 # ================= BASIC =================
 @app.get("/")
 def root():
@@ -600,6 +681,16 @@ def get_accounts():
             })
     return {"accounts": data}
 
+# ================= REMOTE CONTROL =================
+@app.post("/kill-switch")
+def kill_switch(payload: dict = Body(...)):
+    global KILL_SWITCH
+
+    state = payload.get("state", True)
+    KILL_SWITCH = state
+
+    return {"kill_switch": KILL_SWITCH}
+
 def smart_trailing():
     while True:
         try:
@@ -648,6 +739,17 @@ def smart_trailing():
 def auto_trader():
     while True:
         try:
+            check_telegram_commands()
+
+            if KILL_SWITCH:
+                print("🛑 KILL SWITCH ACTIVE")
+                time.sleep(5)
+                continue
+
+            if not safety_check():
+                time.sleep(10)
+                continue
+
             if not AUTO_MODE:
                 time.sleep(SCAN_INTERVAL)
                 continue
@@ -729,12 +831,19 @@ def start_bot():
         time.sleep(3)
 
 def start_background_tasks():
-    global _bot_started
+    global _bot_started, START_EQUITY, DAILY_START_EQUITY, LAST_DAY
     if _bot_started:
         return
     _bot_started = True
     if AUTO_MODE:
         load_exchange_cache()
+        
+        eq = get_total_equity()
+        START_EQUITY = eq
+        DAILY_START_EQUITY = eq
+        LAST_DAY = time.strftime("%Y-%m-%d")
+        print("🧠 START EQUITY:", eq)
+        
         threading.Thread(target=smart_trailing, daemon=True).start()
         threading.Thread(target=start_bot, daemon=True).start()
 
