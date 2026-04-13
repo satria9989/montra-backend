@@ -1,0 +1,4 @@
+.env
+__pycache__
+data.cpython-311.pyc
+main.cpython-311.pyc
