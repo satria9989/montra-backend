@@ -1,13 +1,37 @@
 import os
+import time
+import threading
 import requests
 import base64
 from dotenv import load_dotenv
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 load_dotenv()
 
 AUTO_MODE = True
 SCAN_INTERVAL = 15  # detik
 MIN_SCORE = 80
+
+ACCOUNTS = [
+    {
+        "name": "MAIN",
+        "api_key": os.getenv("BINANCE_API_KEY"),
+        "secret": os.getenv("BINANCE_SECRET"),
+        "risk": 0.01,
+        "compound": True,
+        "withdraw_threshold": 50,   # $ profit
+        "withdraw_ratio": 0.3       # 30% ditarik
+    },
+    {
+        "name": "SECOND",
+        "api_key": os.getenv("BINANCE_API_KEY_2"),
+        "secret": os.getenv("BINANCE_SECRET_2"),
+        "risk": 0.02,
+        "compound": True,
+        "withdraw_threshold": 50,
+        "withdraw_ratio": 0.3
+    }
+]
 
 from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +60,69 @@ binance = Client(
     os.getenv("BINANCE_SECRET")
 )
 
+CLIENTS = []
+for acc in ACCOUNTS:
+    if acc["api_key"] and acc["secret"]:
+        CLIENTS.append({
+            "name": acc["name"],
+            "client": Client(acc["api_key"], acc["secret"]),
+            "risk": acc["risk"]
+        })
+print("🔥 ACTIVE ACCOUNTS:", len(CLIENTS))
+
+ACCOUNT_PROFIT = {}
+
+EXCHANGE_CACHE = {}
+LAST_STOP_PRICE = {}
+
+def floor_to_step(value, step):
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    return float((d / s).to_integral_value(rounding=ROUND_DOWN) * s)
+
+def ceil_to_step(value, step):
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    return float((d / s).to_integral_value(rounding=ROUND_UP) * s)
+
+def normalize_price(symbol, price):
+    f = EXCHANGE_CACHE.get(symbol)
+    if not f:
+        return price
+    tick = f["tickSize"]
+    return floor_to_step(price, tick)
+
+def load_exchange_cache():
+    global EXCHANGE_CACHE
+    info = binance.futures_exchange_info()
+    for s in info["symbols"]:
+        symbol = s["symbol"]
+        lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
+        price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
+        EXCHANGE_CACHE[symbol] = {
+            "stepSize": float(lot["stepSize"]),
+            "minQty": float(lot["minQty"]),
+            "tickSize": float(price["tickSize"]),
+        }
+    print("✅ Exchange cache loaded:", len(EXCHANGE_CACHE))
+
+def adjust_precision(symbol, qty, price):
+    f = EXCHANGE_CACHE.get(symbol)
+    if not f:
+        return qty, price
+
+    step = f["stepSize"]
+    min_qty = f["minQty"]
+    tick = f["tickSize"]
+
+    qty = floor_to_step(qty, step)
+    if qty < min_qty:
+        qty = min_qty
+    qty = floor_to_step(qty, step)
+
+    price = floor_to_step(price, tick)
+    return qty, price
+
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -47,8 +134,35 @@ def send_telegram(msg: str):
         "text": msg
     })
 
+def cancel_existing_orders(symbol):
+    try:
+        orders = binance.futures_get_open_orders(symbol=symbol)
+
+        for o in orders:
+            if o["type"] in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
+                try:
+                    binance.futures_cancel_order(
+                        symbol=symbol,
+                        orderId=o["orderId"]
+                    )
+                except Exception as e:
+                    print("Cancel single order error:", e)
+
+        time.sleep(1.0)
+        return True
+
+    except Exception as e:
+        print("Cancel error:", e)
+        return False
+
 def place_futures_order(symbol, side, quantity, sl, tp):
     try:
+        sl = normalize_price(symbol, sl)
+        tp = normalize_price(symbol, tp)
+
+        cancel_existing_orders(symbol)
+        time.sleep(1.0)
+
         order = binance.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY if side == "BUY" else SIDE_SELL,
@@ -56,28 +170,104 @@ def place_futures_order(symbol, side, quantity, sl, tp):
             quantity=quantity
         )
 
-        # SL
+        time.sleep(0.3)
+
         binance.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
             type=FUTURE_ORDER_TYPE_STOP_MARKET,
             stopPrice=sl,
-            closePosition=True
+            closePosition=True,
+            workingType="MARK_PRICE"
         )
 
-        # TP
         binance.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
             stopPrice=tp,
-            closePosition=True
+            closePosition=True,
+            workingType="MARK_PRICE"
         )
 
         return {"status": "FILLED", "order": order}
 
     except Exception as e:
         return {"error": str(e)}
+
+def update_account_profit(client, name):
+    try:
+        balance_info = client.futures_account_balance()
+        usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
+        unrealized = float(usdt["crossUnPnl"]) if usdt else 0
+        ACCOUNT_PROFIT[name] = unrealized
+    except Exception as e:
+        print("Profit error:", name, e)
+
+def check_withdraw(acc, client):
+    name = acc["name"]
+    profit = ACCOUNT_PROFIT.get(name, 0)
+    threshold = acc.get("withdraw_threshold", 100)
+    ratio = acc.get("withdraw_ratio", 0.3)
+    if profit >= threshold:
+        amount = profit * ratio
+        print(f"💸 WITHDRAW SIMULASI: {name} ${amount:.2f}")
+        send_telegram(f"""
+💸 WITHDRAW TRIGGER
+{name}
+Profit: {profit:.2f}
+Withdraw: {amount:.2f}
+""")
+        ACCOUNT_PROFIT[name] = 0  # reset setelah withdraw
+
+def place_order_multi(symbol, side, sl, tp):
+    results = []
+    for acc in CLIENTS:
+        try:
+            c = acc["client"]
+            base_risk = acc["risk"]
+            profit = ACCOUNT_PROFIT.get(acc["name"], 0)
+            # 🔥 compounding
+            if acc.get("compound") and profit > 0:
+                risk_pct = base_risk + (profit / 1000)  # scaling pelan
+            else:
+                risk_pct = base_risk
+            # balance
+            balance_info = c.futures_account_balance()
+            usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
+            balance = float(usdt["balance"]) if usdt else 0
+            risk_amount = balance * risk_pct
+            price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
+            stop_distance = abs(price - sl)
+
+            if stop_distance == 0:
+                continue
+
+            qty = risk_amount / stop_distance
+
+            # minimal notional
+            if qty * price < 100:
+                qty = ceil_to_step(100 / price, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+
+            qty, price = adjust_precision(symbol, qty, price)
+
+            # validasi final
+            if qty * price < 100:
+                print("❌ SKIP NOTIONAL < 100", symbol)
+                continue
+
+            order = c.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY if side == "BUY" else SIDE_SELL,
+                type=FUTURE_ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+            results.append({"account": acc["name"], "status": "OK"})
+            update_account_profit(c, acc["name"])
+            check_withdraw(acc, c)
+        except Exception as e:
+            results.append({"account": acc["name"], "error": str(e)})
+    return results
 
 def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
     side_close = SIDE_SELL if side == "BUY" else SIDE_BUY
@@ -97,28 +287,41 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
 
 def update_stop_loss(symbol, side, new_sl):
     try:
-        binance.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=new_sl,
-            closePosition=True
-        )
+        new_sl = normalize_price(symbol, new_sl)
+
+        last = LAST_STOP_PRICE.get(symbol)
+        tick = EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0)
+
+        if last is not None and abs(last - new_sl) <= max(tick, 1e-12):
+            return
+
+        for _ in range(3):
+            cancel_existing_orders(symbol)
+            time.sleep(1.0)
+
+            try:
+                binance.futures_create_order(
+                    symbol=symbol,
+                    side=SIDE_SELL if side == "BUY" else SIDE_BUY,
+                    type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                    stopPrice=new_sl,
+                    closePosition=True,
+                    workingType="MARK_PRICE"
+                )
+
+                LAST_STOP_PRICE[symbol] = new_sl
+                return
+
+            except Exception as e:
+                if "-4130" in str(e):
+                    time.sleep(1.0)
+                    continue
+                raise
+
+        print("SL update skipped after retries:", symbol)
+
     except Exception as e:
         print("SL update error:", e)
-
-def adjust_precision(symbol, qty, price):
-    info = binance.futures_exchange_info()
-    for s in info["symbols"]:
-        if s["symbol"] == symbol:
-            step = float(next(f["stepSize"] for f in s["filters"] if f["filterType"] == "LOT_SIZE"))
-            tick = float(next(f["tickSize"] for f in s["filters"] if f["filterType"] == "PRICE_FILTER"))
-            # adjust qty
-            qty = round(qty / step) * step
-            # adjust price
-            price = round(price / tick) * tick
-            return qty, price
-    return qty, price
 
 # ================= BASIC =================
 @app.get("/")
@@ -335,9 +538,34 @@ def position_detail(symbol: str):
     except Exception as e:
         return {"error": str(e)}
 
-def smart_trailing():
-    import time
+@app.get("/accounts")
+def get_accounts():
+    data = []
+    for acc in CLIENTS:
+        try:
+            c = acc["client"]
+            balance_info = c.futures_account_balance()
+            usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
+            balance = float(usdt["balance"]) if usdt else 0
+            unrealized = float(usdt["crossUnPnl"]) if usdt else 0
+            equity = balance + unrealized
+            positions = c.futures_position_information()
+            active = [p for p in positions if float(p["positionAmt"]) != 0]
+            data.append({
+                "name": acc["name"],
+                "balance": balance,
+                "equity": equity,
+                "unrealized": unrealized,
+                "positions": len(active)
+            })
+        except Exception as e:
+            data.append({
+                "name": acc["name"],
+                "error": str(e)
+            })
+    return {"accounts": data}
 
+def smart_trailing():
     while True:
         try:
             positions = binance.futures_position_information()
@@ -352,11 +580,19 @@ def smart_trailing():
                 price = float(p["markPrice"])
                 side = "BUY" if amt > 0 else "SELL"
 
+                current_sl = LAST_STOP_PRICE.get(symbol)
+
+                # Guard: skip jika SL sudah terlalu dekat dengan entry (tidak perlu update)
+                if current_sl is not None and abs(current_sl - entry) <= EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
+                    continue
+
                 move = abs(price - entry)
 
                 # 🎯 BREAK EVEN
                 if move > entry * 0.003:
-                    update_stop_loss(symbol, side, entry)
+                    new_sl = entry
+                    if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
+                        update_stop_loss(symbol, side, new_sl)
 
                 # 🎯 TRAILING PROFIT
                 if move > entry * 0.006:
@@ -365,7 +601,8 @@ def smart_trailing():
                     else:
                         new_sl = price + (move * 0.3)
 
-                    update_stop_loss(symbol, side, new_sl)
+                    if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
+                        update_stop_loss(symbol, side, new_sl)
 
             time.sleep(5)
 
@@ -410,37 +647,26 @@ def auto_trader():
                     if pos:
                         continue  # skip kalau sudah ada posisi
 
-                    # 5 — RISK SIMPLE + MIN NOTIONAL + PRECISION FIX
+                    # 5 — RISK SIMPLE
                     balance_info = binance.futures_account_balance()
                     usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
                     balance = float(usdt["balance"]) if usdt else 0
-
-                    price = signal["entry"]
-                    risk_amount = balance * 0.01
+                    risk_amount = balance * 0.01  # 1%
                     stop_distance = abs(signal["entry"] - signal["sl"])
-                    qty = risk_amount / stop_distance
-
-                    # 🔥 pastikan minimal $100
-                    notional = qty * price
-                    if notional < 100:
-                        qty = 100 / price
-
-                    # precision fix
-                    qty, price = adjust_precision(symbol, qty, price)
+                    qty = round(risk_amount / stop_distance, 3)
 
                     # 🚀 execute
-                    result = place_futures_order(
-                        symbol=signal["symbol"],
+                    result = place_order_multi(
+                        symbol=symbol,
                         side=signal["type"],
-                        quantity=qty,
                         sl=signal["sl"],
                         tp=signal["tp"]
                     )
 
                     send_telegram(f"""
-🤖 AUTO TRADE
+🤖 MULTI AUTO TRADE
 {symbol} {signal['type']}
-Score: {signal['score']}
+{result}
 """)
                     print("AUTO EXEC:", result)
 
@@ -452,11 +678,31 @@ Score: {signal['score']}
 
         time.sleep(SCAN_INTERVAL)
 
-# Jalankan trailing engine di background
-import threading
+_bot_started = False
 
-threading.Thread(target=smart_trailing, daemon=True).start()
+def start_bot():
+    while True:
+        try:
+            t = threading.Thread(target=auto_trader, daemon=True)
+            t.start()
+            print("🚀 BOT STARTED")
+            while t.is_alive():
+                time.sleep(5)
+            print("💀 BOT DEAD → RESTARTING...")
+        except Exception as e:
+            print("WATCHDOG ERROR:", e)
+        time.sleep(3)
 
-# 3 — JALANKAN AUTO BOT
-if AUTO_MODE:
-    threading.Thread(target=auto_trader, daemon=True).start()
+def start_background_tasks():
+    global _bot_started
+    if _bot_started:
+        return
+    _bot_started = True
+    if AUTO_MODE:
+        load_exchange_cache()
+        threading.Thread(target=smart_trailing, daemon=True).start()
+        threading.Thread(target=start_bot, daemon=True).start()
+
+@app.on_event("startup")
+def on_startup():
+    start_background_tasks()
