@@ -4,3 +4,5 @@ ccxt
 openai
 python-dotenv
 requests
+python-binance
+python-dotenv
