@@ -8,6 +8,29 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 load_dotenv()
 
+# ===== CONFIG & ENV CHECK =====
+from config import *
+
+print("🔥 FIREBASE_URL:", os.getenv("FIREBASE_URL"))
+
+# 🔒 SAFETY CHECK (WAJIB DI SINI)
+if not BINANCE_API_KEY:
+    raise Exception("BINANCE_API_KEY not set")
+
+if not BINANCE_SECRET:
+    raise Exception("BINANCE_SECRET not set")
+
+if not OPENAI_API_KEY:
+    print("⚠️ OPENAI_API_KEY not set (AI disabled)")
+
+def check_env():
+    if not BINANCE_API_KEY:
+        raise Exception("BINANCE_API_KEY not set")
+    if not BINANCE_SECRET:
+        raise Exception("BINANCE_SECRET not set")
+
+check_env()
+
 AUTO_MODE = True
 SCAN_INTERVAL = 15  # detik
 MIN_SCORE = 80
@@ -83,8 +106,93 @@ DAILY_LOSS_PCT = 3      # stop kalau -3% harian
 
 LAST_DAY = None
 
+# ===== PERFORMANCE TRACKING =====
+daily_loss = 0
+consecutive_loss = 0
+current_risk = BASE_RISK = 0.01      # default 1%, akan di-override oleh config jika ada
+MAX_DAILY_LOSS = 100                 # dalam USDT, bisa dari config
+MAX_CONSECUTIVE_LOSS = 3
+MIN_RISK = 0.005
+MAX_RISK = 0.03
+
+# ✅ PAIR STATS & DISABLED PAIRS
+pair_stats = {}
+disabled_pairs = set()
+
 EXCHANGE_CACHE = {}
 LAST_STOP_PRICE = {}
+
+# ===== AI MEMORY & FIREBASE =====
+ai_memory = {}  # simpan skor tiap simbol
+trade_history = []  # journal semua trade
+
+FIREBASE_URL = os.getenv("FIREBASE_URL")
+
+# === RL WEIGHTS (NEW) ===
+rl_weights = {
+    "memory": 0.25,
+    "winrate": 0.25,
+    "regime": 0.2,
+    "vol": 0.15,
+    "journal": 0.15
+}
+
+# === PORTFOLIO ALLOCATION (NEW) ===
+portfolio_alloc = {}  # {symbol: weight 0..1}
+position_entry_score = {}  # menyimpan score saat entry untuk RL update
+
+def save_ai_memory():
+    if not FIREBASE_URL:
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}/ai_memory.json", json=ai_memory)
+        print("💾 AI memory saved")
+    except Exception as e:
+        print("Save error:", e)
+
+def save_portfolio():
+    if not FIREBASE_URL:
+        print("⚠️ FIREBASE_URL not set")
+        return
+    requests.put(f"{FIREBASE_URL}/portfolio.json", json=portfolio_alloc)
+
+def load_ai_memory():
+    global ai_memory
+    if not FIREBASE_URL:
+        return
+    try:
+        res = requests.get(f"{FIREBASE_URL}/ai_memory.json")
+        data = res.json()
+        if data:
+            ai_memory = data
+            print("🧠 AI memory loaded")
+    except Exception as e:
+        print("Load error:", e)
+
+def save_rl_weights():
+    if not FIREBASE_URL:
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}/rl_weights.json", json=rl_weights)
+        print("⚖️ RL weights saved")
+    except Exception as e:
+        print("Save RL weights error:", e)
+
+def load_rl_weights():
+    global rl_weights
+    if not FIREBASE_URL:
+        return
+    try:
+        res = requests.get(f"{FIREBASE_URL}/rl_weights.json")
+        data = res.json()
+        if data:
+            rl_weights = data
+            print("⚖️ RL weights loaded")
+    except Exception as e:
+        print("Load RL weights error:", e)
+
+load_ai_memory()
+load_rl_weights()
 
 def floor_to_step(value, step):
     d = Decimal(str(value))
@@ -108,6 +216,8 @@ def load_exchange_cache():
     info = binance.futures_exchange_info()
     for s in info["symbols"]:
         symbol = s["symbol"]
+        if symbol not in PAIRS:
+            continue
         lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
         price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
         EXCHANGE_CACHE[symbol] = {
@@ -137,31 +247,20 @@ def adjust_precision(symbol, qty, price):
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    requests.post(url, json={
-        "chat_id": chat_id,
-        "text": msg
-    })
+    requests.post(url, json={"chat_id": chat_id, "text": msg})
 
 def cancel_existing_orders(symbol):
     try:
         orders = binance.futures_get_open_orders(symbol=symbol)
-
         for o in orders:
             if o["type"] in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
                 try:
-                    binance.futures_cancel_order(
-                        symbol=symbol,
-                        orderId=o["orderId"]
-                    )
+                    binance.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
                 except Exception as e:
                     print("Cancel single order error:", e)
-
         time.sleep(1.0)
         return True
-
     except Exception as e:
         print("Cancel error:", e)
         return False
@@ -170,19 +269,15 @@ def place_futures_order(symbol, side, quantity, sl, tp):
     try:
         sl = normalize_price(symbol, sl)
         tp = normalize_price(symbol, tp)
-
         cancel_existing_orders(symbol)
         time.sleep(1.0)
-
         order = binance.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY if side == "BUY" else SIDE_SELL,
             type=FUTURE_ORDER_TYPE_MARKET,
             quantity=quantity
         )
-
         time.sleep(0.3)
-
         binance.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
@@ -191,7 +286,6 @@ def place_futures_order(symbol, side, quantity, sl, tp):
             closePosition=True,
             workingType="MARK_PRICE"
         )
-
         binance.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
@@ -200,9 +294,7 @@ def place_futures_order(symbol, side, quantity, sl, tp):
             closePosition=True,
             workingType="MARK_PRICE"
         )
-
         return {"status": "FILLED", "order": order}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -229,7 +321,7 @@ def check_withdraw(acc, client):
 Profit: {profit:.2f}
 Withdraw: {amount:.2f}
 """)
-        ACCOUNT_PROFIT[name] = 0  # reset setelah withdraw
+        ACCOUNT_PROFIT[name] = 0
 
 def place_order_multi(symbol, side, sl, tp):
     results = []
@@ -238,35 +330,25 @@ def place_order_multi(symbol, side, sl, tp):
             c = acc["client"]
             base_risk = acc["risk"]
             profit = ACCOUNT_PROFIT.get(acc["name"], 0)
-            # 🔥 compounding
             if acc.get("compound") and profit > 0:
-                risk_pct = base_risk + (profit / 1000)  # scaling pelan
+                risk_pct = base_risk + (profit / 1000)
             else:
                 risk_pct = base_risk
-            # balance
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
             risk_amount = balance * risk_pct
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
             stop_distance = abs(price - sl)
-
             if stop_distance == 0:
                 continue
-
             qty = risk_amount / stop_distance
-
-            # minimal notional
             if qty * price < 100:
                 qty = ceil_to_step(100 / price, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
-
             qty, price = adjust_precision(symbol, qty, price)
-
-            # validasi final
             if qty * price < 100:
                 print("❌ SKIP NOTIONAL < 100", symbol)
                 continue
-
             order = c.futures_create_order(
                 symbol=symbol,
                 side=SIDE_BUY if side == "BUY" else SIDE_SELL,
@@ -282,11 +364,9 @@ def place_order_multi(symbol, side, sl, tp):
 
 def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
     side_close = SIDE_SELL if side == "BUY" else SIDE_BUY
-
     q1 = round(quantity * 0.4, 3)
     q2 = round(quantity * 0.3, 3)
     q3 = round(quantity * 0.3, 3)
-
     for tp, q in [(tp1, q1), (tp2, q2), (tp3, q3)]:
         binance.futures_create_order(
             symbol=symbol,
@@ -299,33 +379,23 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
 def update_stop_loss(symbol, side, new_sl):
     try:
         new_sl = normalize_price(symbol, new_sl)
-        
         current_price = float(binance.futures_symbol_ticker(symbol=symbol)["price"])
-        
         if side == "BUY" and new_sl >= current_price:
             return
-
         if side == "SELL" and new_sl <= current_price:
             return
-            
-        buffer = current_price * 0.001  # 0.1%
-        
+        buffer = current_price * 0.001
         if side == "BUY" and new_sl >= current_price - buffer:
             return
-        
         if side == "SELL" and new_sl <= current_price + buffer:
             return
-    
         last = LAST_STOP_PRICE.get(symbol)
         tick = EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0)
-
         if last is not None and abs(last - new_sl) <= max(tick, 1e-12):
             return
-
         for _ in range(3):
             cancel_existing_orders(symbol)
             time.sleep(1.0)
-
             try:
                 binance.futures_create_order(
                     symbol=symbol,
@@ -335,18 +405,14 @@ def update_stop_loss(symbol, side, new_sl):
                     closePosition=True,
                     workingType="MARK_PRICE"
                 )
-
                 LAST_STOP_PRICE[symbol] = new_sl
                 return
-
             except Exception as e:
                 if "-4130" in str(e):
                     time.sleep(1.0)
                     continue
                 raise
-
         print("SL update skipped after retries:", symbol)
-
     except Exception as e:
         print("SL update error:", e)
 
@@ -358,10 +424,8 @@ def get_total_equity():
             c = acc["client"]
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
-
             balance = float(usdt["balance"]) if usdt else 0
             unreal = float(usdt["crossUnPnl"]) if usdt else 0
-
             total += (balance + unreal)
         except:
             pass
@@ -369,58 +433,348 @@ def get_total_equity():
 
 def safety_check():
     global KILL_SWITCH, DAILY_START_EQUITY, LAST_DAY
-
     now_day = time.strftime("%Y-%m-%d")
-
     eq = get_total_equity()
-
-    # reset harian
     if now_day != LAST_DAY:
         DAILY_START_EQUITY = eq
         LAST_DAY = now_day
         print("🌅 RESET DAILY EQUITY:", eq)
-
-    # drawdown total
+        reset_pairs()
     dd = ((START_EQUITY - eq) / START_EQUITY) * 100
-
     if dd >= MAX_DRAWDOWN_PCT:
         KILL_SWITCH = True
         send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
         return False
-
-    # loss harian
-    daily_loss = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
-
-    if daily_loss >= DAILY_LOSS_PCT:
+    daily_loss_pct = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
+    if daily_loss_pct >= DAILY_LOSS_PCT:
         KILL_SWITCH = True
-        send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss:.2f}% → BOT STOP")
+        send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss_pct:.2f}% → BOT STOP")
         return False
-
     return True
 
 def check_telegram_commands():
     token = os.getenv("TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-
     try:
         res = requests.get(url).json()
-
         for u in res.get("result", []):
             text = u.get("message", {}).get("text", "")
-
             if "/stop" in text:
                 global KILL_SWITCH
                 KILL_SWITCH = True
                 send_telegram("🛑 BOT STOPPED via Telegram")
-
             if "/start" in text:
                 KILL_SWITCH = False
                 send_telegram("🚀 BOT RESUMED via Telegram")
-
     except:
         pass
 
-# ================= BASIC =================
+# ================= PERFORMANCE UPDATE =================
+def update_risk(result, pnl):
+    global daily_loss, consecutive_loss, current_risk
+    if result == "LOSS":
+        daily_loss += abs(pnl)
+        consecutive_loss += 1
+    else:
+        consecutive_loss = 0
+    if daily_loss >= MAX_DAILY_LOSS:
+        print("🛑 DAILY LOSS LIMIT HIT")
+        return False
+    if consecutive_loss >= MAX_CONSECUTIVE_LOSS:
+        print("🛑 TOO MANY LOSSES")
+        return False
+    if consecutive_loss >= 2:
+        current_risk = max(MIN_RISK, current_risk * 0.7)
+    else:
+        current_risk = min(MAX_RISK, current_risk * 1.1)
+    return True
+
+# ✅ PAIR TRACKING FUNCTIONS
+def update_pair_stats(symbol, result, pnl):
+    global pair_stats
+    if symbol not in pair_stats:
+        pair_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0}
+    stats = pair_stats[symbol]
+    if result == "WIN":
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+    stats["pnl"] += pnl
+
+def check_pair_health(symbol):
+    stats = pair_stats.get(symbol)
+    if not stats:
+        return True
+    total = stats["wins"] + stats["losses"]
+    if total >= 5:
+        winrate = stats["wins"] / total
+        if winrate < 0.3 or stats["pnl"] < -5:
+            print(f"🚫 Disable pair {symbol}")
+            disabled_pairs.add(symbol)
+            return False
+    return True
+
+def reset_pairs():
+    global disabled_pairs
+    disabled_pairs = set()
+
+# ===== AI MEMORY FUNCTIONS =====
+def update_ai_memory(symbol, result):
+    global ai_memory
+    if symbol not in ai_memory:
+        ai_memory[symbol] = {"score": 50, "trades": 0}
+    mem = ai_memory[symbol]
+    mem["trades"] += 1
+    if result == "WIN":
+        mem["score"] += 5
+    else:
+        mem["score"] -= 7
+    mem["score"] = max(0, min(100, mem["score"]))
+    print(f"🧠 AI Memory updated: {symbol} score={mem['score']} after {result}")
+    save_ai_memory()
+
+def ai_allow_trade(symbol):
+    mem = ai_memory.get(symbol)
+    if not mem:
+        return True
+    if mem["score"] < 40:
+        print(f"🧠 AI BLOCK {symbol} score={mem['score']}")
+        return False
+    return True
+
+# === HELPER FUNCTIONS ===
+def _get_trend(symbol):
+    try:
+        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=50)
+        closes = [float(k[4]) for k in klines]
+        if closes[-1] > closes[0]:
+            return "BULLISH"
+        elif closes[-1] < closes[0]:
+            return "BEARISH"
+        else:
+            return "SIDEWAYS"
+    except Exception as e:
+        print(f"Error get trend {symbol}: {e}")
+        return "UNKNOWN"
+
+def _get_strength(symbol):
+    try:
+        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=2)
+        if len(klines) < 2:
+            return 0.0
+        prev_close = float(klines[0][4])
+        curr_close = float(klines[1][4])
+        if prev_close == 0:
+            return 0.0
+        return ((curr_close - prev_close) / prev_close) * 100.0
+    except Exception as e:
+        print(f"Error get strength {symbol}: {e}")
+        return 0.0
+
+def btc_filter(trend):
+    btc_trend = _get_trend("BTCUSDT")
+    if btc_trend != trend:
+        print(f"🧠 BTC filter block: BTC={btc_trend}, Signal={trend}")
+        return False
+    return True
+
+def get_regime_tf(symbol, interval):
+    try:
+        klines = binance.futures_klines(symbol=symbol, interval=interval, limit=50)
+        closes = [float(k[4]) for k in klines]
+        change = (closes[-1] - closes[0]) / closes[0]
+        if abs(change) < 0.004:
+            return "SIDEWAYS"
+        elif change > 0:
+            return "BULL"
+        else:
+            return "BEAR"
+    except Exception as e:
+        print(f"Error get_regime_tf {symbol} {interval}: {e}")
+        return "SIDEWAYS"
+
+def get_multi_tf_regime(symbol="BTCUSDT"):
+    tf_15m = get_regime_tf(symbol, "15m")
+    tf_1h  = get_regime_tf(symbol, "1h")
+    tf_4h  = get_regime_tf(symbol, "4h")
+    if tf_15m == tf_1h == tf_4h:
+        return tf_1h
+    votes = [tf_15m, tf_1h, tf_4h]
+    if votes.count("BULL") >= 2:
+        return "BULL"
+    if votes.count("BEAR") >= 2:
+        return "BEAR"
+    return "SIDEWAYS"
+
+def get_volatility(symbol="BTCUSDT"):
+    try:
+        klines = binance.futures_klines(symbol=symbol, interval="15m", limit=20)
+        ranges = []
+        for k in klines:
+            high = float(k[2])
+            low = float(k[3])
+            if low == 0:
+                continue
+            ranges.append((high - low) / low)
+        if not ranges:
+            return 0.0
+        return sum(ranges) / len(ranges)
+    except Exception as e:
+        print(f"Error get_volatility: {e}")
+        return 0.0
+
+def get_dynamic_risk(regime, vol):
+    risk = current_risk
+    if vol < 0.003:
+        risk *= 0.5
+    if vol > 0.015:
+        risk *= 0.6
+    if regime in ["BULL", "BEAR"]:
+        risk *= 1.2
+    return max(MIN_RISK, min(MAX_RISK, risk))
+
+# === JOURNAL & META SCORE ===
+def analyze_journal():
+    stats = {}
+    for t in trade_history:
+        key = (t["symbol"], t["regime"])
+        if key not in stats:
+            stats[key] = {"win": 0, "loss": 0}
+        if t["result"] == "WIN":
+            stats[key]["win"] += 1
+        else:
+            stats[key]["loss"] += 1
+    return stats
+
+def meta_score(symbol, signal, regime, vol):
+    # Komponen skor (0-100)
+    mem = ai_memory.get(symbol, {"score": 50})
+    memory_score = mem["score"]
+
+    stats = pair_stats.get(symbol, {"wins": 0, "losses": 0})
+    total_trades = stats["wins"] + stats["losses"]
+    winrate_score = (stats["wins"] / total_trades * 100) if total_trades > 0 else 50
+
+    if regime == "BULL" and signal["type"] == "BUY":
+        regime_score = 80
+    elif regime == "BEAR" and signal["type"] == "SELL":
+        regime_score = 80
+    else:
+        regime_score = 30
+
+    vol_score = 80 if 0.003 < vol < 0.015 else 40
+
+    journal_stats = analyze_journal()
+    j = journal_stats.get((symbol, regime))
+    if j:
+        t = j["win"] + j["loss"]
+        journal_score = (j["win"] / t * 100) if t > 0 else 50
+    else:
+        journal_score = 50
+
+    score = (
+        memory_score * rl_weights["memory"] +
+        winrate_score * rl_weights["winrate"] +
+        regime_score * rl_weights["regime"] +
+        vol_score * rl_weights["vol"] +
+        journal_score * rl_weights["journal"]
+    )
+    return max(0, min(100, score))
+
+# === RL WEIGHTS UPDATE (NEW) ===
+def update_rl_weights(result, score):
+    global rl_weights
+    adjust = 0.02 if result == "WIN" else -0.02
+    for k in rl_weights:
+        rl_weights[k] += adjust
+    total = sum(rl_weights.values())
+    for k in rl_weights:
+        rl_weights[k] /= total
+    print(f"⚖️ RL weights updated: {rl_weights}")
+    save_rl_weights()
+
+# === PORTFOLIO ALLOCATION (NEW) ===
+def update_portfolio(scores: dict):
+    eligible = {s: sc for s, sc in scores.items() if sc >= MIN_SCORE}
+    if not eligible:
+        return {}
+    total = sum(eligible.values())
+    alloc = {}
+    for s, sc in eligible.items():
+        w = sc / total
+        w = max(0.05, min(0.4, w))
+        alloc[s] = w
+    ssum = sum(alloc.values())
+    for s in alloc:
+        alloc[s] /= ssum
+    return alloc
+
+# ===== MONITOR POSISI =====
+last_position_state = {}
+last_regime = None
+last_vol = None
+
+def monitor_positions_for_memory_update():
+    global last_position_state, last_regime, last_vol
+    while True:
+        try:
+            try:
+                current_regime = get_multi_tf_regime("BTCUSDT")
+                current_vol = get_volatility("BTCUSDT")
+                last_regime = current_regime
+                last_vol = current_vol
+            except:
+                pass
+
+            positions = binance.futures_position_information()
+            current_state = {}
+            for p in positions:
+                amt = float(p["positionAmt"])
+                if amt != 0:
+                    symbol = p["symbol"]
+                    side = "BUY" if amt > 0 else "SELL"
+                    current_state[symbol] = {
+                        "side": side,
+                        "size": abs(amt),
+                        "entry": float(p["entryPrice"]),
+                        "unrealized": float(p["unRealizedProfit"]),
+                        "leverage": float(p["leverage"])
+                    }
+
+            for symbol, last in last_position_state.items():
+                if symbol not in current_state:
+                    pnl = last.get("unrealized", 0.0)
+                    result = "WIN" if pnl > 0 else "LOSS"
+                    print(f"📊 Position closed: {symbol} PnL={pnl:.2f} {result}")
+
+                    update_pair_stats(symbol, result, pnl)
+                    update_risk(result, pnl)
+                    update_ai_memory(symbol, result)
+
+                    # RL weights update pakai entry score jika ada
+                    entry_score = position_entry_score.pop(symbol, 50)
+                    update_rl_weights(result, entry_score)
+
+                    trade_history.append({
+                        "symbol": symbol,
+                        "result": result,
+                        "pnl": pnl,
+                        "regime": last_regime if last_regime else "UNKNOWN",
+                        "vol": last_vol if last_vol else 0.0,
+                        "score": entry_score
+                    })
+                    print(f"📝 Journal updated: {symbol} {result}")
+
+                    send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
+
+            last_position_state = current_state
+
+        except Exception as e:
+            print("Monitor position error:", e)
+
+        time.sleep(10)
+
+# ================= BASIC ENDPOINTS =================
 @app.get("/")
 def root():
     return {"status": "MONTRA backend running 🚀"}
@@ -431,36 +785,12 @@ def home():
 
 @app.get("/trend/{symbol}")
 def get_trend(symbol: str):
-    try:
-        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=50)
-        closes = [float(k[4]) for k in klines]
-
-        # simple trend logic
-        if closes[-1] > closes[0]:
-            trend = "BULLISH"
-        elif closes[-1] < closes[0]:
-            trend = "BEARISH"
-        else:
-            trend = "SIDEWAYS"
-
-        return {"symbol": symbol, "trend": trend}
-
-    except Exception as e:
-        return {"error": str(e)}
+    trend = _get_trend(symbol)
+    return {"symbol": symbol, "trend": trend}
 
 @app.get("/symbols")
 def symbols():
-    return {
-        "symbols": [
-            "BTCUSDT",
-            "ETHUSDT",
-            "BNBUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-        ]
-    }
-
-# ================= MARKET =================
+    return {"symbols": PAIRS}
 
 @app.get("/ticker/{symbol}")
 def ticker(symbol: str):
@@ -470,30 +800,19 @@ def ticker(symbol: str):
         return {"error": str(e)}
 
 @app.get("/ohlcv/{symbol}")
-def ohlcv(
-    symbol: str,
-    timeframe: str = Query(default="15m"),
-    limit: int = Query(default=100, ge=1, le=1000),
-):
+def ohlcv(symbol: str, timeframe: str = Query(default="15m"), limit: int = Query(default=100, ge=1, le=1000)):
     try:
-        return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "limit": limit,
-            "data": get_ohlcv(symbol, timeframe=timeframe, limit=limit),
-        }
+        return {"symbol": symbol, "timeframe": timeframe, "limit": limit, "data": get_ohlcv(symbol, timeframe=timeframe, limit=limit)}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/tickers")
-def tickers(symbols: str = Query(default="BTCUSDT,ETHUSDT,BNBUSDT")):
+def tickers(symbols: str = Query(default=",".join(PAIRS))):
     try:
         symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
         return {"data": get_multi_tickers(symbol_list)}
     except Exception as e:
         return {"error": str(e)}
-
-# ================= AI FILTER =================
 
 @app.post("/ai-filter")
 def ai_filter(payload: dict = Body(...)):
@@ -501,7 +820,6 @@ def ai_filter(payload: dict = Body(...)):
         symbol = payload.get("symbol")
         trade_type = payload.get("type")
         rr = payload.get("rr")
-
         prompt = f"""
 You are a professional trading AI.
 
@@ -520,22 +838,13 @@ Answer format ONLY:
 VALID or NO TRADE
 Confidence: XX%
 """.strip()
-
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
         )
-
-        return {
-            "result": res.choices[0].message.content.strip()
-        }
-
+        return {"result": res.choices[0].message.content.strip()}
     except Exception as e:
-        # 🔥 fallback kalau AI down
-        return {
-            "result": "NO TRADE\nConfidence: 0%",
-            "error": str(e),
-        }
+        return {"result": "NO TRADE\nConfidence: 0%", "error": str(e)}
 
 @app.post("/notify")
 def notify(payload: dict = Body(...)):
@@ -551,27 +860,14 @@ def notify_image(payload: dict = Body(...)):
     try:
         text = payload.get("text", "")
         image = payload.get("image", "")
-
         token = os.getenv("TELEGRAM_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
-
         img_data = base64.b64decode(image.split(",")[1])
-
-        files = {
-            "photo": ("chart.png", img_data)
-        }
-
-        data = {
-            "chat_id": chat_id,
-            "caption": text
-        }
-
+        files = {"photo": ("chart.png", img_data)}
+        data = {"chat_id": chat_id, "caption": text}
         requests.post(url, files=files, data=data)
-
         return {"status": "sent"}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -584,23 +880,13 @@ def trade(payload: dict = Body(...)):
         sl = float(payload.get("sl"))
         tp = float(payload.get("tp"))
         risk_percent = float(payload.get("risk", 1))
-
-        # BALANCE
         balance_info = binance.futures_account_balance()
-        usdt_balance = next(
-            (b for b in balance_info if b["asset"] == "USDT"), None
-        )
-
+        usdt_balance = next((b for b in balance_info if b["asset"] == "USDT"), None)
         balance = float(usdt_balance["balance"]) if usdt_balance else 0
-
-        # POSITION SIZE
         risk_amount = balance * (risk_percent / 100)
         stop_distance = abs(entry - sl)
-
         quantity = round(risk_amount / stop_distance, 3)
-
         result = place_futures_order(symbol, side, quantity, sl, tp)
-
         send_telegram(f"""
 🚀 TRADE EXECUTED
 {symbol} {side}
@@ -608,9 +894,7 @@ Qty: {quantity}
 SL: {sl}
 TP: {tp}
 """)
-
         return result
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -618,7 +902,6 @@ TP: {tp}
 def get_positions():
     try:
         positions = binance.futures_position_information()
-
         active = []
         for p in positions:
             amt = float(p["positionAmt"])
@@ -630,27 +913,17 @@ def get_positions():
                     "size": abs(amt),
                     "unrealized": float(p["unRealizedProfit"])
                 })
-
         return {"positions": active}
-
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ POSITION DETAIL + TRADES (new endpoint)
 @app.get("/position-detail/{symbol}")
 def position_detail(symbol: str):
     try:
         positions = binance.futures_position_information(symbol=symbol)
         trades = binance.futures_account_trades(symbol=symbol)
-
-        # Cari posisi yang sedang aktif (positionAmt != 0)
         pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
-
-        return {
-            "position": pos,
-            "trades": trades[-50:]  # ambil 50 transaksi terakhir
-        }
-
+        return {"position": pos, "trades": trades[-50:]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -675,63 +948,44 @@ def get_accounts():
                 "positions": len(active)
             })
         except Exception as e:
-            data.append({
-                "name": acc["name"],
-                "error": str(e)
-            })
+            data.append({"name": acc["name"], "error": str(e)})
     return {"accounts": data}
 
-# ================= REMOTE CONTROL =================
 @app.post("/kill-switch")
 def kill_switch(payload: dict = Body(...)):
     global KILL_SWITCH
-
     state = payload.get("state", True)
     KILL_SWITCH = state
-
     return {"kill_switch": KILL_SWITCH}
 
 def smart_trailing():
     while True:
         try:
             positions = binance.futures_position_information()
-
             for p in positions:
                 amt = float(p["positionAmt"])
                 if amt == 0:
                     continue
-
                 symbol = p["symbol"]
                 entry = float(p["entryPrice"])
                 price = float(p["markPrice"])
                 side = "BUY" if amt > 0 else "SELL"
-
                 current_sl = LAST_STOP_PRICE.get(symbol)
-
-                # Guard: skip jika SL sudah terlalu dekat dengan entry (tidak perlu update)
                 if current_sl is not None and abs(current_sl - entry) <= EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
                     continue
-
                 move = abs(price - entry)
-
-                # 🎯 BREAK EVEN
                 if move > entry * 0.003:
                     new_sl = entry
                     if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
                         update_stop_loss(symbol, side, new_sl)
-
-                # 🎯 TRAILING PROFIT
                 if move > entry * 0.006:
                     if side == "BUY":
                         new_sl = price - (move * 0.3)
                     else:
                         new_sl = price + (move * 0.3)
-
                     if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
                         update_stop_loss(symbol, side, new_sl)
-
             time.sleep(5)
-
         except Exception as e:
             print("Trailing error:", e)
             time.sleep(5)
@@ -740,31 +994,52 @@ def auto_trader():
     while True:
         try:
             check_telegram_commands()
-
             if KILL_SWITCH:
                 print("🛑 KILL SWITCH ACTIVE")
                 time.sleep(5)
                 continue
-
             if not safety_check():
                 time.sleep(10)
                 continue
-
             if not AUTO_MODE:
                 time.sleep(SCAN_INTERVAL)
                 continue
+            if daily_loss >= MAX_DAILY_LOSS:
+                print("🚫 Skip trade: daily loss limit")
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-            # 🔥 contoh pair (bisa expand)
-            pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            regime = get_multi_tf_regime("BTCUSDT")
+            vol = get_volatility("BTCUSDT")
+            print(f"🧠 MTF REGIME: {regime}")
+            print(f"🌊 VOL: {vol:.4f}")
 
+            if vol < 0.002:
+                print("⏸️ Skip: low volatility")
+                time.sleep(SCAN_INTERVAL)
+                continue
+            if vol > 0.02:
+                print("⚠️ Skip: high volatility")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            pairs = PAIRS.copy()
+            scores_map = {}
+
+            # --- Kumpulkan skor untuk semua pair ---
             for symbol in pairs:
                 try:
-                    # ambil data
+                    if symbol in disabled_pairs:
+                        continue
+                    if not check_pair_health(symbol):
+                        continue
+                    if not ai_allow_trade(symbol):
+                        continue
+
                     ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
                     closes = [float(c[4]) for c in ohlcv]
                     last_price = closes[-1]
 
-                    # 🧠 dummy signal (sementara, nanti bisa connect logic lo)
                     signal = {
                         "symbol": symbol,
                         "type": "BUY" if closes[-1] > closes[-2] else "SELL",
@@ -774,25 +1049,86 @@ def auto_trader():
                         "score": 85
                     }
 
-                    # 🎯 filter
-                    if signal["score"] < MIN_SCORE:
+                    # Hitung meta score
+                    score = meta_score(symbol, signal, regime, vol)
+                    scores_map[symbol] = score
+
+                except Exception as e:
+                    print(f"Scoring error {symbol}: {e}")
+
+            # Update portfolio allocation
+            global portfolio_alloc
+            portfolio_alloc = update_portfolio(scores_map)
+            save_portfolio()
+            print("📊 PORTFOLIO:", portfolio_alloc)
+
+            # --- Eksekusi trade berdasarkan alokasi ---
+            for symbol in pairs:
+                try:
+                    if symbol in disabled_pairs:
+                        continue
+                    if not check_pair_health(symbol):
+                        continue
+                    if not ai_allow_trade(symbol):
                         continue
 
-                    # 4 — LIMIT DUPLICATE TRADE
+                    w = portfolio_alloc.get(symbol, 0)
+                    if w <= 0:
+                        continue
+
+                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    closes = [float(c[4]) for c in ohlcv]
+                    last_price = closes[-1]
+
+                    signal = {
+                        "symbol": symbol,
+                        "type": "BUY" if closes[-1] > closes[-2] else "SELL",
+                        "entry": last_price,
+                        "sl": last_price * 0.995,
+                        "tp": last_price * 1.01,
+                        "score": 85
+                    }
+
+                    score = scores_map.get(symbol, 0)
+                    if score < MIN_SCORE:
+                        print(f"⛔ META BLOCK {symbol} score={score}")
+                        continue
+
+                    # Filter tambahan
+                    if regime == "SIDEWAYS":
+                        print(f"⏸️ Skip {symbol}: market SIDEWAYS")
+                        continue
+                    if regime == "BULL" and signal["type"] != "BUY":
+                        print(f"⏸️ Skip {symbol}: BULL market but signal SELL")
+                        continue
+                    if regime == "BEAR" and signal["type"] != "SELL":
+                        print(f"⏸️ Skip {symbol}: BEAR market but signal BUY")
+                        continue
+
+                    signal_trend = "BULLISH" if signal["type"] == "BUY" else "BEARISH"
+                    if not btc_filter(signal_trend):
+                        continue
+
+                    btc_strength = _get_strength("BTCUSDT")
+                    alt_strength = _get_strength(symbol)
+                    if abs(btc_strength - alt_strength) > 20.0:
+                        print(f"🧠 Strength divergence block: BTC {btc_strength:.2f}% vs {symbol} {alt_strength:.2f}%")
+                        continue
+
                     positions = binance.futures_position_information(symbol=symbol)
                     pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
                     if pos:
-                        continue  # skip kalau sudah ada posisi
+                        continue
 
-                    # 5 — RISK SIMPLE
+                    dynamic_risk = get_dynamic_risk(regime, vol)
                     balance_info = binance.futures_account_balance()
                     usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
                     balance = float(usdt["balance"]) if usdt else 0
-                    risk_amount = balance * 0.01  # 1%
+                    risk_amount = balance * dynamic_risk * w
+
                     stop_distance = abs(signal["entry"] - signal["sl"])
                     qty = round(risk_amount / stop_distance, 3)
 
-                    # 🚀 execute
                     result = place_order_multi(
                         symbol=symbol,
                         side=signal["type"],
@@ -800,9 +1136,13 @@ def auto_trader():
                         tp=signal["tp"]
                     )
 
+                    # Simpan entry score untuk RL update nanti
+                    position_entry_score[symbol] = score
+
                     send_telegram(f"""
 🤖 MULTI AUTO TRADE
 {symbol} {signal['type']}
+Score: {score:.1f} | Weight: {w:.2f}
 {result}
 """)
                     print("AUTO EXEC:", result)
@@ -837,14 +1177,13 @@ def start_background_tasks():
     _bot_started = True
     if AUTO_MODE:
         load_exchange_cache()
-        
         eq = get_total_equity()
         START_EQUITY = eq
         DAILY_START_EQUITY = eq
         LAST_DAY = time.strftime("%Y-%m-%d")
         print("🧠 START EQUITY:", eq)
-        
         threading.Thread(target=smart_trailing, daemon=True).start()
+        threading.Thread(target=monitor_positions_for_memory_update, daemon=True).start()
         threading.Thread(target=start_bot, daemon=True).start()
 
 @app.on_event("startup")
