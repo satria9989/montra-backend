@@ -32,8 +32,10 @@ def check_env():
 check_env()
 
 AUTO_MODE = True
-SCAN_INTERVAL = 15  # detik
+AUTO_TRADING = True          # ⭐ NEW: switch on/off via Telegram
+SCAN_INTERVAL = 15           # detik
 MIN_SCORE = 80
+MAX_OPEN_TRADES = 3          # ⭐ NEW: batas maksimum posisi terbuka
 
 ACCOUNTS = [
     {
@@ -109,9 +111,8 @@ LAST_DAY = None
 # ===== PERFORMANCE TRACKING =====
 daily_loss = 0
 consecutive_loss = 0
-current_risk = BASE_RISK = 0.01      # default 1%, akan di-override oleh config jika ada
-MAX_DAILY_LOSS = 100                 # dalam USDT, bisa dari config
-MAX_CONSECUTIVE_LOSS = 3
+# 🔥 FIX: Gunakan nilai dari config
+current_risk = BASE_RISK
 MIN_RISK = 0.005
 MAX_RISK = 0.03
 
@@ -128,7 +129,7 @@ trade_history = []  # journal semua trade
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
 
-# === RL WEIGHTS (NEW) ===
+# === RL WEIGHTS ===
 rl_weights = {
     "memory": 0.25,
     "winrate": 0.25,
@@ -137,9 +138,12 @@ rl_weights = {
     "journal": 0.15
 }
 
-# === PORTFOLIO ALLOCATION (NEW) ===
+# === PORTFOLIO ALLOCATION ===
 portfolio_alloc = {}  # {symbol: weight 0..1}
 position_entry_score = {}  # menyimpan score saat entry untuk RL update
+
+# ⭐ NEW: signal storage
+LAST_SIGNAL = None
 
 def save_ai_memory():
     if not FIREBASE_URL:
@@ -337,7 +341,9 @@ def place_order_multi(symbol, side, sl, tp):
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
-            risk_amount = balance * risk_pct
+            # ✅ UPDATED: gunakan alokasi portofolio untuk position sizing
+            alloc = portfolio_alloc.get(symbol, 0.25)
+            risk_amount = balance * risk_pct * alloc
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
             stop_distance = abs(price - sl)
             if stop_distance == 0:
@@ -453,6 +459,7 @@ def safety_check():
     return True
 
 def check_telegram_commands():
+    global KILL_SWITCH, AUTO_TRADING
     token = os.getenv("TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     try:
@@ -460,12 +467,17 @@ def check_telegram_commands():
         for u in res.get("result", []):
             text = u.get("message", {}).get("text", "")
             if "/stop" in text:
-                global KILL_SWITCH
                 KILL_SWITCH = True
                 send_telegram("🛑 BOT STOPPED via Telegram")
             if "/start" in text:
                 KILL_SWITCH = False
                 send_telegram("🚀 BOT RESUMED via Telegram")
+            if "/auto_on" in text:
+                AUTO_TRADING = True
+                send_telegram("🟢 AUTO TRADING ENABLED")
+            if "/auto_off" in text:
+                AUTO_TRADING = False
+                send_telegram("🔴 AUTO TRADING DISABLED")
     except:
         pass
 
@@ -501,6 +513,11 @@ def update_pair_stats(symbol, result, pnl):
         stats["losses"] += 1
     stats["pnl"] += pnl
 
+    # ✅ UPDATED: auto disable pair setelah 3 loss berturut-turut
+    if stats["losses"] >= 3:
+        disabled_pairs.add(symbol)
+        print(f"🚫 Pair {symbol} disabled after {stats['losses']} losses")
+
 def check_pair_health(symbol):
     stats = pair_stats.get(symbol)
     if not stats:
@@ -518,17 +535,27 @@ def reset_pairs():
     global disabled_pairs
     disabled_pairs = set()
 
+# 🔥 NEW: helper untuk ekstrak skor dengan aman
+def safe_score(mem):
+    if isinstance(mem, dict):
+        return float(mem.get("score", 50))
+    try:
+        return float(mem)
+    except:
+        return 50
+
 # ===== AI MEMORY FUNCTIONS =====
 def update_ai_memory(symbol, result):
     global ai_memory
-    if symbol not in ai_memory:
+    # 🔥 FIX: pastikan entri adalah dict
+    if symbol not in ai_memory or not isinstance(ai_memory.get(symbol), dict):
         ai_memory[symbol] = {"score": 50, "trades": 0}
     mem = ai_memory[symbol]
-    mem["trades"] += 1
+    mem["trades"] = mem.get("trades", 0) + 1
     if result == "WIN":
-        mem["score"] += 5
+        mem["score"] = mem.get("score", 50) + 5
     else:
-        mem["score"] -= 7
+        mem["score"] = mem.get("score", 50) - 7
     mem["score"] = max(0, min(100, mem["score"]))
     print(f"🧠 AI Memory updated: {symbol} score={mem['score']} after {result}")
     save_ai_memory()
@@ -537,8 +564,9 @@ def ai_allow_trade(symbol):
     mem = ai_memory.get(symbol)
     if not mem:
         return True
-    if mem["score"] < 40:
-        print(f"🧠 AI BLOCK {symbol} score={mem['score']}")
+    score = safe_score(mem)
+    if score < 40:
+        print(f"🧠 AI BLOCK {symbol} score={score}")
         return False
     return True
 
@@ -649,7 +677,7 @@ def analyze_journal():
 def meta_score(symbol, signal, regime, vol):
     # Komponen skor (0-100)
     mem = ai_memory.get(symbol, {"score": 50})
-    memory_score = mem["score"]
+    memory_score = safe_score(mem)
 
     stats = pair_stats.get(symbol, {"wins": 0, "losses": 0})
     total_trades = stats["wins"] + stats["losses"]
@@ -681,7 +709,7 @@ def meta_score(symbol, signal, regime, vol):
     )
     return max(0, min(100, score))
 
-# === RL WEIGHTS UPDATE (NEW) ===
+# === RL WEIGHTS UPDATE ===
 def update_rl_weights(result, score):
     global rl_weights
     adjust = 0.02 if result == "WIN" else -0.02
@@ -693,21 +721,91 @@ def update_rl_weights(result, score):
     print(f"⚖️ RL weights updated: {rl_weights}")
     save_rl_weights()
 
-# === PORTFOLIO ALLOCATION (NEW) ===
-def update_portfolio(scores: dict):
-    eligible = {s: sc for s, sc in scores.items() if sc >= MIN_SCORE}
-    if not eligible:
-        return {}
-    total = sum(eligible.values())
-    alloc = {}
-    for s, sc in eligible.items():
-        w = sc / total
-        w = max(0.05, min(0.4, w))
-        alloc[s] = w
-    ssum = sum(alloc.values())
-    for s in alloc:
-        alloc[s] /= ssum
-    return alloc
+# === PORTFOLIO ALLOCATION ===
+# 🔥 FIX: alokasi berdasarkan skor ai_memory dengan type safety
+def update_portfolio_allocation():
+    global portfolio_alloc
+
+    scores = {}
+    total = 0
+
+    for sym, mem in ai_memory.items():
+        # 🔥 FIX TYPE SAFETY
+        if isinstance(mem, dict):
+            score = mem.get("score", 50)
+        else:
+            try:
+                score = float(mem)
+            except:
+                score = 50
+
+        scores[sym] = max(score, 1)
+        total += scores[sym]
+
+    if total == 0:
+        portfolio_alloc = {}
+        return
+
+    for sym in scores:
+        portfolio_alloc[sym] = scores[sym] / total
+
+    print("📊 PORTFOLIO:", portfolio_alloc)
+    save_portfolio()
+
+def get_open_positions():
+    try:
+        positions = binance.futures_position_information()
+        return [p for p in positions if float(p["positionAmt"]) != 0]
+    except Exception as e:
+        print("Error get_open_positions:", e)
+        return []
+
+# ⭐ NEW: centralized decision
+def should_execute_trade(signal):
+    score = signal.get("score", 0)
+    symbol = signal.get("symbol")
+
+    if KILL_SWITCH:
+        return False, "KILL_SWITCH"
+
+    if not AUTO_TRADING:
+        return False, "AUTO_OFF"
+
+    if symbol in disabled_pairs:
+        return False, "DISABLED_PAIR"
+
+    if not ai_allow_trade(symbol):
+        return False, "AI_BLOCK"
+
+    if score < MIN_SCORE:
+        return False, "LOW_SCORE"
+
+    if len(get_open_positions()) >= MAX_OPEN_TRADES:
+        return False, "MAX_POSITION"
+
+    # 🔥 NEW: strategy-based defense check
+    strategy = get_strategy(symbol)
+    if strategy == "DEFENSIVE" and score < 85:
+        return False, "DEFENSIVE_SKIP"
+
+    return True, "OK"
+
+# 🔥 NEW: fungsi strategi adaptif
+def get_strategy(symbol):
+    mem = ai_memory.get(symbol, {})
+    score = safe_score(mem)
+
+    if score >= 80:
+        return "AGGRESSIVE"
+    elif score >= 60:
+        return "BALANCED"
+    return "DEFENSIVE"
+
+# 🔥 NEW: scale in function
+def scale_in(symbol, side, sl, tp):
+    print("➕ SCALE IN", symbol)
+    place_order_multi(symbol, side, sl, tp)
+    send_telegram(f"➕ SCALE IN {symbol} {side}")
 
 # ===== MONITOR POSISI =====
 last_position_state = {}
@@ -751,7 +849,6 @@ def monitor_positions_for_memory_update():
                     update_risk(result, pnl)
                     update_ai_memory(symbol, result)
 
-                    # RL weights update pakai entry score jika ada
                     entry_score = position_entry_score.pop(symbol, 50)
                     update_rl_weights(result, entry_score)
 
@@ -813,6 +910,10 @@ def tickers(symbols: str = Query(default=",".join(PAIRS))):
         return {"data": get_multi_tickers(symbol_list)}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/ai-memory")
+def get_ai_memory():
+    return ai_memory
 
 @app.post("/ai-filter")
 def ai_filter(payload: dict = Body(...)):
@@ -958,6 +1059,35 @@ def kill_switch(payload: dict = Body(...)):
     KILL_SWITCH = state
     return {"kill_switch": KILL_SWITCH}
 
+@app.get("/ai-memory")
+def get_ai_memory():
+    return ai_memory
+
+# ⭐ NEW: signal receiver endpoint
+@app.post("/signal")
+def receive_signal(signal: dict):
+    global LAST_SIGNAL
+    LAST_SIGNAL = signal
+    ok, reason = should_execute_trade(signal)
+    if ok:
+        def execute():
+            place_order_multi(
+                signal["symbol"],
+                signal["type"],
+                signal["sl"],
+                signal["tp"]
+            )
+            position_entry_score[signal["symbol"]] = signal.get("score", 0)
+            send_telegram(f"""
+🚀 SIGNAL TRADE
+{signal['symbol']} {signal['type']}
+Score: {signal.get('score', 0)}
+""")
+        threading.Thread(target=execute, daemon=True).start()
+        return {"status": "executed", "reason": reason}
+    else:
+        return {"status": "rejected", "reason": reason}
+
 def smart_trailing():
     while True:
         try:
@@ -1004,10 +1134,20 @@ def auto_trader():
             if not AUTO_MODE:
                 time.sleep(SCAN_INTERVAL)
                 continue
+            if not AUTO_TRADING:
+                print("⏸️ AUTO TRADING DISABLED")
+                time.sleep(SCAN_INTERVAL)
+                continue
             if daily_loss >= MAX_DAILY_LOSS:
                 print("🚫 Skip trade: daily loss limit")
                 time.sleep(SCAN_INTERVAL)
                 continue
+
+            # 🔥 DEBUG: tampilkan isi ai_memory mentah
+            print("AI MEMORY RAW:", ai_memory)
+
+            # 🔥 NEW: perbarui alokasi portofolio berdasarkan AI memory
+            update_portfolio_allocation()
 
             regime = get_multi_tf_regime("BTCUSDT")
             vol = get_volatility("BTCUSDT")
@@ -1049,20 +1189,13 @@ def auto_trader():
                         "score": 85
                     }
 
-                    # Hitung meta score
                     score = meta_score(symbol, signal, regime, vol)
                     scores_map[symbol] = score
 
                 except Exception as e:
                     print(f"Scoring error {symbol}: {e}")
 
-            # Update portfolio allocation
-            global portfolio_alloc
-            portfolio_alloc = update_portfolio(scores_map)
-            save_portfolio()
-            print("📊 PORTFOLIO:", portfolio_alloc)
-
-            # --- Eksekusi trade berdasarkan alokasi ---
+            # --- Eksekusi trade dengan decision engine ---
             for symbol in pairs:
                 try:
                     if symbol in disabled_pairs:
@@ -1086,15 +1219,15 @@ def auto_trader():
                         "entry": last_price,
                         "sl": last_price * 0.995,
                         "tp": last_price * 1.01,
-                        "score": 85
+                        "score": scores_map.get(symbol, 0)
                     }
 
-                    score = scores_map.get(symbol, 0)
-                    if score < MIN_SCORE:
-                        print(f"⛔ META BLOCK {symbol} score={score}")
+                    ok, reason = should_execute_trade(signal)
+                    if not ok:
+                        print(f"❌ SKIP {symbol} - {reason}")
                         continue
 
-                    # Filter tambahan
+                    # Filter tambahan (regime, btc, strength)
                     if regime == "SIDEWAYS":
                         print(f"⏸️ Skip {symbol}: market SIDEWAYS")
                         continue
@@ -1115,9 +1248,11 @@ def auto_trader():
                         print(f"🧠 Strength divergence block: BTC {btc_strength:.2f}% vs {symbol} {alt_strength:.2f}%")
                         continue
 
-                    positions = binance.futures_position_information(symbol=symbol)
-                    pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
-                    if pos:
+                    positions = get_open_positions()
+                    if len(positions) >= MAX_OPEN_TRADES:
+                        print(f"❌ SKIP {symbol} - MAX_POSITION")
+                        continue
+                    if any(p["symbol"] == symbol for p in positions):
                         continue
 
                     dynamic_risk = get_dynamic_risk(regime, vol)
@@ -1136,16 +1271,19 @@ def auto_trader():
                         tp=signal["tp"]
                     )
 
-                    # Simpan entry score untuk RL update nanti
-                    position_entry_score[symbol] = score
+                    position_entry_score[symbol] = signal["score"]
 
                     send_telegram(f"""
 🤖 MULTI AUTO TRADE
 {symbol} {signal['type']}
-Score: {score:.1f} | Weight: {w:.2f}
+Score: {signal['score']:.1f} | Weight: {w:.2f}
 {result}
 """)
                     print("AUTO EXEC:", result)
+
+                    # 🔥 NEW: scale in jika skor sangat tinggi
+                    if signal["score"] >= 90:
+                        scale_in(symbol, signal["type"], signal["sl"], signal["tp"])
 
                 except Exception as e:
                     print("Pair error:", symbol, e)

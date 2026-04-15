@@ -36,3 +36,23 @@
     transform: rotate(360deg);
   }
 }
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr 280px;
+  grid-template-rows: 1fr 260px;
+  gap: 10px;
+  height: 100vh;
+}
+
+.left { grid-row: 1 / span 2; }
+.center { grid-column: 2; }
+.right { grid-row: 1 / span 2; }
+.bottom-left { grid-column: 2; grid-row: 2; }
+
+.card {
+  background: #0b0f14;
+  border-radius: 10px;
+  padding: 12px;
+  border: 1px solid #1f2a36;
+}
