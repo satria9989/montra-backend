@@ -10,7 +10,6 @@ certifi==2026.2.25
 cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.3.2
-coincurve==21.0.0
 colorama==0.4.6
 dateparser==1.4.0
 distro==1.9.0
