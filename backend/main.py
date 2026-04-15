@@ -14,8 +14,8 @@ from config import *
 print("🔥 FIREBASE_URL:", os.getenv("FIREBASE_URL"))
 
 # 🔒 SAFETY CHECK (WAJIB DI SINI)
-if not BINANCE_API_KEY:
-    raise Exception("BINANCE_API_KEY not set")
+if not BINANCE_API_KEY or not BINANCE_SECRET:
+    print("⚠️ BINANCE API NOT SET → BOT DISABLED")
 
 if not BINANCE_SECRET:
     raise Exception("BINANCE_SECRET not set")
@@ -68,6 +68,18 @@ from data import get_ticker, get_ohlcv, get_multi_tickers
 
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
+
+@app.get("/ai-memory")
+def get_ai_memory():
+    return ai_memory
+
+@app.get("/accounts")
+def get_accounts():
+    return {"accounts": []}
+
+@app.get("/positions")
+def get_positions():
+    return {"positions": []}
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,6 +140,7 @@ ai_memory = {}  # simpan skor tiap simbol
 trade_history = []  # journal semua trade
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
+print("🔥 FIREBASE_URL:", FIREBASE_URL)
 
 # === RL WEIGHTS ===
 rl_weights = {
@@ -910,10 +923,6 @@ def tickers(symbols: str = Query(default=",".join(PAIRS))):
         return {"data": get_multi_tickers(symbol_list)}
     except Exception as e:
         return {"error": str(e)}
-
-@app.get("/ai-memory")
-def get_ai_memory():
-    return ai_memory
 
 @app.post("/ai-filter")
 def ai_filter(payload: dict = Body(...)):
