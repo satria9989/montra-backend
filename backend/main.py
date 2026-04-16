@@ -36,6 +36,7 @@ AUTO_TRADING = True          # ⭐ NEW: switch on/off via Telegram
 SCAN_INTERVAL = 15           # detik
 MIN_SCORE = 58
 MAX_OPEN_TRADES = 3          # ⭐ NEW: batas maksimum posisi terbuka
+GLOBAL_SYMBOL_LOCK = set()
 
 ACCOUNTS = [
     {
@@ -70,6 +71,7 @@ except Exception:
     lgb = None
 
 from data import get_ticker, get_ohlcv, get_multi_tickers
+from ws_feed import start_ws, get_live_candle, get_live_mark, get_live_age
 
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
@@ -169,6 +171,16 @@ def clean_url(url):
 
 def firebase_ready():
     return bool(FIREBASE_URL and FIREBASE_URL.startswith("http"))
+    
+def get_session_utc():
+    h = time.gmtime().tm_hour
+    if 7 <= h < 13:
+        return "LONDON"
+    if 13 <= h < 22:
+        return "NEWYORK"
+    if 0 <= h < 7:
+        return "ASIA"
+    return "OFF"
 
 ai_memory = {}  # simpan skor tiap simbol
 trade_history = []  # journal semua trade
@@ -363,7 +375,7 @@ def cancel_existing_orders(symbol):
     except Exception as e:
         print("Cancel error:", e)
         return False
-
+    
 def place_futures_order(symbol, side, quantity, sl, tp):
     try:
         sl = normalize_price(symbol, sl)
@@ -436,7 +448,7 @@ def place_order_multi(symbol, side, sl, tp):
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
-            alloc = portfolio_alloc.get(symbol, 0.25)
+            alloc = min(portfolio_alloc.get(symbol, 0.25), 0.12)
             risk_amount = balance * risk_pct * alloc
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
             stop_distance = abs(price - sl)
@@ -662,6 +674,12 @@ def ai_allow_trade(symbol):
     return True
 
 # === HELPER FUNCTIONS ===
+def get_ohlcv_cached(symbol, interval="15m"):
+    live = get_live_candle(symbol)
+    if live and get_live_age(symbol) < 10:
+        return live
+    return None
+    
 def _get_trend(symbol):
     try:
         klines = binance.futures_klines(symbol=symbol, interval="1h", limit=50)
@@ -968,6 +986,8 @@ def monitor_positions_for_memory_update():
                     print(f"📝 Journal updated: {symbol} {result}")
 
                     send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
+                    
+                    GLOBAL_SYMBOL_LOCK.discard(symbol)
 
             last_position_state = current_state
 
@@ -1281,6 +1301,11 @@ def auto_trader():
                 print("⚠️ Skip: high volatility")
                 time.sleep(SCAN_INTERVAL)
                 continue
+            session = get_session_utc()
+            if session not in ("LONDON", "NEWYORK"):
+                print(f"⏸️ Skip: off session ({session})")
+                time.sleep(SCAN_INTERVAL)
+                continue
 
             pairs = PAIRS.copy()
             scores_map = {}
@@ -1295,9 +1320,12 @@ def auto_trader():
                     if not ai_allow_trade(symbol):
                         continue
 
-                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
-                    closes = [float(c[4]) for c in ohlcv]
-                    last_price = closes[-1]
+                    live = get_live_candle(symbol)
+                    if live and get_live_age(symbol) < 10:
+                        last_price = live["close"]
+                    else:
+                        ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                        last_price = float(ohlcv[-1][4])
 
                     # === STRUCTURE LOGIC ===
                     highs = [float(c[2]) for c in ohlcv]
@@ -1353,12 +1381,20 @@ def auto_trader():
 
                     # === BUY RUMOR / SELL NEWS ===
                     # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
-                    # news impact dipakai lewat apply_news_bias() saja, jangan reverse dua kali
+                    # news impact dipakai lewat apply_news_bias() saja
 
                     # === ENTRY, SL, TP ===
                     ob_candle = ohlcv[-4]
 
                     final_side = apply_news_bias(signal_type, news_reverse)
+                    
+                    pair_regime = get_multi_tf_regime(symbol)
+                    if pair_regime == "SIDEWAYS":
+                        continue
+                    if pair_regime == "BULL" and final_side != "BUY":
+                        continue
+                    if pair_regime == "BEAR" and final_side != "SELL":
+                        continue
                     
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
@@ -1366,6 +1402,10 @@ def auto_trader():
                     else:
                         sl = float(ob_candle[2])  # high OB
                         tp = last_price - (sl - last_price) * 2
+                        
+                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
+                    if rr < 3.2:
+                        continue
                     
                     signal = {
                         "symbol": symbol,
@@ -1383,8 +1423,8 @@ def auto_trader():
                     ))
                     score = round((score * 0.8) + (ml_prob * 100 * 0.2))
                                                           
-                    if news_reverse:
-                        score -= 10
+                    if news_impact == "HIGH":
+                        score -= 6
 
                     # === SMC BOOST ===
                     if fvg_up or fvg_down:
@@ -1418,9 +1458,12 @@ def auto_trader():
                     if w <= 0:
                         continue
 
-                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
-                    closes = [float(c[4]) for c in ohlcv]
-                    last_price = closes[-1]
+                    live = get_live_candle(symbol)
+                    if live and get_live_age(symbol) < 10:
+                        last_price = live["close"]
+                    else:
+                        ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                        last_price = float(ohlcv[-1][4])
 
                     # === STRUCTURE LOGIC ===
                     highs = [float(c[2]) for c in ohlcv]
@@ -1483,12 +1526,24 @@ def auto_trader():
 
                     final_side = apply_news_bias(signal_type, news_reverse)
                     
+                    pair_regime = get_multi_tf_regime(symbol)
+                    if pair_regime == "SIDEWAYS":
+                        continue
+                    if pair_regime == "BULL" and final_side != "BUY":
+                        continue
+                    if pair_regime == "BEAR" and final_side != "SELL":
+                        continue
+                    
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
                         tp = last_price + (last_price - sl) * 2
                     else:
                         sl = float(ob_candle[2])  # high OB
                         tp = last_price - (sl - last_price) * 2
+                        
+                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
+                    if rr < 3.2:
+                        continue
                     
                     signal = {
                         "symbol": symbol,
@@ -1537,6 +1592,10 @@ def auto_trader():
                         continue
                     if any(p["symbol"] == symbol for p in positions):
                         continue
+                    
+                    if symbol in GLOBAL_SYMBOL_LOCK:
+                        print(f"🔒 SKIP {symbol} already open")
+                        continue
 
                     dynamic_risk = get_dynamic_risk(regime, vol)
                     balance_info = binance.futures_account_balance()
@@ -1553,6 +1612,8 @@ def auto_trader():
                         sl=signal["sl"],
                         tp=signal["tp"]
                     )
+                    
+                    GLOBAL_SYMBOL_LOCK.add(symbol)
 
                     position_entry_score[symbol] = signal["score"]
 
@@ -1597,6 +1658,7 @@ def start_background_tasks():
     _bot_started = True
     if AUTO_MODE:
         load_exchange_cache()
+        start_ws(PAIRS, interval="15m")
         eq = get_total_equity()
         START_EQUITY = eq
         DAILY_START_EQUITY = eq
