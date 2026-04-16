@@ -1353,11 +1353,7 @@ def auto_trader():
 
                     # === BUY RUMOR / SELL NEWS ===
                     # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
-                    if news_impact == "HIGH":
-                        if signal_type == "BUY":
-                            signal_type = "SELL"
-                        else:
-                            signal_type = "BUY"
+                    # news impact dipakai lewat apply_news_bias() saja, jangan reverse dua kali
 
                     # === ENTRY, SL, TP ===
                     ob_candle = ohlcv[-4]
