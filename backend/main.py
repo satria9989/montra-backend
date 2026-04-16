@@ -64,6 +64,11 @@ from openai import OpenAI
 from binance.client import Client
 from binance.enums import *
 
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
+
 from data import get_ticker, get_ohlcv, get_multi_tickers
 
 # ================= INIT =================
@@ -135,8 +140,6 @@ EXCHANGE_CACHE = {}
 LAST_STOP_PRICE = {}
 
 # ===== AI MEMORY & FIREBASE =====
-ai_memory = {}  # simpan skor tiap simbol
-trade_history = []  # journal semua trade
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
 print("🔥 FIREBASE_URL:", FIREBASE_URL)
@@ -155,6 +158,25 @@ portfolio_alloc = {}  # {symbol: weight 0..1}
 position_entry_score = {}  # menyimpan score saat entry untuk RL update
 
 LAST_SIGNAL = None
+
+def clean_url(url):
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith("FIREBASE_URL="):
+        url = url.split("=", 1)[1].strip()
+    return url.rstrip("/")
+
+def firebase_ready():
+    return bool(FIREBASE_URL and FIREBASE_URL.startswith("http"))
+
+ai_memory = {}  # simpan skor tiap simbol
+trade_history = []  # journal semua trade
+
+ENABLE_ML = os.getenv("ENABLE_ML", "false").lower() == "true"
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "models/lgbm_model.txt")
+FALLBACK_MODE = os.getenv("FALLBACK_MODE", "true").lower() == "true"
+ML_MODEL = None
 
 # === NEWS ENGINE ===
 NEWS_CACHE = {"last_check": 0, "impact": "LOW"}
@@ -190,26 +212,29 @@ def get_market_news():
         return "NORMAL"
 
 def save_ai_memory():
-    if not FIREBASE_URL:
+    if not firebase_ready():
         return
     try:
-        requests.put(f"{FIREBASE_URL}/ai_memory.json", json=ai_memory)
+        requests.put(f"{FIREBASE_URL}/ai_memory.json", json=ai_memory, timeout=5)
         print("💾 AI memory saved")
     except Exception as e:
         print("Save error:", e)
 
 def save_portfolio():
-    if not FIREBASE_URL:
-        print("⚠️ FIREBASE_URL not set")
+    if not firebase_ready():
         return
-    requests.put(f"{FIREBASE_URL}/portfolio.json", json=portfolio_alloc)
+    try:
+        requests.put(f"{FIREBASE_URL}/portfolio.json", json=portfolio_alloc, timeout=5)
+    except Exception as e:
+        print("Save portfolio error:", e)
 
 def load_ai_memory():
     global ai_memory
-    if not FIREBASE_URL:
+    if not firebase_ready():
+        print("⚠️ Firebase invalid → fallback mode")
         return
     try:
-        res = requests.get(f"{FIREBASE_URL}/ai_memory.json")
+        res = requests.get(f"{FIREBASE_URL}/ai_memory.json", timeout=5)
         data = res.json()
         if data:
             ai_memory = data
@@ -218,20 +243,21 @@ def load_ai_memory():
         print("Load error:", e)
 
 def save_rl_weights():
-    if not FIREBASE_URL:
+    if not firebase_ready():
         return
     try:
-        requests.put(f"{FIREBASE_URL}/rl_weights.json", json=rl_weights)
+        requests.put(f"{FIREBASE_URL}/rl_weights.json", json=rl_weights, timeout=5)
         print("⚖️ RL weights saved")
     except Exception as e:
         print("Save RL weights error:", e)
 
 def load_rl_weights():
     global rl_weights
-    if not FIREBASE_URL:
+    if not firebase_ready():
+        print("⚠️ Firebase invalid → fallback mode")
         return
     try:
-        res = requests.get(f"{FIREBASE_URL}/rl_weights.json")
+        res = requests.get(f"{FIREBASE_URL}/rl_weights.json", timeout=5)
         data = res.json()
         if data:
             rl_weights = data
@@ -239,6 +265,31 @@ def load_rl_weights():
     except Exception as e:
         print("Load RL weights error:", e)
 
+def load_ml_model():
+    global ML_MODEL
+    if not ENABLE_ML or lgb is None:
+        print("⚠️ LightGBM disabled → fallback mode")
+        return
+    if not os.path.exists(ML_MODEL_PATH):
+        print("⚠️ LightGBM model not found → fallback mode")
+        return
+    try:
+        ML_MODEL = lgb.Booster(model_file=ML_MODEL_PATH)
+        print("🧠 LightGBM loaded")
+    except Exception as e:
+        print("Load ML error:", e)
+
+def ml_predict(features):
+    if ML_MODEL is None:
+        return 0.5
+    try:
+        p = ML_MODEL.predict([features])[0]
+        return float(max(0, min(1, p)))
+    except Exception as e:
+        print("ML predict error:", e)
+        return 0.5
+
+load_ml_model()
 load_ai_memory()
 load_rl_weights()
 
@@ -700,6 +751,26 @@ def get_dynamic_risk(regime, vol):
     if regime in ["BULL", "BEAR"]:
         risk *= 1.2
     return max(MIN_RISK, min(MAX_RISK, risk))
+
+def build_ml_features(symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low):
+    mem = safe_score(ai_memory.get(symbol, {"score": 50}))
+    stats = pair_stats.get(symbol, {"wins": 0, "losses": 0})
+    total = stats["wins"] + stats["losses"]
+    winrate = (stats["wins"] / total) if total > 0 else 0.5
+
+    return [
+        mem / 100.0,
+        winrate,
+        1.0 if regime == "BULL" else 0.0,
+        1.0 if regime == "BEAR" else 0.0,
+        float(vol),
+        1.0 if final_side == "BUY" else 0.0,
+        1.0 if news_reverse else 0.0,
+        1.0 if fvg_up else 0.0,
+        1.0 if fvg_down else 0.0,
+        1.0 if sweep_high else 0.0,
+        1.0 if sweep_low else 0.0,
+    ]
 
 # === JOURNAL & META SCORE ===
 def analyze_journal():
@@ -1311,6 +1382,11 @@ def auto_trader():
 
                     score = meta_score(symbol, signal, regime, vol)
                     
+                    ml_prob = ml_predict(build_ml_features(
+                        symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
+                    ))
+                    score = round((score * 0.8) + (ml_prob * 100 * 0.2))
+                                                          
                     if news_reverse:
                         score -= 10
 
@@ -1431,6 +1507,12 @@ def auto_trader():
                         "score": scores_map.get(symbol, 0)
                     }
 
+                    ml_prob = ml_predict(build_ml_features(
+                        symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
+                    ))
+                    score = round((scores_map.get(symbol, 0) * 0.8) + (ml_prob * 100 * 0.2))
+                    signal["score"] = score
+                    
                     ok, reason = should_execute_trade(signal)
                     if not ok:
                         print(f"❌ SKIP {symbol} - {reason}")
