@@ -34,7 +34,7 @@ check_env()
 AUTO_MODE = True
 AUTO_TRADING = True          # ⭐ NEW: switch on/off via Telegram
 SCAN_INTERVAL = 15           # detik
-MIN_SCORE = 80
+MIN_SCORE = 65
 MAX_OPEN_TRADES = 3          # ⭐ NEW: batas maksimum posisi terbuka
 
 ACCOUNTS = [
@@ -123,7 +123,6 @@ LAST_DAY = None
 # ===== PERFORMANCE TRACKING =====
 daily_loss = 0
 consecutive_loss = 0
-# 🔥 FIX: Gunakan nilai dari config
 current_risk = BASE_RISK
 MIN_RISK = 0.005
 MAX_RISK = 0.03
@@ -155,8 +154,40 @@ rl_weights = {
 portfolio_alloc = {}  # {symbol: weight 0..1}
 position_entry_score = {}  # menyimpan score saat entry untuk RL update
 
-# ⭐ NEW: signal storage
 LAST_SIGNAL = None
+
+# === NEWS ENGINE ===
+NEWS_CACHE = {"last_check": 0, "impact": "LOW"}
+
+def get_market_news():
+    global NEWS_CACHE
+
+    # cache 5 menit
+    if time.time() - NEWS_CACHE["last_check"] < 300:
+        return NEWS_CACHE["impact"]
+
+    try:
+        # pakai free API (Forex Factory alternatif simple) - FNG API
+        res = requests.get("https://api.alternative.me/fng/").json()
+        value = int(res["data"][0]["value"])
+
+        # fear = panic → biasanya reversal (atau extreme greed)
+        if value < 25:
+            impact = "HIGH"
+        elif value > 75:
+            impact = "HIGH"
+        else:
+            impact = "NORMAL"
+
+        NEWS_CACHE = {
+            "last_check": time.time(),
+            "impact": impact
+        }
+
+        return impact
+
+    except:
+        return "NORMAL"
 
 def save_ai_memory():
     if not FIREBASE_URL:
@@ -354,7 +385,6 @@ def place_order_multi(symbol, side, sl, tp):
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
-            # ✅ UPDATED: gunakan alokasi portofolio untuk position sizing
             alloc = portfolio_alloc.get(symbol, 0.25)
             risk_amount = balance * risk_pct * alloc
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
@@ -526,7 +556,6 @@ def update_pair_stats(symbol, result, pnl):
         stats["losses"] += 1
     stats["pnl"] += pnl
 
-    # ✅ UPDATED: auto disable pair setelah 3 loss berturut-turut
     if stats["losses"] >= 3:
         disabled_pairs.add(symbol)
         print(f"🚫 Pair {symbol} disabled after {stats['losses']} losses")
@@ -548,7 +577,6 @@ def reset_pairs():
     global disabled_pairs
     disabled_pairs = set()
 
-# 🔥 NEW: helper untuk ekstrak skor dengan aman
 def safe_score(mem):
     if isinstance(mem, dict):
         return float(mem.get("score", 50))
@@ -560,7 +588,6 @@ def safe_score(mem):
 # ===== AI MEMORY FUNCTIONS =====
 def update_ai_memory(symbol, result):
     global ai_memory
-    # 🔥 FIX: pastikan entri adalah dict
     if symbol not in ai_memory or not isinstance(ai_memory.get(symbol), dict):
         ai_memory[symbol] = {"score": 50, "trades": 0}
     mem = ai_memory[symbol]
@@ -688,7 +715,6 @@ def analyze_journal():
     return stats
 
 def meta_score(symbol, signal, regime, vol):
-    # Komponen skor (0-100)
     mem = ai_memory.get(symbol, {"score": 50})
     memory_score = safe_score(mem)
 
@@ -735,7 +761,6 @@ def update_rl_weights(result, score):
     save_rl_weights()
 
 # === PORTFOLIO ALLOCATION ===
-# 🔥 FIX: alokasi berdasarkan skor ai_memory dengan type safety
 def update_portfolio_allocation():
     global portfolio_alloc
 
@@ -743,7 +768,6 @@ def update_portfolio_allocation():
     total = 0
 
     for sym, mem in ai_memory.items():
-        # 🔥 FIX TYPE SAFETY
         if isinstance(mem, dict):
             score = mem.get("score", 50)
         else:
@@ -796,25 +820,22 @@ def should_execute_trade(signal):
     if len(get_open_positions()) >= MAX_OPEN_TRADES:
         return False, "MAX_POSITION"
 
-    # 🔥 NEW: strategy-based defense check
     strategy = get_strategy(symbol)
     if strategy == "DEFENSIVE" and score < 85:
         return False, "DEFENSIVE_SKIP"
 
     return True, "OK"
 
-# 🔥 NEW: fungsi strategi adaptif
 def get_strategy(symbol):
     mem = ai_memory.get(symbol, {})
     score = safe_score(mem)
 
-    if score >= 80:
+    if score >= 65:
         return "AGGRESSIVE"
-    elif score >= 60:
+    elif score >= 55:
         return "BALANCED"
     return "DEFENSIVE"
 
-# 🔥 NEW: scale in function
 def scale_in(symbol, side, sl, tp):
     print("➕ SCALE IN", symbol)
     place_order_multi(symbol, side, sl, tp)
@@ -1129,6 +1150,11 @@ def smart_trailing():
             print("Trailing error:", e)
             time.sleep(5)
 
+def apply_news_bias(signal_type, news_reverse):
+    if news_reverse:
+        return "SELL" if signal_type == "BUY" else "BUY"
+    return signal_type
+
 def auto_trader():
     while True:
         try:
@@ -1163,6 +1189,19 @@ def auto_trader():
             print(f"🧠 MTF REGIME: {regime}")
             print(f"🌊 VOL: {vol:.4f}")
 
+            # === VOL SPIKE DETECTION ===
+            if vol > 0.015:
+                print("⚠️ VOL SPIKE → MARKET CHAOS")
+
+            # === NEWS FILTER ===
+            news_impact = get_market_news()
+            print(f"📰 NEWS IMPACT: {news_impact}")
+
+            # === NEWS STATE ===
+            news_reverse = (news_impact == "HIGH")
+            if news_reverse:
+                print("📰 HIGH IMPACT NEWS → SMC tetap jalan, arah akan di-reverse")
+
             if vol < 0.002:
                 print("⏸️ Skip: low volatility")
                 time.sleep(SCAN_INTERVAL)
@@ -1189,16 +1228,105 @@ def auto_trader():
                     closes = [float(c[4]) for c in ohlcv]
                     last_price = closes[-1]
 
+                    # === STRUCTURE LOGIC ===
+                    highs = [float(c[2]) for c in ohlcv]
+                    lows = [float(c[3]) for c in ohlcv]
+
+                    hh = highs[-1] > highs[-5]
+                    ll = lows[-1] < lows[-5]
+
+                    # === FVG DETECTION ===
+                    fvg_up = False
+                    fvg_down = False
+
+                    if len(ohlcv) >= 3:
+                        c1 = ohlcv[-3]
+                        c2 = ohlcv[-2]
+                        c3 = ohlcv[-1]
+
+                        if float(c1[2]) < float(c3[3]):
+                            fvg_up = True
+                        if float(c1[3]) > float(c3[2]):
+                            fvg_down = True
+
+                    if hh and fvg_up:
+                        signal_type = "BUY"
+                    elif ll and fvg_down:
+                        signal_type = "SELL"
+                    else:
+                        continue  # skip kalau no structure
+
+                    # === FILTER FAKE MOVE (liquidity sweep) ===
+                    last_candle = ohlcv[-1]
+                    prev_candle = ohlcv[-2]
+
+                    wick_up = float(last_candle[2]) - max(float(last_candle[1]), float(last_candle[4]))
+                    wick_down = min(float(last_candle[1]), float(last_candle[4])) - float(last_candle[3])
+
+                    if wick_up > wick_down * 2 and signal_type == "BUY":
+                        continue
+                    if wick_down > wick_up * 2 and signal_type == "SELL":
+                        continue
+
+                    # === LIQUIDITY SWEEP CHECK ===
+                    recent_high = max(highs[-11:-1])
+                    recent_low = min(lows[-11:-1])
+
+                    sweep_high = highs[-1] > recent_high
+                    sweep_low = lows[-1] < recent_low
+
+                    if signal_type == "BUY" and not sweep_low:
+                        continue
+                    if signal_type == "SELL" and not sweep_high:
+                        continue
+
+                    # === BUY RUMOR / SELL NEWS ===
+                    # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
+                    if news_impact == "HIGH":
+                        if signal_type == "BUY":
+                            signal_type = "SELL"
+                        else:
+                            signal_type = "BUY"
+
+                    # === ENTRY, SL, TP ===
+                    ob_candle = ohlcv[-4]
+
+                    final_side = apply_news_bias(signal_type, news_reverse)
+                    
+                    if final_side == "BUY":
+                        sl = float(ob_candle[3])  # low OB
+                        tp = last_price + (last_price - sl) * 2
+                    else:
+                        sl = float(ob_candle[2])  # high OB
+                        tp = last_price - (sl - last_price) * 2
+                    
                     signal = {
                         "symbol": symbol,
-                        "type": "BUY" if closes[-1] > closes[-2] else "SELL",
+                        "type": final_side,
                         "entry": last_price,
-                        "sl": last_price * 0.995,
-                        "tp": last_price * 1.01,
+                        "sl": sl,
+                        "tp": tp,
                         "score": 85
                     }
 
                     score = meta_score(symbol, signal, regime, vol)
+                    
+                    if news_reverse:
+                        score -= 10
+
+                    # === SMC BOOST ===
+                    if fvg_up or fvg_down:
+                        score += 5
+                    if sweep_high or sweep_low:
+                        score += 5
+
+                    # === NEWS FACTOR ===
+                    if news_impact == "HIGH":
+                        score -= 10
+                    elif news_impact == "NORMAL":
+                        score += 2
+
+                    score = min(score, 100)
                     scores_map[symbol] = score
 
                 except Exception as e:
@@ -1222,12 +1350,84 @@ def auto_trader():
                     closes = [float(c[4]) for c in ohlcv]
                     last_price = closes[-1]
 
+                    # === STRUCTURE LOGIC ===
+                    highs = [float(c[2]) for c in ohlcv]
+                    lows = [float(c[3]) for c in ohlcv]
+
+                    hh = highs[-1] > highs[-5]
+                    ll = lows[-1] < lows[-5]
+
+                    # === FVG DETECTION ===
+                    fvg_up = False
+                    fvg_down = False
+
+                    if len(ohlcv) >= 3:
+                        c1 = ohlcv[-3]
+                        c2 = ohlcv[-2]
+                        c3 = ohlcv[-1]
+
+                        if float(c1[2]) < float(c3[3]):
+                            fvg_up = True
+                        if float(c1[3]) > float(c3[2]):
+                            fvg_down = True
+
+                    if hh and fvg_up:
+                        signal_type = "BUY"
+                    elif ll and fvg_down:
+                        signal_type = "SELL"
+                    else:
+                        continue  # skip kalau no structure
+
+                    # === FILTER FAKE MOVE (liquidity sweep) ===
+                    last_candle = ohlcv[-1]
+                    prev_candle = ohlcv[-2]
+
+                    wick_up = float(last_candle[2]) - max(float(last_candle[1]), float(last_candle[4]))
+                    wick_down = min(float(last_candle[1]), float(last_candle[4])) - float(last_candle[3])
+
+                    if wick_up > wick_down * 2 and signal_type == "BUY":
+                        continue
+                    if wick_down > wick_up * 2 and signal_type == "SELL":
+                        continue
+
+                    # === LIQUIDITY SWEEP CHECK ===
+                    recent_high = max(highs[-11:-1])
+                    recent_low = min(lows[-11:-1])
+
+                    sweep_high = highs[-1] > recent_high
+                    sweep_low = lows[-1] < recent_low
+
+                    if signal_type == "BUY" and not sweep_low:
+                        continue
+                    if signal_type == "SELL" and not sweep_high:
+                        continue
+
+                    # === BUY RUMOR / SELL NEWS ===
+                    # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
+                    if news_impact == "HIGH":
+                        if signal_type == "BUY":
+                            signal_type = "SELL"
+                        else:
+                            signal_type = "BUY"
+
+                    # === ENTRY, SL, TP ===
+                    ob_candle = ohlcv[-4]
+
+                    final_side = apply_news_bias(signal_type, news_reverse)
+                    
+                    if final_side == "BUY":
+                        sl = float(ob_candle[3])  # low OB
+                        tp = last_price + (last_price - sl) * 2
+                    else:
+                        sl = float(ob_candle[2])  # high OB
+                        tp = last_price - (sl - last_price) * 2
+                    
                     signal = {
                         "symbol": symbol,
-                        "type": "BUY" if closes[-1] > closes[-2] else "SELL",
+                        "type": final_side,
                         "entry": last_price,
-                        "sl": last_price * 0.995,
-                        "tp": last_price * 1.01,
+                        "sl": sl,
+                        "tp": tp,
                         "score": scores_map.get(symbol, 0)
                     }
 
@@ -1290,7 +1490,6 @@ Score: {signal['score']:.1f} | Weight: {w:.2f}
 """)
                     print("AUTO EXEC:", result)
 
-                    # 🔥 NEW: scale in jika skor sangat tinggi
                     if signal["score"] >= 90:
                         scale_in(symbol, signal["type"], signal["sl"], signal["tp"])
 

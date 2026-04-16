@@ -465,6 +465,7 @@ function createOverlayCanvas(container: HTMLDivElement) {
 
 async function drawLiquidationHeatmapAndFootprint(
   chart: any,
+  candleSeries: any,
   symbol: string,
   overlay: {
     clear: () => void;
@@ -578,7 +579,7 @@ async function drawLiquidationHeatmapAndFootprint(
   // Garis harga terakhir
   if (candles.length > 0) {
     const last = candles[candles.length - 1];
-    const yPrice = chart.priceScale("right").priceToCoordinate(last.close);
+    const yPrice = candleSeries.priceToCoordinate(last.close);
     if (yPrice !== null && yPrice !== undefined && Number.isFinite(yPrice) && yPrice < priceAreaH) {
       ctx.save();
       ctx.strokeStyle = "rgba(255,255,255,0.65)";
@@ -598,8 +599,8 @@ async function drawLiquidationHeatmapAndFootprint(
   // ===== HTF ZONES (OB + FVG dari 1h) transparan, hanya untuk ANALYSIS/DEBUG =====
   if ((mode === "ANALYSIS" || mode === "DEBUG") && htfZones && htfZones.length > 0) {
     htfZones.forEach((z: any) => {
-      const yTop = chart.priceScale("right").priceToCoordinate(z.top);
-      const yBottom = chart.priceScale("right").priceToCoordinate(z.bottom);
+      const yTop = candleSeries.priceToCoordinate(z.top);
+      const yBottom = candleSeries.priceToCoordinate(z.bottom);
       if (yTop === null || yBottom === null || yTop === undefined || yBottom === undefined) return;
       const topY = Math.min(yTop, yBottom);
       const bottomY = Math.max(yTop, yBottom);
@@ -616,7 +617,7 @@ async function drawLiquidationHeatmapAndFootprint(
   if ((mode === "ANALYSIS" || mode === "DEBUG") && liqZones.length > 0) {
     const topLiquidity = liqZones.slice(0, 3);
     topLiquidity.forEach((z) => {
-      const y = chart.priceScale("right").priceToCoordinate(z.level);
+      const y = candleSeries.priceToCoordinate(z.level);
       if (y === null || y === undefined || !Number.isFinite(y)) return;
       ctx.save();
       ctx.strokeStyle = "#FFD700";
@@ -672,7 +673,7 @@ async function drawLiquidationHeatmapAndFootprint(
 
     // Liquidation zones (semua)
     liqZones.forEach((z) => {
-      const y = chart.priceScale("right").priceToCoordinate(z.level);
+      const y = candleSeries.priceToCoordinate(z.level);
       if (y === null || y === undefined || !Number.isFinite(y)) return;
       const intensity = Math.max(0.12, Math.min(0.7, z.strength / 4));
       const bandH = 10 + z.strength * 12;
@@ -717,7 +718,7 @@ async function drawLiquidationHeatmapAndFootprint(
 
     if (liqZones.length > 0 && bias !== "NO TRADE" && bias !== "WAIT") {
       const z = liqZones[0];
-      const y = chart.priceScale("right").priceToCoordinate(z.level);
+      const y = candleSeries.priceToCoordinate(z.level);
       if (y !== null && y !== undefined && Number.isFinite(y)) {
         ctx.save();
         ctx.strokeStyle = bias === "LONG" ? "#00FFAA" : "#FF4444";
@@ -738,7 +739,7 @@ async function drawLiquidationHeatmapAndFootprint(
     // Orderbook heatmap
     levels.forEach((x: any) => {
       if (x.size < 5) return;
-      const y = chart.priceScale("right").priceToCoordinate(x.price);
+      const y = candleSeries.priceToCoordinate(x.price);
       if (y === null || y === undefined || !Number.isFinite(y)) return;
       if (y > priceAreaH + 12) return;
       const intensity = x.size / maxSize;
@@ -874,7 +875,7 @@ export default function Chart({ symbol, selected }: Props) {
     const loadData = async () => {
       try {
         // Load HTF zones terlebih dahulu (atau paralel)
-        await loadHTF(symbol);
+        loadHTF(symbol); // jangan pakai await
 
         const res = await axios.get(
           `https://montra-backend-9wku.onrender.com/ohlcv/${symbol}?timeframe=15m&limit=100`
@@ -1226,6 +1227,7 @@ export default function Chart({ symbol, selected }: Props) {
 
         await drawLiquidationHeatmapAndFootprint(
           chart,
+		  candleSeries,
           symbol,
           overlay,
           latestCandles,
@@ -1249,6 +1251,7 @@ export default function Chart({ symbol, selected }: Props) {
       const lastPrice = latestCandles.length > 0 ? latestCandles[latestCandles.length - 1].close : undefined;
       await drawLiquidationHeatmapAndFootprint(
         chart,
+		candleSeries,
         symbol,
         overlay,
         latestCandles,
@@ -1280,7 +1283,7 @@ export default function Chart({ symbol, selected }: Props) {
       overlay.destroy();
       chart.remove();
     };
-  }, [symbol, mode, selected, htfZones]); // tambah htfZones dependency
+  }, [symbol, mode, selected]);
 
   return (
     <div style={{ width: "100%" }}>
