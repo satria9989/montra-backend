@@ -50,3 +50,5 @@ websockets==16.0
 yarl==1.23.0
 ccxt
 lightgbm
+websocket-client
+orjson
