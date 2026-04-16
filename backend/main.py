@@ -34,7 +34,7 @@ check_env()
 AUTO_MODE = True
 AUTO_TRADING = True          # ⭐ NEW: switch on/off via Telegram
 SCAN_INTERVAL = 15           # detik
-MIN_SCORE = 65
+MIN_SCORE = 58
 MAX_OPEN_TRADES = 3          # ⭐ NEW: batas maksimum posisi terbuka
 
 ACCOUNTS = [
@@ -656,7 +656,7 @@ def ai_allow_trade(symbol):
     if not mem:
         return True
     score = safe_score(mem)
-    if score < 40:
+    if score < 35:
         print(f"🧠 AI BLOCK {symbol} score={score}")
         return False
     return True
@@ -892,7 +892,7 @@ def should_execute_trade(signal):
         return False, "MAX_POSITION"
 
     strategy = get_strategy(symbol)
-    if strategy == "DEFENSIVE" and score < 85:
+    if strategy == "DEFENSIVE" and score < 75:
         return False, "DEFENSIVE_SKIP"
 
     return True, "OK"
@@ -901,9 +901,9 @@ def get_strategy(symbol):
     mem = ai_memory.get(symbol, {})
     score = safe_score(mem)
 
-    if score >= 65:
+    if score >= 60:
         return "AGGRESSIVE"
-    elif score >= 55:
+    elif score >= 50:
         return "BALANCED"
     return "DEFENSIVE"
 
@@ -1273,11 +1273,11 @@ def auto_trader():
             if news_reverse:
                 print("📰 HIGH IMPACT NEWS → SMC tetap jalan, arah akan di-reverse")
 
-            if vol < 0.002:
+            if vol < 0.0015:
                 print("⏸️ Skip: low volatility")
                 time.sleep(SCAN_INTERVAL)
                 continue
-            if vol > 0.02:
+            if vol > 0.03:
                 print("⚠️ Skip: high volatility")
                 time.sleep(SCAN_INTERVAL)
                 continue
@@ -1400,7 +1400,7 @@ def auto_trader():
                     if news_impact == "HIGH":
                         score -= 10
                     elif news_impact == "NORMAL":
-                        score += 2
+                        score += 8
 
                     score = min(score, 100)
                     scores_map[symbol] = score
@@ -1480,11 +1480,7 @@ def auto_trader():
 
                     # === BUY RUMOR / SELL NEWS ===
                     # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
-                    if news_impact == "HIGH":
-                        if signal_type == "BUY":
-                            signal_type = "SELL"
-                        else:
-                            signal_type = "BUY"
+                    # news impact dipakai lewat apply_news_bias() saja, jangan reversal dua kali
 
                     # === ENTRY, SL, TP ===
                     ob_candle = ohlcv[-4]

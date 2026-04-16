@@ -231,8 +231,8 @@ function groupBySymbol(journal: JournalItem[]) {
 // Menentukan aksi berdasarkan score confluence:
 //   ≥80 → langsung execute | ≥60 → tunggu konfirmasi tambahan | <60 → skip
 function getDecision(score: number) {
-  if (score >= 80) return "EXECUTE";
-  if (score >= 60) return "WAIT";
+  if (score >= 75) return "EXECUTE";
+  if (score >= 55) return "WAIT";
   return "SKIP";
 }
 
