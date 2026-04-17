@@ -10,6 +10,9 @@ LIVE_MARK = {}
 LAST_UPDATE = {}
 WS_THREAD = None
 WS_RUNNING = False
+WS_LAST_ERROR = None
+WS_LAST_START = 0
+WS_RESTART_COUNT = 0
 
 def build_stream_url(symbols, interval="15m"):
     streams = []
@@ -50,6 +53,8 @@ def on_message(ws, message):
         print("WS message error:", e)
 
 def on_error(ws, error):
+    global WS_LAST_ERROR
+    WS_LAST_ERROR = str(error)
     print("WS error:", error)
 
 def on_close(ws, close_status_code, close_msg):
@@ -58,15 +63,19 @@ def on_close(ws, close_status_code, close_msg):
     WS_RUNNING = False
 
 def on_open(ws):
+    global WS_LAST_START, WS_LAST_ERROR
+    WS_LAST_START = time.time()
+    WS_LAST_ERROR = None
     print("WS connected 🚀")
 
 def run_ws(symbols, interval="15m"):
-    global WS_RUNNING
+    global WS_RUNNING, WS_RESTART_COUNT
     url = build_stream_url(symbols, interval)
 
     while True:
         try:
             WS_RUNNING = True
+            WS_RESTART_COUNT += 1
             ws = WebSocketApp(
                 url,
                 on_open=on_open,
@@ -99,3 +108,31 @@ def get_live_age(symbol):
     if not ts:
         return 9999
     return time.time() - ts
+
+def is_ws_running():
+    return WS_RUNNING
+
+def get_ws_status():
+    return {
+        "running": WS_RUNNING,
+        "last_error": WS_LAST_ERROR,
+        "last_start": WS_LAST_START,
+        "restart_count": WS_RESTART_COUNT,
+        "thread_alive": WS_THREAD.is_alive() if WS_THREAD else False,
+    }
+
+def count_stale_symbols(symbols, max_age=20):
+    stale = []
+    for sym in symbols:
+        age = get_live_age(sym)
+        if age > max_age:
+            stale.append(sym)
+    return stale
+
+def restart_ws(symbols, interval="15m"):
+    global WS_THREAD, WS_RUNNING
+    print("🔁 WS restart requested")
+    WS_RUNNING = False
+    time.sleep(1)
+    WS_THREAD = None
+    start_ws(symbols, interval)

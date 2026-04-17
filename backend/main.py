@@ -3,47 +3,81 @@ import time
 import threading
 import requests
 import base64
+import json
 from dotenv import load_dotenv
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 load_dotenv()
 
 # ===== CONFIG & ENV CHECK =====
+# ===== CONFIG & ENV CHECK =====
 from config import *
 
 print("🔥 FIREBASE_URL:", os.getenv("FIREBASE_URL"))
 
-# 🔒 SAFETY CHECK (WAJIB DI SINI)
+# 🔒 SAFE STARTUP CHECK
 if not BINANCE_API_KEY or not BINANCE_SECRET:
-    print("⚠️ BINANCE API NOT SET → BOT DISABLED")
-
-if not BINANCE_SECRET:
-    raise Exception("BINANCE_SECRET not set")
+    print("⚠️ BINANCE API NOT SET → trading client disabled")
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not set (AI disabled)")
 
 def check_env():
-    if not BINANCE_API_KEY:
-        raise Exception("BINANCE_API_KEY not set")
-    if not BINANCE_SECRET:
-        raise Exception("BINANCE_SECRET not set")
+    mode = globals().get("MONTRA_MODE", "api_only")
+    if mode == "live":
+        if not BINANCE_API_KEY:
+            raise Exception("BINANCE_API_KEY not set in LIVE mode")
+        if not BINANCE_SECRET:
+            raise Exception("BINANCE_SECRET not set in LIVE mode")
 
 check_env()
 
 AUTO_MODE = True
-AUTO_TRADING = True          # ⭐ NEW: switch on/off via Telegram
-SCAN_INTERVAL = 15           # detik
-MIN_SCORE = 58
-MAX_OPEN_TRADES = 3          # ⭐ NEW: batas maksimum posisi terbuka
+AUTO_TRADING = True
+SCAN_INTERVAL = 15
+VALIDATION_MODE = True
+MIN_SCORE = 52
+MAX_OPEN_TRADES = 2
 GLOBAL_SYMBOL_LOCK = set()
+SYMBOL_COOLDOWN = {}
+ORDER_AUDIT_LOG = []
+EXECUTION_IN_PROGRESS = set()
+COOLDOWN_SECONDS = 180   # 3 menit
+MAX_AUDIT_LOG = 500
+WS_MAX_AGE = 20
+WS_STALE_THRESHOLD = 5
+WS_RESTART_COOLDOWN = 30
+LAST_WS_HEAL = 0
+STATE_FILE = "runtime_state.json"
+VALIDATION_RR_MIN = 2.2
+LIVE_RR_MIN = 3.2
+
+VALIDATION_VOL_MIN = 0.0008
+VALIDATION_VOL_MAX = 0.05
+
+LIVE_VOL_MIN = 0.0015
+LIVE_VOL_MAX = 0.03
+
+VALIDATION_SESSION_ALLOW_ASIA = True
+VALIDATION_NEWS_BLOCK = False
+VALIDATION_REQUIRE_SWEEP = False
+VALIDATION_REQUIRE_PAIR_REGIME_MATCH = False
+VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY = True
+
+TOP_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+MID_PAIRS = ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"]
+LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS]
+
+TOP_PAIR_LIMIT = 2
+MID_PAIR_LIMIT = 1
+LOW_PAIR_LIMIT = 1
 
 ACCOUNTS = [
     {
         "name": "MAIN",
         "api_key": os.getenv("BINANCE_API_KEY"),
         "secret": os.getenv("BINANCE_SECRET"),
-        "risk": 0.01,
+        "risk": 0.003,
         "compound": True,
         "withdraw_threshold": 50,   # $ profit
         "withdraw_ratio": 0.3       # 30% ditarik
@@ -52,7 +86,7 @@ ACCOUNTS = [
         "name": "SECOND",
         "api_key": os.getenv("BINANCE_API_KEY_2"),
         "secret": os.getenv("BINANCE_SECRET_2"),
-        "risk": 0.02,
+        "risk": 0.005,
         "compound": True,
         "withdraw_threshold": 50,
         "withdraw_ratio": 0.3
@@ -71,10 +105,33 @@ except Exception:
     lgb = None
 
 from data import get_ticker, get_ohlcv, get_multi_tickers
-from ws_feed import start_ws, get_live_candle, get_live_mark, get_live_age
+from ws_feed import (
+    start_ws,
+    get_live_candle,
+    get_live_mark,
+    get_live_age,
+    get_ws_status,
+    count_stale_symbols,
+    restart_ws,
+    is_ws_running,
+)
 
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
+
+@app.get("/health/live")
+def health_live():
+    return {"status": "ok", "mode": MONTRA_MODE}
+
+@app.get("/health/ready")
+def health_ready():
+    return {
+        "status": "ready",
+        "mode": MONTRA_MODE,
+        "binance": binance is not None,
+        "openai": client is not None,
+        "accounts": len(CLIENTS),
+    }
 
 @app.get("/ai-memory")
 def get_ai_memory():
@@ -97,12 +154,14 @@ app.add_middleware(
 )
 
 # 🔥 OPENAI CLIENT
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
-binance = Client(
-    os.getenv("BINANCE_API_KEY"),
-    os.getenv("BINANCE_SECRET")
-)
+binance = None
+if os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_SECRET"):
+    binance = Client(
+        os.getenv("BINANCE_API_KEY"),
+        os.getenv("BINANCE_SECRET")
+    )
 
 CLIENTS = []
 for acc in ACCOUNTS:
@@ -141,6 +200,12 @@ disabled_pairs = set()
 EXCHANGE_CACHE = {}
 LAST_STOP_PRICE = {}
 
+# === DEBUG CANDIDATE LIVE ===
+candidate_list_live = []
+selected_symbols_live = []
+skip_reasons_live = []
+MAX_SKIP_REASONS = 300
+
 # ===== AI MEMORY & FIREBASE =====
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
@@ -160,6 +225,124 @@ portfolio_alloc = {}  # {symbol: weight 0..1}
 position_entry_score = {}  # menyimpan score saat entry untuk RL update
 
 LAST_SIGNAL = None
+
+def add_order_audit(event_type, symbol, detail=None):
+    global ORDER_AUDIT_LOG
+
+    if detail is None:
+        detail = {}
+
+    row = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event_type,
+        "symbol": symbol,
+        "detail": detail,
+    }
+
+    ORDER_AUDIT_LOG.append(row)
+
+    if len(ORDER_AUDIT_LOG) > MAX_AUDIT_LOG:
+        ORDER_AUDIT_LOG = ORDER_AUDIT_LOG[-MAX_AUDIT_LOG:]
+
+    print(f"🧾 AUDIT {event_type} {symbol} {detail}")
+    save_runtime_state()
+
+def save_trade_snapshot(symbol, snapshot):
+    TRADE_SNAPSHOTS[symbol] = snapshot
+    save_runtime_state()
+
+def move_snapshot_to_replay(symbol, close_info):
+    snap = TRADE_SNAPSHOTS.pop(symbol, None)
+    if not snap:
+        return
+
+    row = {
+        "symbol": symbol,
+        "opened_at": snap.get("opened_at"),
+        "closed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "snapshot": snap,
+        "close_info": close_info,
+    }
+
+    TRADE_REPLAY_LOG.append(row)
+
+    if len(TRADE_REPLAY_LOG) > MAX_REPLAY_LOG:
+        del TRADE_REPLAY_LOG[:-MAX_REPLAY_LOG]
+
+    save_runtime_state()
+
+def build_runtime_state():
+    cooldowns = {}
+    now = time.time()
+
+    for sym, ts in SYMBOL_COOLDOWN.items():
+        left = COOLDOWN_SECONDS - (now - ts)
+        if left > 0:
+            cooldowns[sym] = ts
+
+    return {
+        "kill_switch": KILL_SWITCH,
+        "start_equity": START_EQUITY,
+        "daily_start_equity": DAILY_START_EQUITY,
+        "last_day": LAST_DAY,
+        "daily_loss": daily_loss,
+        "consecutive_loss": consecutive_loss,
+        "current_risk": current_risk,
+        "cooldowns": cooldowns,
+        "locked_symbols": sorted(list(GLOBAL_SYMBOL_LOCK)),
+        "trade_snapshots": TRADE_SNAPSHOTS,
+        "trade_replay_log": TRADE_REPLAY_LOG[-MAX_REPLAY_LOG:],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+def save_runtime_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(build_runtime_state(), f, indent=2)
+    except Exception as e:
+        print("save_runtime_state error:", e)
+
+def load_runtime_state():
+    global KILL_SWITCH, START_EQUITY, DAILY_START_EQUITY, LAST_DAY
+    global daily_loss, consecutive_loss, current_risk, SYMBOL_COOLDOWN, GLOBAL_SYMBOL_LOCK
+    global TRADE_SNAPSHOTS, TRADE_REPLAY_LOG
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        KILL_SWITCH = bool(data.get("kill_switch", False))
+        START_EQUITY = data.get("start_equity")
+        DAILY_START_EQUITY = data.get("daily_start_equity")
+        LAST_DAY = data.get("last_day")
+        daily_loss = float(data.get("daily_loss", 0))
+        consecutive_loss = int(data.get("consecutive_loss", 0))
+        current_risk = float(data.get("current_risk", BASE_RISK))
+
+        cooldowns = data.get("cooldowns", {})
+        if isinstance(cooldowns, dict):
+            SYMBOL_COOLDOWN.update(cooldowns)
+
+        locked_symbols = data.get("locked_symbols", [])
+        if isinstance(locked_symbols, list):
+            for sym in locked_symbols:
+                GLOBAL_SYMBOL_LOCK.add(sym)
+
+        snapshots = data.get("trade_snapshots", {})
+        if isinstance(snapshots, dict):
+            TRADE_SNAPSHOTS.update(snapshots)
+
+        replay_log = data.get("trade_replay_log", [])
+        if isinstance(replay_log, list):
+            TRADE_REPLAY_LOG = replay_log[-MAX_REPLAY_LOG:]
+
+        print("✅ Runtime state loaded")
+
+    except Exception as e:
+        print("load_runtime_state error:", e)
 
 def clean_url(url):
     if not url:
@@ -182,8 +365,64 @@ def get_session_utc():
         return "ASIA"
     return "OFF"
 
+def active_rr_min():
+    return VALIDATION_RR_MIN if VALIDATION_MODE else LIVE_RR_MIN
+
+def active_vol_min():
+    return VALIDATION_VOL_MIN if VALIDATION_MODE else LIVE_VOL_MIN
+
+def active_vol_max():
+    return VALIDATION_VOL_MAX if VALIDATION_MODE else LIVE_VOL_MAX
+
+def session_allowed(session):
+    if VALIDATION_MODE and VALIDATION_SESSION_ALLOW_ASIA:
+        return session in ("ASIA", "LONDON", "NEWYORK")
+    return session in ("LONDON", "NEWYORK")
+
+def get_pair_tier(symbol):
+    if symbol in TOP_PAIRS:
+        return "TOP"
+    if symbol in MID_PAIRS:
+        return "MID"
+    return "LOW"
+
+def tier_limits():
+    return {
+        "TOP": TOP_PAIR_LIMIT,
+        "MID": MID_PAIR_LIMIT,
+        "LOW": LOW_PAIR_LIMIT,
+    }
+
+def tier_score_bonus(symbol):
+    tier = get_pair_tier(symbol)
+    if tier == "TOP":
+        return 6
+    if tier == "MID":
+        return 2
+    return -2
+
+def add_skip_reason(symbol, reason, extra=None):
+    global skip_reasons_live
+
+    row = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": symbol,
+        "reason": reason,
+    }
+
+    if extra:
+        row.update(extra)
+
+    skip_reasons_live.append(row)
+
+    if len(skip_reasons_live) > MAX_SKIP_REASONS:
+        skip_reasons_live = skip_reasons_live[-MAX_SKIP_REASONS:]
+
 ai_memory = {}  # simpan skor tiap simbol
 trade_history = []  # journal semua trade
+TRADE_SNAPSHOTS = {}
+TRADE_REPLAY_LOG = []
+MAX_REPLAY_LOG = 500
 
 ENABLE_ML = os.getenv("ENABLE_ML", "false").lower() == "true"
 ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "models/lgbm_model.txt")
@@ -324,19 +563,33 @@ def normalize_price(symbol, price):
 
 def load_exchange_cache():
     global EXCHANGE_CACHE
-    info = binance.futures_exchange_info()
-    for s in info["symbols"]:
-        symbol = s["symbol"]
-        if symbol not in PAIRS:
-            continue
-        lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
-        price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
-        EXCHANGE_CACHE[symbol] = {
-            "stepSize": float(lot["stepSize"]),
-            "minQty": float(lot["minQty"]),
-            "tickSize": float(price["tickSize"]),
-        }
-    print("✅ Exchange cache loaded:", len(EXCHANGE_CACHE))
+    if binance is None:
+        print("⚠️ Exchange cache skipped: binance client not ready")
+        return
+
+    try:
+        info = binance.futures_exchange_info()
+        for s in info["symbols"]:
+            symbol = s["symbol"]
+            if symbol not in PAIRS:
+                continue
+
+            lot = next((f for f in s["filters"] if f["filterType"] == "LOT_SIZE"), None)
+            price = next((f for f in s["filters"] if f["filterType"] == "PRICE_FILTER"), None)
+
+            if not lot or not price:
+                continue
+
+            EXCHANGE_CACHE[symbol] = {
+                "stepSize": float(lot["stepSize"]),
+                "minQty": float(lot["minQty"]),
+                "tickSize": float(price["tickSize"]),
+            }
+
+        print("✅ Exchange cache loaded:", len(EXCHANGE_CACHE))
+
+    except Exception as e:
+        print("❌ load_exchange_cache error:", e)
 
 def adjust_precision(symbol, qty, price):
     f = EXCHANGE_CACHE.get(symbol)
@@ -362,6 +615,9 @@ def send_telegram(msg: str):
     requests.post(url, json={"chat_id": chat_id, "text": msg})
 
 def cancel_existing_orders(symbol):
+    if binance is None:
+        print("⚠️ cancel skipped: binance client not ready")
+        return False
     try:
         orders = binance.futures_get_open_orders(symbol=symbol)
         for o in orders:
@@ -377,6 +633,8 @@ def cancel_existing_orders(symbol):
         return False
     
 def place_futures_order(symbol, side, quantity, sl, tp):
+    if binance is None:
+        return {"error": "binance client not ready"}
     try:
         sl = normalize_price(symbol, sl)
         tp = normalize_price(symbol, tp)
@@ -472,6 +730,14 @@ def place_order_multi(symbol, side, sl, tp):
             check_withdraw(acc, c)
         except Exception as e:
             results.append({"account": acc["name"], "error": str(e)})
+    success = any(r.get("status") == "OK" for r in results if isinstance(r, dict))
+    if not success:
+        add_order_audit("ORDER_MULTI_FAILED", symbol, {"results": results})
+        TRADE_SNAPSHOTS.pop(symbol, None)
+        set_symbol_cooldown(symbol, reason="multi_order_failed")
+    else:
+        add_order_audit("ORDER_MULTI_OK", symbol, {"results": results})
+
     return results
 
 def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
@@ -489,6 +755,9 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
         )
 
 def update_stop_loss(symbol, side, new_sl):
+    if binance is None:
+        print("⚠️ SL update skipped: binance client not ready")
+        return
     try:
         new_sl = normalize_price(symbol, new_sl)
         current_price = float(binance.futures_symbol_ticker(symbol=symbol)["price"])
@@ -530,38 +799,87 @@ def update_stop_loss(symbol, side, new_sl):
 
 # ================= TOTAL EQUITY & SAFETY =================
 def get_total_equity():
-    total = 0
+    if not CLIENTS:
+        print("⚠️ get_total_equity: no active clients")
+        return None
+
+    total = 0.0
+    ok_count = 0
+
     for acc in CLIENTS:
         try:
             c = acc["client"]
             balance_info = c.futures_account_balance()
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
-            balance = float(usdt["balance"]) if usdt else 0
-            unreal = float(usdt["crossUnPnl"]) if usdt else 0
+
+            if not usdt:
+                print(f"⚠️ get_total_equity: no USDT balance for {acc['name']}")
+                continue
+
+            balance = float(usdt["balance"])
+            unreal = float(usdt["crossUnPnl"])
             total += (balance + unreal)
-        except:
-            pass
+            ok_count += 1
+
+        except Exception as e:
+            print(f"get_total_equity error {acc['name']}: {e}")
+
+    if ok_count == 0:
+        print("⚠️ get_total_equity: all account reads failed")
+        return None
+
     return total
 
 def safety_check():
-    global KILL_SWITCH, DAILY_START_EQUITY, LAST_DAY
+    global KILL_SWITCH, DAILY_START_EQUITY, LAST_DAY, daily_loss, START_EQUITY
+
     now_day = time.strftime("%Y-%m-%d")
     eq = get_total_equity()
+
+    if eq is None or eq <= 0:
+        print(f"⚠️ safety_check skipped: invalid equity read ({eq})")
+        return True
+
+    if START_EQUITY is None or START_EQUITY <= 0:
+        START_EQUITY = eq
+        print("🧠 START_EQUITY initialized from safety_check:", START_EQUITY)
+        save_runtime_state()
+        return True
+
+    if DAILY_START_EQUITY is None or DAILY_START_EQUITY <= 0:
+        DAILY_START_EQUITY = eq
+        print("🧠 DAILY_START_EQUITY initialized from safety_check:", DAILY_START_EQUITY)
+        save_runtime_state()
+        return True
+
     if now_day != LAST_DAY:
         DAILY_START_EQUITY = eq
         LAST_DAY = now_day
+        daily_loss = 0
         print("🌅 RESET DAILY EQUITY:", eq)
         reset_pairs()
+        save_runtime_state()
+
     dd = ((START_EQUITY - eq) / START_EQUITY) * 100
+    if dd < 0:
+        dd = 0
+
     if dd >= MAX_DRAWDOWN_PCT:
         KILL_SWITCH = True
+        save_runtime_state()
         send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
         return False
+
     daily_loss_pct = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
+    if daily_loss_pct < 0:
+        daily_loss_pct = 0
+
     if daily_loss_pct >= DAILY_LOSS_PCT:
         KILL_SWITCH = True
+        save_runtime_state()
         send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss_pct:.2f}% → BOT STOP")
         return False
+
     return True
 
 def check_telegram_commands():
@@ -574,15 +892,22 @@ def check_telegram_commands():
             text = u.get("message", {}).get("text", "")
             if "/stop" in text:
                 KILL_SWITCH = True
+                save_runtime_state()
                 send_telegram("🛑 BOT STOPPED via Telegram")
+
             if "/start" in text:
                 KILL_SWITCH = False
+                save_runtime_state()
                 send_telegram("🚀 BOT RESUMED via Telegram")
+
             if "/auto_on" in text:
                 AUTO_TRADING = True
+                save_runtime_state()
                 send_telegram("🟢 AUTO TRADING ENABLED")
+
             if "/auto_off" in text:
                 AUTO_TRADING = False
+                save_runtime_state()
                 send_telegram("🔴 AUTO TRADING DISABLED")
     except:
         pass
@@ -605,6 +930,7 @@ def update_risk(result, pnl):
         current_risk = max(MIN_RISK, current_risk * 0.7)
     else:
         current_risk = min(MAX_RISK, current_risk * 1.1)
+    save_runtime_state()
     return True
 
 # ✅ PAIR TRACKING FUNCTIONS
@@ -647,6 +973,23 @@ def safe_score(mem):
         return float(mem)
     except:
         return 50
+def symbol_in_cooldown(symbol):
+    ts = SYMBOL_COOLDOWN.get(symbol)
+    if not ts:
+        return False
+    return (time.time() - ts) < COOLDOWN_SECONDS
+
+def get_symbol_cooldown_left(symbol):
+    ts = SYMBOL_COOLDOWN.get(symbol)
+    if not ts:
+        return 0
+    left = COOLDOWN_SECONDS - (time.time() - ts)
+    return max(0, int(left))
+
+def set_symbol_cooldown(symbol, reason=""):
+    SYMBOL_COOLDOWN[symbol] = time.time()
+    add_order_audit("COOLDOWN_SET", symbol, {"reason": reason, "seconds": COOLDOWN_SECONDS})
+    save_runtime_state()
 
 # ===== AI MEMORY FUNCTIONS =====
 def update_ai_memory(symbol, result):
@@ -667,10 +1010,14 @@ def ai_allow_trade(symbol):
     mem = ai_memory.get(symbol)
     if not mem:
         return True
+
     score = safe_score(mem)
-    if score < 35:
-        print(f"🧠 AI BLOCK {symbol} score={score}")
+    threshold = 25 if VALIDATION_MODE else 35
+
+    if score < threshold:
+        print(f"🧠 AI BLOCK {symbol} score={score} threshold={threshold}")
         return False
+
     return True
 
 # === HELPER FUNCTIONS ===
@@ -679,6 +1026,47 @@ def get_ohlcv_cached(symbol, interval="15m"):
     if live and get_live_age(symbol) < 10:
         return live
     return None
+
+def ws_data_healthy():
+    if MONTRA_MODE == "api_only":
+        return True
+
+    status = get_ws_status()
+    if not status["thread_alive"]:
+        return False
+
+    stale = count_stale_symbols(PAIRS[:10], max_age=WS_MAX_AGE)
+    if len(stale) >= WS_STALE_THRESHOLD:
+        return False
+
+    return True
+
+def ws_auto_heal():
+    global LAST_WS_HEAL
+
+    if MONTRA_MODE == "api_only":
+        return
+
+    now = time.time()
+    if now - LAST_WS_HEAL < WS_RESTART_COOLDOWN:
+        return
+
+    status = get_ws_status()
+    stale = count_stale_symbols(PAIRS[:10], max_age=WS_MAX_AGE)
+
+    need_restart = False
+
+    if not status["thread_alive"]:
+        print("❌ WS watchdog: thread dead")
+        need_restart = True
+
+    if len(stale) >= WS_STALE_THRESHOLD:
+        print(f"❌ WS watchdog: stale symbols = {stale}")
+        need_restart = True
+
+    if need_restart:
+        LAST_WS_HEAL = now
+        restart_ws(PAIRS, interval="15m")
     
 def _get_trend(symbol):
     try:
@@ -708,12 +1096,20 @@ def _get_strength(symbol):
         print(f"Error get strength {symbol}: {e}")
         return 0.0
 
-def btc_filter(trend):
+def btc_alignment(symbol, signal_trend):
     btc_trend = _get_trend("BTCUSDT")
-    if btc_trend != trend:
-        print(f"🧠 BTC filter block: BTC={btc_trend}, Signal={trend}")
-        return False
-    return True
+    pair_tier = get_pair_tier(symbol)
+
+    if btc_trend == signal_trend:
+        return {"ok": True, "penalty": 0, "reason": "ALIGNED"}
+
+    if pair_tier == "TOP":
+        return {"ok": True, "penalty": 6, "reason": f"TOP_COUNTER_BTC_{btc_trend}"}
+
+    if pair_tier == "MID" and VALIDATION_MODE:
+        return {"ok": True, "penalty": 10, "reason": f"MID_COUNTER_BTC_{btc_trend}"}
+
+    return {"ok": False, "penalty": 99, "reason": f"BTC_BLOCK_{btc_trend}"}
 
 def get_regime_tf(symbol, interval):
     try:
@@ -880,6 +1276,8 @@ def update_portfolio_allocation():
 
 def get_open_positions():
     try:
+        if binance is None:
+            return []
         positions = binance.futures_position_information()
         return [p for p in positions if float(p["positionAmt"]) != 0]
     except Exception as e:
@@ -899,6 +1297,15 @@ def should_execute_trade(signal):
 
     if symbol in disabled_pairs:
         return False, "DISABLED_PAIR"
+        
+    if symbol in EXECUTION_IN_PROGRESS:
+        return False, "EXECUTION_IN_PROGRESS"
+
+    if symbol in GLOBAL_SYMBOL_LOCK:
+        return False, "SYMBOL_LOCKED"
+
+    if symbol_in_cooldown(symbol):
+        return False, f"COOLDOWN_{get_symbol_cooldown_left(symbol)}s"
 
     if not ai_allow_trade(symbol):
         return False, "AI_BLOCK"
@@ -906,8 +1313,13 @@ def should_execute_trade(signal):
     if score < MIN_SCORE:
         return False, "LOW_SCORE"
 
-    if len(get_open_positions()) >= MAX_OPEN_TRADES:
+    positions = get_open_positions()
+
+    if len(positions) >= MAX_OPEN_TRADES:
         return False, "MAX_POSITION"
+
+    if any(p["symbol"] == symbol for p in positions):
+        return False, "POSITION_ALREADY_OPEN"
 
     strategy = get_strategy(symbol)
     if strategy == "DEFENSIVE" and score < 75:
@@ -939,6 +1351,9 @@ def monitor_positions_for_memory_update():
     global last_position_state, last_regime, last_vol
     while True:
         try:
+            if binance is None:
+                time.sleep(10)
+                continue
             try:
                 current_regime = get_multi_tf_regime("BTCUSDT")
                 current_vol = get_volatility("BTCUSDT")
@@ -953,6 +1368,7 @@ def monitor_positions_for_memory_update():
                 amt = float(p["positionAmt"])
                 if amt != 0:
                     symbol = p["symbol"]
+                    GLOBAL_SYMBOL_LOCK.add(symbol)                    
                     side = "BUY" if amt > 0 else "SELL"
                     current_state[symbol] = {
                         "side": side,
@@ -986,8 +1402,21 @@ def monitor_positions_for_memory_update():
                     print(f"📝 Journal updated: {symbol} {result}")
 
                     send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
-                    
+
+                    close_info = {
+                        "result": result,
+                        "pnl": pnl,
+                        "regime": last_regime if last_regime else "UNKNOWN",
+                        "vol": last_vol if last_vol else 0.0,
+                        "entry_score": entry_score,
+                    }
+
+                    add_order_audit("POSITION_CLOSED", symbol, close_info)
+                    move_snapshot_to_replay(symbol, close_info)
+
                     GLOBAL_SYMBOL_LOCK.discard(symbol)
+                    EXECUTION_IN_PROGRESS.discard(symbol)
+                    set_symbol_cooldown(symbol, reason=f"position_closed_{result.lower()}")
 
             last_position_state = current_state
 
@@ -1096,8 +1525,37 @@ def notify_image(payload: dict = Body(...)):
 @app.post("/trade")
 def trade(payload: dict = Body(...)):
     try:
+        if binance is None:
+            return {"error": "binance client not ready"}
         symbol = payload.get("symbol")
         side = payload.get("type")
+        if symbol in EXECUTION_IN_PROGRESS:
+            return {"error": "execution in progress"}
+
+        if symbol in GLOBAL_SYMBOL_LOCK:
+            return {"error": "symbol locked"}
+
+        if symbol_in_cooldown(symbol):
+            return {"error": f"symbol cooldown {get_symbol_cooldown_left(symbol)}s"}
+
+        EXECUTION_IN_PROGRESS.add(symbol)
+        GLOBAL_SYMBOL_LOCK.add(symbol)
+        
+        save_trade_snapshot(symbol, {
+            "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "manual_trade",
+            "signal": {
+                "symbol": symbol,
+                "type": side,
+            },
+            "score": None,
+            "side": side,
+            "sl": float(payload.get("sl")),
+            "tp": float(payload.get("tp")),
+            "entry": float(payload.get("entry")),
+            "risk_percent": float(payload.get("risk", 1)),
+        })
+
         entry = float(payload.get("entry"))
         sl = float(payload.get("sl"))
         tp = float(payload.get("tp"))
@@ -1116,13 +1574,37 @@ Qty: {quantity}
 SL: {sl}
 TP: {tp}
 """)
+        add_order_audit("MANUAL_TRADE_SENT", symbol, {
+            "side": side,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "risk_percent": risk_percent,
+            "result": result,
+        })
+
+        if isinstance(result, dict) and result.get("error"):
+            TRADE_SNAPSHOTS.pop(symbol, None)
+            set_symbol_cooldown(symbol, reason="manual_trade_error")
+            GLOBAL_SYMBOL_LOCK.discard(symbol)
         return result
+
     except Exception as e:
+        add_order_audit("MANUAL_TRADE_ERROR", payload.get("symbol", "UNKNOWN"), {"error": str(e)})
+        if payload.get("symbol"):
+            set_symbol_cooldown(payload.get("symbol"), reason="manual_trade_exception")
+            GLOBAL_SYMBOL_LOCK.discard(payload.get("symbol"))
         return {"error": str(e)}
+
+    finally:
+        if payload.get("symbol"):
+            EXECUTION_IN_PROGRESS.discard(payload.get("symbol"))
 
 @app.get("/positions")
 def get_positions():
     try:
+        if binance is None:
+            return {"positions": []}
         positions = binance.futures_position_information()
         active = []
         for p in positions:
@@ -1139,8 +1621,367 @@ def get_positions():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/audit/orders")
+def audit_orders(limit: int = Query(default=50, ge=1, le=500)):
+    return {
+        "count": min(limit, len(ORDER_AUDIT_LOG)),
+        "rows": ORDER_AUDIT_LOG[-limit:]
+    }
+
+@app.get("/health/live")
+def health_live():
+    return {"status": "ok", "mode": MONTRA_MODE}
+
+@app.get("/health/ready")
+def health_ready():
+    return {
+        "status": "ready",
+        "mode": MONTRA_MODE,
+        "binance": binance is not None,
+        "openai": client is not None,
+        "accounts": len(CLIENTS),
+    }
+
+@app.get("/health/pairs")
+def health_pairs():
+    return {
+        "top_pairs": TOP_PAIRS,
+        "mid_pairs": MID_PAIRS,
+        "low_pairs": LOW_PAIRS,
+        "limits": tier_limits(),
+    }
+
+@app.get("/health/validation")
+def health_validation():
+    return {
+        "validation_mode": VALIDATION_MODE,
+        "min_score": MIN_SCORE,
+        "rr_min": active_rr_min(),
+        "vol_min": active_vol_min(),
+        "vol_max": active_vol_max(),
+        "allow_asia_session": VALIDATION_SESSION_ALLOW_ASIA,
+        "news_block": VALIDATION_NEWS_BLOCK,
+        "require_sweep": VALIDATION_REQUIRE_SWEEP,
+        "require_pair_regime_match": VALIDATION_REQUIRE_PAIR_REGIME_MATCH,
+    }
+
+@app.get("/health/ws")
+def health_ws():
+    sample = {}
+    for sym in PAIRS[:5]:
+        sample[sym] = round(get_live_age(sym), 2)
+
+    stale = count_stale_symbols(PAIRS[:10], max_age=WS_MAX_AGE)
+    status = get_ws_status()
+
+    return {
+        "mode": MONTRA_MODE,
+        "sample_age": sample,
+        "ws_expected": MONTRA_MODE != "api_only",
+        "ws_running": status["running"],
+        "thread_alive": status["thread_alive"],
+        "restart_count": status["restart_count"],
+        "last_error": status["last_error"],
+        "stale_symbols": stale,
+        "healthy": len(stale) < WS_STALE_THRESHOLD and status["thread_alive"],
+    }
+
+@app.get("/health/state")
+def health_state():
+    return build_runtime_state()
+
+@app.get("/health/equity")
+def health_equity():
+    eq = get_total_equity()
+    return {
+        "equity_now": eq,
+        "start_equity": START_EQUITY,
+        "daily_start_equity": DAILY_START_EQUITY,
+        "clients": len(CLIENTS),
+        "kill_switch": KILL_SWITCH,
+    }
+
+@app.post("/health/state/reset")
+def health_state_reset():
+    global KILL_SWITCH, START_EQUITY, DAILY_START_EQUITY, LAST_DAY
+    global daily_loss, consecutive_loss, current_risk
+    global SYMBOL_COOLDOWN, GLOBAL_SYMBOL_LOCK, EXECUTION_IN_PROGRESS
+
+    KILL_SWITCH = False
+    START_EQUITY = None
+    DAILY_START_EQUITY = None
+    LAST_DAY = None
+    daily_loss = 0
+    consecutive_loss = 0
+    current_risk = BASE_RISK
+    SYMBOL_COOLDOWN = {}
+    GLOBAL_SYMBOL_LOCK = set()
+    EXECUTION_IN_PROGRESS = set()
+
+    save_runtime_state()
+    return {"status": "reset_ok"}
+
+@app.get("/health/locks")
+def health_locks():
+    cooldowns = {}
+    for sym in list(SYMBOL_COOLDOWN.keys()):
+        left = get_symbol_cooldown_left(sym)
+        if left > 0:
+            cooldowns[sym] = left
+
+    return {
+        "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
+        "execution_in_progress_count": len(EXECUTION_IN_PROGRESS),
+        "locked_symbols": sorted(list(GLOBAL_SYMBOL_LOCK)),
+        "executing_symbols": sorted(list(EXECUTION_IN_PROGRESS)),
+        "cooldowns": cooldowns,
+    }
+
+@app.post("/health/ws/restart")
+def health_ws_restart():
+    try:
+        restart_ws(PAIRS, interval="15m")
+        return {"status": "restarted"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/health/bot")
+def health_bot():
+    return {
+        "mode": MONTRA_MODE,
+        "auto_mode": AUTO_MODE,
+        "auto_trading": AUTO_TRADING,
+        "validation_mode": VALIDATION_MODE,
+        "kill_switch": KILL_SWITCH,
+        "max_open_trades": MAX_OPEN_TRADES,
+        "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
+        "active_accounts": len(CLIENTS),
+    }
+
+@app.get("/replay/open")
+def replay_open():
+    return {
+        "count": len(TRADE_SNAPSHOTS),
+        "rows": TRADE_SNAPSHOTS
+    }
+
+@app.get("/replay/history")
+def replay_history(limit: int = Query(default=50, ge=1, le=500)):
+    return {
+        "count": min(limit, len(TRADE_REPLAY_LOG)),
+        "rows": TRADE_REPLAY_LOG[-limit:]
+    }
+
+@app.get("/analytics/summary")
+def analytics_summary():
+    total = len(trade_history)
+    wins = sum(1 for t in trade_history if t.get("result") == "WIN")
+    losses = sum(1 for t in trade_history if t.get("result") == "LOSS")
+    pnl_total = sum(float(t.get("pnl", 0)) for t in trade_history)
+
+    winrate = (wins / total * 100) if total > 0 else 0.0
+
+    best = None
+    worst = None
+
+    if trade_history:
+        best = max(trade_history, key=lambda x: float(x.get("pnl", 0)))
+        worst = min(trade_history, key=lambda x: float(x.get("pnl", 0)))
+
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "winrate_pct": round(winrate, 2),
+        "pnl_total": round(pnl_total, 4),
+        "best_trade": best,
+        "worst_trade": worst,
+        "open_snapshots": len(TRADE_SNAPSHOTS),
+        "replay_log_size": len(TRADE_REPLAY_LOG),
+    }
+
+@app.get("/analytics/by-symbol")
+def analytics_by_symbol():
+    rows = {}
+
+    for t in trade_history:
+        sym = t.get("symbol", "UNKNOWN")
+        if sym not in rows:
+            rows[sym] = {
+                "symbol": sym,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+            }
+
+        rows[sym]["trades"] += 1
+        if t.get("result") == "WIN":
+            rows[sym]["wins"] += 1
+        else:
+            rows[sym]["losses"] += 1
+        rows[sym]["pnl"] += float(t.get("pnl", 0))
+
+    for sym in rows:
+        total = rows[sym]["trades"]
+        rows[sym]["winrate_pct"] = round((rows[sym]["wins"] / total * 100) if total > 0 else 0.0, 2)
+        rows[sym]["pnl"] = round(rows[sym]["pnl"], 4)
+
+    return {"rows": list(rows.values())}
+
+@app.get("/analytics/by-regime")
+def analytics_by_regime():
+    rows = {}
+
+    for t in trade_history:
+        regime = t.get("regime", "UNKNOWN")
+        if regime not in rows:
+            rows[regime] = {
+                "regime": regime,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+            }
+
+        rows[regime]["trades"] += 1
+        if t.get("result") == "WIN":
+            rows[regime]["wins"] += 1
+        else:
+            rows[regime]["losses"] += 1
+        rows[regime]["pnl"] += float(t.get("pnl", 0))
+
+    for regime in rows:
+        total = rows[regime]["trades"]
+        rows[regime]["winrate_pct"] = round((rows[regime]["wins"] / total * 100) if total > 0 else 0.0, 2)
+        rows[regime]["pnl"] = round(rows[regime]["pnl"], 4)
+
+    return {"rows": list(rows.values())}
+
+@app.get("/debug/pair-tiers")
+def debug_pair_tiers():
+    rows = []
+    for sym in PAIRS:
+        rows.append({
+            "symbol": sym,
+            "tier": get_pair_tier(sym),
+            "bonus": tier_score_bonus(sym),
+        })
+    return {"rows": rows}
+
+@app.get("/debug/candidates")
+def debug_candidates():
+    rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+    return {
+        "count": len(rows),
+        "rows": rows[:20]
+    }
+
+@app.get("/debug/selected")
+def debug_selected():
+    return {
+        "count": len(selected_symbols_live),
+        "rows": selected_symbols_live
+    }
+
+@app.get("/debug/skip-reasons")
+def debug_skip_reasons(limit: int = Query(default=100, ge=1, le=300)):
+    rows = skip_reasons_live[-limit:]
+
+    summary = {}
+    for row in rows:
+        reason = row["reason"]
+        summary[reason] = summary.get(reason, 0) + 1
+
+    summary_rows = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(summary.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+    return {
+        "count": len(rows),
+        "summary": summary_rows,
+        "rows": rows
+    }
+
+@app.get("/debug/decision-board")
+def debug_decision_board():
+    candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+
+    skip_rows = skip_reasons_live[-100:]
+    skip_summary = {}
+    for row in skip_rows:
+        reason = row["reason"]
+        skip_summary[reason] = skip_summary.get(reason, 0) + 1
+
+    skip_summary_rows = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(skip_summary.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+    ws_sample = {}
+    for sym in PAIRS[:5]:
+        ws_sample[sym] = round(get_live_age(sym), 2)
+
+    ws_status = get_ws_status()
+
+    return {
+        "mode": MONTRA_MODE,
+        "validation_mode": VALIDATION_MODE,
+        "kill_switch": KILL_SWITCH,
+        "auto_mode": AUTO_MODE,
+        "auto_trading": AUTO_TRADING,
+
+        "ws": {
+            "running": ws_status["running"],
+            "thread_alive": ws_status["thread_alive"],
+            "restart_count": ws_status["restart_count"],
+            "last_error": ws_status["last_error"],
+            "sample_age": ws_sample,
+        },
+
+        "risk": {
+            "start_equity": START_EQUITY,
+            "daily_start_equity": DAILY_START_EQUITY,
+            "daily_loss": daily_loss,
+            "current_risk": current_risk,
+            "max_open_trades": MAX_OPEN_TRADES,
+        },
+
+        "locks": {
+            "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
+            "execution_in_progress_count": len(EXECUTION_IN_PROGRESS),
+            "locked_symbols": sorted(list(GLOBAL_SYMBOL_LOCK)),
+            "executing_symbols": sorted(list(EXECUTION_IN_PROGRESS)),
+        },
+
+        "candidates": {
+            "count": len(candidate_rows),
+            "rows": candidate_rows[:20]
+        },
+
+        "selected": {
+            "count": len(selected_symbols_live),
+            "rows": selected_symbols_live
+        },
+
+        "skip_reasons": {
+            "count": len(skip_rows),
+            "summary": skip_summary_rows[:20],
+            "rows": skip_rows[-20:]
+        },
+
+        "analytics": {
+            "total_trades": len(trade_history),
+            "open_snapshots": len(TRADE_SNAPSHOTS),
+            "replay_log_size": len(TRADE_REPLAY_LOG),
+        }
+    }
+
 @app.get("/position-detail/{symbol}")
 def position_detail(symbol: str):
+    if binance is None:
+        return {"position": None, "trades": []}    
     try:
         positions = binance.futures_position_information(symbol=symbol)
         trades = binance.futures_account_trades(symbol=symbol)
@@ -1178,6 +2019,7 @@ def kill_switch(payload: dict = Body(...)):
     global KILL_SWITCH
     state = payload.get("state", True)
     KILL_SWITCH = state
+    save_runtime_state()
     return {"kill_switch": KILL_SWITCH}
 
 @app.get("/ai-memory")
@@ -1188,30 +2030,84 @@ def get_ai_memory():
 @app.post("/signal")
 def receive_signal(signal: dict):
     global LAST_SIGNAL
+
     LAST_SIGNAL = signal
+    symbol = signal.get("symbol")
+
+    if not symbol:
+        return {"status": "rejected", "reason": "NO_SYMBOL"}
+
     ok, reason = should_execute_trade(signal)
-    if ok:
-        def execute():
-            place_order_multi(
+    if not ok:
+        add_order_audit("SIGNAL_REJECTED", symbol, {"reason": reason, "signal": signal})
+        return {"status": "rejected", "reason": reason}
+
+    if symbol in EXECUTION_IN_PROGRESS:
+        add_order_audit("SIGNAL_REJECTED", symbol, {"reason": "EXECUTION_IN_PROGRESS", "signal": signal})
+        return {"status": "rejected", "reason": "EXECUTION_IN_PROGRESS"}
+
+    EXECUTION_IN_PROGRESS.add(symbol)
+    GLOBAL_SYMBOL_LOCK.add(symbol)
+
+    snapshot = {
+        "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "signal_endpoint",
+        "signal": signal,
+        "score": signal.get("score", 0),
+        "side": signal.get("type"),
+        "sl": signal.get("sl"),
+        "tp": signal.get("tp"),
+        "entry": signal.get("entry"),
+        "regime": None,
+        "vol": None,
+        "news_bias": None,
+    }
+
+    save_trade_snapshot(symbol, snapshot)
+    add_order_audit("SIGNAL_ACCEPTED", symbol, {"signal": signal})
+
+    def execute():
+        try:
+            result = place_order_multi(
                 signal["symbol"],
                 signal["type"],
                 signal["sl"],
                 signal["tp"]
             )
-            position_entry_score[signal["symbol"]] = signal.get("score", 0)
-            send_telegram(f"""
-🚀 SIGNAL TRADE
-{signal['symbol']} {signal['type']}
-Score: {signal.get('score', 0)}
-""")
-        threading.Thread(target=execute, daemon=True).start()
-        return {"status": "executed", "reason": reason}
-    else:
-        return {"status": "rejected", "reason": reason}
 
+            position_entry_score[signal["symbol"]] = signal.get("score", 0)
+
+            add_order_audit("ORDER_SENT", symbol, {
+                "type": signal.get("type"),
+                "score": signal.get("score", 0),
+                "sl": signal.get("sl"),
+                "tp": signal.get("tp"),
+                "result": result,
+            })
+
+            send_telegram(
+                f"🚀 SIGNAL TRADE\n"
+                f"{signal['symbol']} {signal['type']}\n"
+                f"Score: {signal.get('score', 0)}"
+            )
+
+        except Exception as e:
+            add_order_audit("ORDER_ERROR", symbol, {"error": str(e)})
+            set_symbol_cooldown(symbol, reason="order_error")
+            GLOBAL_SYMBOL_LOCK.discard(symbol)
+
+        finally:
+            EXECUTION_IN_PROGRESS.discard(symbol)
+
+    threading.Thread(target=execute, daemon=True).start()
+    return {"status": "accepted", "reason": "EXECUTING"}
+    
 def smart_trailing():
     while True:
         try:
+            if binance is None:
+                time.sleep(5)
+                continue
             positions = binance.futures_position_information()
             for p in positions:
                 amt = float(p["positionAmt"])
@@ -1247,9 +2143,16 @@ def apply_news_bias(signal_type, news_reverse):
     return signal_type
 
 def auto_trader():
+    global candidate_list_live, selected_symbols_live, skip_reasons_live
     while True:
         try:
             check_telegram_commands()
+            ws_auto_heal()
+
+            if not ws_data_healthy():
+                print("⏸️ Skip trade: WS data not healthy")
+                time.sleep(5)
+                continue
             if KILL_SWITCH:
                 print("🛑 KILL SWITCH ACTIVE")
                 time.sleep(5)
@@ -1289,42 +2192,61 @@ def auto_trader():
             print(f"📰 NEWS IMPACT: {news_impact}")
 
             # === NEWS STATE ===
-            news_reverse = (news_impact == "HIGH")
-            if news_reverse:
-                print("📰 HIGH IMPACT NEWS → SMC tetap jalan, arah akan di-reverse")
+            news_reverse = (news_impact == "HIGH" and not VALIDATION_MODE)
 
-            if vol < 0.0015:
-                print("⏸️ Skip: low volatility")
+            if news_impact == "HIGH":
+                if VALIDATION_MODE:
+                    print("📰 HIGH IMPACT NEWS → validation mode: no reverse, score penalty only")
+                else:
+                    print("📰 HIGH IMPACT NEWS → SMC tetap jalan, arah akan di-reverse")
+
+            if vol < active_vol_min():
+                print(f"⏸️ Skip: low volatility ({vol:.4f})")
                 time.sleep(SCAN_INTERVAL)
                 continue
-            if vol > 0.03:
-                print("⚠️ Skip: high volatility")
+
+            if vol > active_vol_max():
+                print(f"⚠️ Skip: high volatility ({vol:.4f})")
                 time.sleep(SCAN_INTERVAL)
                 continue
+
             session = get_session_utc()
-            if session not in ("LONDON", "NEWYORK"):
+            if not session_allowed(session):
                 print(f"⏸️ Skip: off session ({session})")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
+            candidate_list_live = []
+            selected_symbols_live = []
+            skip_reasons_live = []
+
+            pairs = PAIRS.copy()
+
             pairs = PAIRS.copy()
             scores_map = {}
+            candidate_map = {"TOP": [], "MID": [], "LOW": []}
 
             # --- Kumpulkan skor untuk semua pair ---
             for symbol in pairs:
                 try:
                     if symbol in disabled_pairs:
-                        continue
-                    if not check_pair_health(symbol):
-                        continue
-                    if not ai_allow_trade(symbol):
+                        add_skip_reason(symbol, "DISABLED_PAIR")
                         continue
 
+                    if not check_pair_health(symbol):
+                        add_skip_reason(symbol, "PAIR_HEALTH_FAIL")
+                        continue
+
+                    if not ai_allow_trade(symbol):
+                        add_skip_reason(symbol, "AI_BLOCK")
+                        continue
+
+                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    
                     live = get_live_candle(symbol)
                     if live and get_live_age(symbol) < 10:
                         last_price = live["close"]
                     else:
-                        ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
                         last_price = float(ohlcv[-1][4])
 
                     # === STRUCTURE LOGIC ===
@@ -1374,10 +2296,11 @@ def auto_trader():
                     sweep_high = highs[-1] > recent_high
                     sweep_low = lows[-1] < recent_low
 
-                    if signal_type == "BUY" and not sweep_low:
-                        continue
-                    if signal_type == "SELL" and not sweep_high:
-                        continue
+                    if VALIDATION_REQUIRE_SWEEP:
+                        if signal_type == "BUY" and not sweep_low:
+                            continue
+                        if signal_type == "SELL" and not sweep_high:
+                            continue
 
                     # === BUY RUMOR / SELL NEWS ===
                     # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
@@ -1389,12 +2312,20 @@ def auto_trader():
                     final_side = apply_news_bias(signal_type, news_reverse)
                     
                     pair_regime = get_multi_tf_regime(symbol)
-                    if pair_regime == "SIDEWAYS":
-                        continue
-                    if pair_regime == "BULL" and final_side != "BUY":
-                        continue
-                    if pair_regime == "BEAR" and final_side != "SELL":
-                        continue
+
+                    if not VALIDATION_REQUIRE_PAIR_REGIME_MATCH:
+                        if pair_regime == "SIDEWAYS" and VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY:
+                            pass
+                    else:
+                        if pair_regime == "SIDEWAYS":
+                            add_skip_reason(symbol, "PAIR_REGIME_SIDEWAYS")
+                            continue
+                        if pair_regime == "BULL" and final_side != "BUY":
+                            add_skip_reason(symbol, "PAIR_REGIME_BULL_MISMATCH")
+                            continue
+                        if pair_regime == "BEAR" and final_side != "SELL":
+                            add_skip_reason(symbol, "PAIR_REGIME_BEAR_MISMATCH")
+                            continue
                     
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
@@ -1404,7 +2335,11 @@ def auto_trader():
                         tp = last_price - (sl - last_price) * 2
                         
                     rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
-                    if rr < 3.2:
+                    if rr < active_rr_min():
+                        add_skip_reason(symbol, "LOW_RR", {
+                            "rr": round(rr, 2),
+                            "min_rr": active_rr_min()
+                        })
                         continue
                     
                     signal = {
@@ -1424,7 +2359,7 @@ def auto_trader():
                     score = round((score * 0.8) + (ml_prob * 100 * 0.2))
                                                           
                     if news_impact == "HIGH":
-                        score -= 6
+                        score -= 2 if VALIDATION_MODE else 6
 
                     # === SMC BOOST ===
                     if fvg_up or fvg_down:
@@ -1434,35 +2369,75 @@ def auto_trader():
 
                     # === NEWS FACTOR ===
                     if news_impact == "HIGH":
-                        score -= 10
+                        score -= 4 if VALIDATION_MODE else 10
                     elif news_impact == "NORMAL":
-                        score += 8
+                        score += 6 if VALIDATION_MODE else 8
 
-                    score = min(score, 100)
+                    score += tier_score_bonus(symbol)
+
+                    if pair_regime == "SIDEWAYS" and VALIDATION_MODE:
+                        score -= 4
+
+                    score = max(0, min(score, 100))
                     scores_map[symbol] = score
+                    tier = get_pair_tier(symbol)
+
+                    row = {
+                        "symbol": symbol,
+                        "tier": tier,
+                        "score": score,
+                        "side": final_side,
+                        "rr": round(rr, 2),
+                        "pair_regime": pair_regime,
+                        "news_impact": news_impact,
+                        "session": session,
+                    }
+
+                    candidate_map[tier].append(row)
+                    candidate_list_live.append(row)
+                    
+                    if VALIDATION_MODE:
+                        print(f"🧪 CANDIDATE {symbol} tier={get_pair_tier(symbol)} side={final_side} score={score} rr={rr:.2f} regime={pair_regime} news={news_impact} session={session}")
 
                 except Exception as e:
                     print(f"Scoring error {symbol}: {e}")
 
             # --- Eksekusi trade dengan decision engine ---
+            selected_symbols = set()
+
+            for tier_name, limit in tier_limits().items():
+                rows = sorted(candidate_map[tier_name], key=lambda x: x["score"], reverse=True)
+                for row in rows[:limit]:
+                    selected_symbols.add(row["symbol"])
+
+            selected_symbols_live = sorted(list(selected_symbols))
+
+            if VALIDATION_MODE:
+                print("🎯 SELECTED SYMBOLS:", selected_symbols_live)
+            
             for symbol in pairs:
                 try:
-                    if symbol in disabled_pairs:
+                    if symbol not in selected_symbols:
+                        add_skip_reason(symbol, "NOT_IN_SHORTLIST")
                         continue
                     if not check_pair_health(symbol):
+                        add_skip_reason(symbol, "PAIR_HEALTH_FAIL_EXEC")
                         continue
                     if not ai_allow_trade(symbol):
+                        add_skip_reason(symbol, "AI_BLOCK_EXEC")
                         continue
 
                     w = portfolio_alloc.get(symbol, 0)
                     if w <= 0:
+                        add_skip_reason(symbol, "ZERO_PORTFOLIO_WEIGHT")
                         continue
 
+                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    
                     live = get_live_candle(symbol)
                     if live and get_live_age(symbol) < 10:
                         last_price = live["close"]
                     else:
-                        ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
                         last_price = float(ohlcv[-1][4])
 
                     # === STRUCTURE LOGIC ===
@@ -1491,7 +2466,8 @@ def auto_trader():
                     elif ll and fvg_down:
                         signal_type = "SELL"
                     else:
-                        continue  # skip kalau no structure
+                        add_skip_reason(symbol, "NO_STRUCTURE")
+                        continue
 
                     # === FILTER FAKE MOVE (liquidity sweep) ===
                     last_candle = ohlcv[-1]
@@ -1501,8 +2477,10 @@ def auto_trader():
                     wick_down = min(float(last_candle[1]), float(last_candle[4])) - float(last_candle[3])
 
                     if wick_up > wick_down * 2 and signal_type == "BUY":
+                        add_skip_reason(symbol, "FAKE_MOVE_WICK_UP")
                         continue
                     if wick_down > wick_up * 2 and signal_type == "SELL":
+                        add_skip_reason(symbol, "FAKE_MOVE_WICK_DOWN")
                         continue
 
                     # === LIQUIDITY SWEEP CHECK ===
@@ -1512,10 +2490,13 @@ def auto_trader():
                     sweep_high = highs[-1] > recent_high
                     sweep_low = lows[-1] < recent_low
 
-                    if signal_type == "BUY" and not sweep_low:
-                        continue
-                    if signal_type == "SELL" and not sweep_high:
-                        continue
+                    if VALIDATION_REQUIRE_SWEEP:
+                        if signal_type == "BUY" and not sweep_low:
+                            add_skip_reason(symbol, "NO_SWEEP_LOW")
+                            continue
+                        if signal_type == "SELL" and not sweep_high:
+                            add_skip_reason(symbol, "NO_SWEEP_HIGH")
+                            continue
 
                     # === BUY RUMOR / SELL NEWS ===
                     # [!] LOGIC FIX: Posisi dipindah ke sini agar SL dan TP dihitung dengan arah yang sudah di-reverse
@@ -1527,12 +2508,14 @@ def auto_trader():
                     final_side = apply_news_bias(signal_type, news_reverse)
                     
                     pair_regime = get_multi_tf_regime(symbol)
-                    if pair_regime == "SIDEWAYS":
-                        continue
-                    if pair_regime == "BULL" and final_side != "BUY":
-                        continue
-                    if pair_regime == "BEAR" and final_side != "SELL":
-                        continue
+
+                    if VALIDATION_REQUIRE_PAIR_REGIME_MATCH:
+                        if pair_regime == "SIDEWAYS":
+                            continue
+                        if pair_regime == "BULL" and final_side != "BUY":
+                            continue
+                        if pair_regime == "BEAR" and final_side != "SELL":
+                            continue
                     
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
@@ -1542,7 +2525,7 @@ def auto_trader():
                         tp = last_price - (sl - last_price) * 2
                         
                     rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
-                    if rr < 3.2:
+                    if rr < active_rr_min():
                         continue
                     
                     signal = {
@@ -1562,28 +2545,51 @@ def auto_trader():
                     
                     ok, reason = should_execute_trade(signal)
                     if not ok:
-                        print(f"❌ SKIP {symbol} - {reason}")
+                        add_skip_reason(symbol, reason, {
+                            "score": signal["score"],
+                            "rr": round(rr, 2)
+                        })
+                        if VALIDATION_MODE:
+                            print(f"🧪 SKIP {symbol} - {reason} score={signal['score']} rr={rr:.2f}")
+                        else:
+                            print(f"❌ SKIP {symbol} - {reason}")
                         continue
 
-                    # Filter tambahan (regime, btc, strength)
                     if regime == "SIDEWAYS":
+                        add_skip_reason(symbol, "GLOBAL_REGIME_SIDEWAYS")
                         print(f"⏸️ Skip {symbol}: market SIDEWAYS")
                         continue
                     if regime == "BULL" and signal["type"] != "BUY":
+                        add_skip_reason(symbol, "GLOBAL_REGIME_BULL_MISMATCH")
                         print(f"⏸️ Skip {symbol}: BULL market but signal SELL")
                         continue
                     if regime == "BEAR" and signal["type"] != "SELL":
+                        add_skip_reason(symbol, "GLOBAL_REGIME_BEAR_MISMATCH")
                         print(f"⏸️ Skip {symbol}: BEAR market but signal BUY")
                         continue
 
                     signal_trend = "BULLISH" if signal["type"] == "BUY" else "BEARISH"
-                    if not btc_filter(signal_trend):
+                    btc_align = btc_alignment(symbol, signal_trend)
+
+                    if not btc_align["ok"]:
+                        add_skip_reason(symbol, btc_align["reason"])
+                        print(f"🧠 BTC BLOCK {symbol} - {btc_align['reason']}")
                         continue
+
+                    signal["score"] = max(0, signal["score"] - btc_align["penalty"])
 
                     btc_strength = _get_strength("BTCUSDT")
                     alt_strength = _get_strength(symbol)
-                    if abs(btc_strength - alt_strength) > 20.0:
-                        print(f"🧠 Strength divergence block: BTC {btc_strength:.2f}% vs {symbol} {alt_strength:.2f}%")
+
+                    divergence_limit = 30.0 if get_pair_tier(symbol) == "TOP" else 20.0
+
+                    if abs(btc_strength - alt_strength) > divergence_limit:
+                        add_skip_reason(symbol, "STRENGTH_DIVERGENCE", {
+                            "btc_strength": round(btc_strength, 2),
+                            "alt_strength": round(alt_strength, 2),
+                            "limit": divergence_limit
+                        })
+                        print(f"🧠 Strength divergence block: BTC {btc_strength:.2f}% vs {symbol} {alt_strength:.2f}% limit={divergence_limit}")
                         continue
 
                     positions = get_open_positions()
@@ -1605,6 +2611,30 @@ def auto_trader():
 
                     stop_distance = abs(signal["entry"] - signal["sl"])
                     qty = round(risk_amount / stop_distance, 3)
+
+                    save_trade_snapshot(symbol, {
+                        "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": "auto_trader",
+                        "signal": signal,
+                        "score": signal["score"],
+                        "side": signal["type"],
+                        "sl": signal["sl"],
+                        "tp": signal["tp"],
+                        "entry": signal["entry"],
+                        "regime": regime,
+                        "pair_regime": pair_regime,
+                        "pair_tier": get_pair_tier(symbol),
+                        "vol": vol,
+                        "news_impact": news_impact,
+                        "news_reverse": news_reverse,
+                        "portfolio_weight": w,
+                        "btc_strength": btc_strength,
+                        "alt_strength": alt_strength,
+                        "fvg_up": fvg_up,
+                        "fvg_down": fvg_down,
+                        "sweep_high": sweep_high,
+                        "sweep_low": sweep_low,
+                    })
 
                     result = place_order_multi(
                         symbol=symbol,
@@ -1655,18 +2685,52 @@ def start_background_tasks():
     global _bot_started, START_EQUITY, DAILY_START_EQUITY, LAST_DAY
     if _bot_started:
         return
+
     _bot_started = True
-    if AUTO_MODE:
-        load_exchange_cache()
-        start_ws(PAIRS, interval="15m")
-        eq = get_total_equity()
-        START_EQUITY = eq
-        DAILY_START_EQUITY = eq
-        LAST_DAY = time.strftime("%Y-%m-%d")
-        print("🧠 START EQUITY:", eq)
-        threading.Thread(target=smart_trailing, daemon=True).start()
-        threading.Thread(target=monitor_positions_for_memory_update, daemon=True).start()
-        threading.Thread(target=start_bot, daemon=True).start()
+    load_runtime_state()
+
+    if MONTRA_MODE == "api_only":
+        print("⚠️ API ONLY mode → no WS, no bot, no trader")
+        return
+
+    load_exchange_cache()
+    start_ws(PAIRS, interval="15m")
+
+    try:
+        for p in get_open_positions():
+            sym = p["symbol"]
+            GLOBAL_SYMBOL_LOCK.add(sym)
+        if GLOBAL_SYMBOL_LOCK:
+            print("🔒 Recovered symbol locks:", sorted(list(GLOBAL_SYMBOL_LOCK)))
+    except Exception as e:
+        print("recover open positions error:", e)
+
+    if not AUTO_MODE:
+        print("⚠️ AUTO_MODE OFF → WS on, trader not started")
+        return
+
+    eq = get_total_equity()
+
+    if eq is None or eq <= 0:
+        print(f"⚠️ startup equity invalid: {eq}, skip baseline init")
+    else:
+        if START_EQUITY is None or START_EQUITY <= 0:
+            START_EQUITY = eq
+
+        if DAILY_START_EQUITY is None or DAILY_START_EQUITY <= 0:
+            DAILY_START_EQUITY = eq
+
+        if LAST_DAY is None:
+            LAST_DAY = time.strftime("%Y-%m-%d")
+
+        print("🧠 START EQUITY:", START_EQUITY)
+        print("🧠 DAILY START EQUITY:", DAILY_START_EQUITY)
+
+        save_runtime_state()
+
+    threading.Thread(target=smart_trailing, daemon=True).start()
+    threading.Thread(target=monitor_positions_for_memory_update, daemon=True).start()
+    threading.Thread(target=start_bot, daemon=True).start()
 
 @app.on_event("startup")
 def on_startup():

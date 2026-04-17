@@ -47,7 +47,64 @@ type Toast = {
   text: string;
 };
 
+type DecisionBoard = {
+  mode?: string;
+  validation_mode?: boolean;
+  kill_switch?: boolean;
+  auto_mode?: boolean;
+  auto_trading?: boolean;
+  ws?: {
+    running?: boolean;
+    thread_alive?: boolean;
+    restart_count?: number;
+    last_error?: string | null;
+    sample_age?: Record<string, number>;
+  };
+  risk?: {
+    start_equity?: number | null;
+    daily_start_equity?: number | null;
+    daily_loss?: number;
+    current_risk?: number;
+    max_open_trades?: number;
+  };
+  locks?: {
+    symbol_lock_count?: number;
+    execution_in_progress_count?: number;
+    locked_symbols?: string[];
+    executing_symbols?: string[];
+  };
+  candidates?: {
+    count?: number;
+    rows?: Array<{
+      symbol: string;
+      tier?: string;
+      score?: number;
+      side?: string;
+      rr?: number;
+      pair_regime?: string;
+      news_impact?: string;
+      session?: string;
+    }>;
+  };
+  selected?: {
+    count?: number;
+    rows?: string[];
+  };
+  skip_reasons?: {
+    count?: number;
+    summary?: Array<{ reason: string; count: number }>;
+    rows?: Array<{ time: string; symbol: string; reason: string }>;
+  };
+  analytics?: {
+    total_trades?: number;
+    open_snapshots?: number;
+    replay_log_size?: number;
+  };
+};
+
 const PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"];
+const MONITOR_URL = "https://montra-backend-9wku.onrender.com/debug/decision-board";
+const MONITOR_URL = "http://localhost:8000/debug/decision-board";
 
 // ─── SESSION HELPERS ───────────────────────────────────────────────────────────
 
@@ -443,6 +500,11 @@ export default function App() {
   const [pendingTrade, setPendingTrade] = useState<Signal | null>(null);
   const [accounts, setAccounts] = useState<any[]>([]);
 
+  const [decisionBoard, setDecisionBoard] = useState<DecisionBoard | null>(null);
+  const [monitorLoading, setMonitorLoading] = useState(true);
+  const [monitorError, setMonitorError] = useState<string | null>(null);
+  const [lastMonitorUpdate, setLastMonitorUpdate] = useState("");
+
   // ─── [4] AI MEMORY STATE ─────────────────────────────────────────────────────
   const [aiMemory, setAiMemory] = useState<Record<string, any>>({});
 
@@ -477,13 +539,24 @@ export default function App() {
     return () => clearInterval(i);
   }, []);
 
-  // ─── [4] FETCH AI MEMORY ─────────────────────────────────────────────────────
-  // Endpoint relatif /ai-memory; diambil sekali saat mount
+  // ─── MINI MONITOR PANEL ──────────────────────────────────────────────────────
   useEffect(() => {
-    axios
-      .get("https://montra-backend-9wku.onrender.com/ai-memory")
-      .then((res) => setAiMemory(res.data || {}))
-      .catch(() => {}); // silent fail jika endpoint belum tersedia
+    const fetchDecisionBoard = async () => {
+      try {
+        const res = await axios.get(MONITOR_URL);
+        setDecisionBoard(res.data || null);
+        setMonitorError(null);
+        setLastMonitorUpdate(new Date().toLocaleTimeString());
+      } catch (err: any) {
+        setMonitorError(err?.message || "monitor fetch failed");
+      } finally {
+        setMonitorLoading(false);
+      }
+    };
+
+    fetchDecisionBoard();
+    const i = setInterval(fetchDecisionBoard, 5000);
+    return () => clearInterval(i);
   }, []);
 
   const loginGoogle = async () => {
@@ -1294,6 +1367,57 @@ export default function App() {
         .panel-btm     { grid-area: btm;    overflow-y: auto; }
         .panel-right   { grid-area: right;  overflow-y: auto; }
 
+        .monitor-grid {
+          display: grid;
+          grid-template-columns: repeat(6, minmax(120px, 1fr));
+          gap: 10px;
+          margin-bottom: 10px;
+        }
+
+        .monitor-card {
+          background: #0f172a;
+          border: 1px solid #1e293b;
+          border-radius: 8px;
+          padding: 10px 12px;
+        }
+
+        .monitor-title {
+          font-size: 11px;
+          color: #7dd3fc;
+          text-transform: uppercase;
+          letter-spacing: 0.8px;
+          margin-bottom: 6px;
+        }
+
+        .monitor-value {
+          font-size: 15px;
+          font-weight: bold;
+          color: #fff;
+        }
+
+        .monitor-board {
+          background: #0f172a;
+          border: 1px solid #1e293b;
+          border-radius: 10px;
+          padding: 12px;
+          margin-bottom: 10px;
+        }
+
+        .monitor-columns {
+          display: grid;
+          grid-template-columns: 1.2fr 0.9fr 1fr;
+          gap: 10px;
+        }
+
+        .monitor-list-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 6px 0;
+          border-bottom: 1px solid #1e293b;
+          font-size: 12px;
+        }
+
         /* ── MOBILE: stack vertically ── */
         @media (max-width: 900px) {
           .layout {
@@ -1307,6 +1431,8 @@ export default function App() {
             height: auto;
           }
           .panel-center { min-height: 350px; }
+          .monitor-grid { grid-template-columns: 1fr 1fr; }
+          .monitor-columns { grid-template-columns: 1fr; }
         }
       `}</style>
 
@@ -1333,6 +1459,108 @@ export default function App() {
           </button>
           {photo && <img src={photo} style={{ width: "28px", borderRadius: "50%" }} alt="User" />}
           <span style={{ color: "#00E5FF", fontWeight: "bold", fontSize: "12px" }}>{name}</span>
+        </div>
+      </div>
+
+      {/* ── MINI MONITORING PANEL ── */}
+      <div className="monitor-board">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+          <div>
+            <div style={{ fontSize: "16px", fontWeight: "bold", color: "#fff" }}>
+              MONTRA Monitoring Panel
+            </div>
+            <div style={{ fontSize: "11px", color: "#777" }}>
+              {monitorLoading ? "Loading..." : `Last update: ${lastMonitorUpdate || "-"}`}
+            </div>
+          </div>
+          <div style={{ fontSize: "12px", fontWeight: "bold", color: monitorError ? "#FF4444" : "#00FFAA" }}>
+            {monitorError ? `ERROR: ${monitorError}` : "LIVE"}
+          </div>
+        </div>
+
+        <div className="monitor-grid">
+          <div className="monitor-card">
+            <div className="monitor-title">Mode</div>
+            <div className="monitor-value">
+              {decisionBoard?.mode || "-"} {decisionBoard?.validation_mode ? "V" : ""}
+            </div>
+          </div>
+
+          <div className="monitor-card">
+            <div className="monitor-title">Kill Switch</div>
+            <div className="monitor-value" style={{ color: decisionBoard?.kill_switch ? "#FF4444" : "#00FFAA" }}>
+              {decisionBoard?.kill_switch ? "ON" : "OFF"}
+            </div>
+          </div>
+
+          <div className="monitor-card">
+            <div className="monitor-title">WS</div>
+            <div className="monitor-value" style={{ color: decisionBoard?.ws?.running ? "#00FFAA" : "#FF4444" }}>
+              {decisionBoard?.ws?.running ? "RUNNING" : "DOWN"}
+            </div>
+          </div>
+
+          <div className="monitor-card">
+            <div className="monitor-title">Candidates</div>
+            <div className="monitor-value">{decisionBoard?.candidates?.count ?? 0}</div>
+          </div>
+
+          <div className="monitor-card">
+            <div className="monitor-title">Selected</div>
+            <div className="monitor-value">{decisionBoard?.selected?.count ?? 0}</div>
+          </div>
+
+          <div className="monitor-card">
+            <div className="monitor-title">Trades</div>
+            <div className="monitor-value">{decisionBoard?.analytics?.total_trades ?? 0}</div>
+          </div>
+        </div>
+
+        <div className="monitor-columns">
+          <div className="card" style={{ marginBottom: 0 }}>
+            <h3>🎯 Top Candidates</h3>
+            {(decisionBoard?.candidates?.rows || []).slice(0, 6).length === 0 ? (
+              <p style={{ color: "#555", fontSize: "11px" }}>— No candidate yet —</p>
+            ) : (
+              (decisionBoard?.candidates?.rows || []).slice(0, 6).map((row, idx) => (
+                <div key={`${row.symbol}-${idx}`} className="monitor-list-row">
+                  <span>
+                    {row.symbol} {row.side}
+                  </span>
+                  <span>
+                    {row.score ?? "-"} | RR {row.rr ?? "-"}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="card" style={{ marginBottom: 0 }}>
+            <h3>📌 Selected</h3>
+            {(decisionBoard?.selected?.rows || []).length === 0 ? (
+              <p style={{ color: "#555", fontSize: "11px" }}>— No shortlist —</p>
+            ) : (
+              (decisionBoard?.selected?.rows || []).map((sym, idx) => (
+                <div key={`${sym}-${idx}`} className="monitor-list-row">
+                  <span>{sym}</span>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="card" style={{ marginBottom: 0 }}>
+            <h3>🚫 Top Skip Reasons</h3>
+            {(decisionBoard?.skip_reasons?.summary || []).slice(0, 6).length === 0 ? (
+              <p style={{ color: "#555", fontSize: "11px" }}>— No skip data —</p>
+            ) : (
+              (decisionBoard?.skip_reasons?.summary || []).slice(0, 6).map((row, idx) => (
+                <div key={`${row.reason}-${idx}`} className="monitor-list-row">
+                  <span>{row.reason}</span>
+                  <span>{row.count}</span>
+                </div>
+              ))
+            )}
+          </div>
         </div>
       </div>
 
