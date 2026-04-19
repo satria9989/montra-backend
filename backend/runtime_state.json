@@ -1,14 +1,20 @@
 {
   "kill_switch": false,
   "start_equity": 57.13228443,
-  "daily_start_equity": 57.13228443,
-  "last_day": "2026-04-17",
+  "daily_start_equity": 92.04956501,
+  "last_day": "2026-04-20",
   "daily_loss": 0.0,
   "consecutive_loss": 0,
   "current_risk": 1.0,
   "cooldowns": {},
-  "locked_symbols": [],
+  "locked_symbols": [
+    "BTCUSDT",
+    "DOGEUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "TONUSDT"
+  ],
   "trade_snapshots": {},
   "trade_replay_log": [],
-  "updated_at": "2026-04-17 18:58:59"
+  "updated_at": "2026-04-20 02:40:29"
 }

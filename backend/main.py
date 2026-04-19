@@ -34,9 +34,17 @@ check_env()
 
 AUTO_MODE = True
 AUTO_TRADING = True
-SCAN_INTERVAL = 15
+
+# validation scan lebih cepat
+SCAN_INTERVAL = 10
+
+# fokus sekarang: cari sample trade dulu
 VALIDATION_MODE = True
-MIN_SCORE = 52
+
+# score dibuat lebih longgar supaya candidate lebih sering muncul
+MIN_SCORE = 46
+
+# safety core tetap dijaga
 MAX_OPEN_TRADES = 2
 GLOBAL_SYMBOL_LOCK = set()
 SYMBOL_COOLDOWN = {}
@@ -44,16 +52,22 @@ ORDER_AUDIT_LOG = []
 EXECUTION_IN_PROGRESS = set()
 COOLDOWN_SECONDS = 180   # 3 menit
 MAX_AUDIT_LOG = 500
+
+# websocket safety
 WS_MAX_AGE = 20
 WS_STALE_THRESHOLD = 5
 WS_RESTART_COOLDOWN = 30
 LAST_WS_HEAL = 0
+
 STATE_FILE = "runtime_state.json"
-VALIDATION_RR_MIN = 2.2
+
+# ===== VALIDATION / LIVE GATES =====
+# validation = cari sample trade dulu
+VALIDATION_RR_MIN = 1.8
 LIVE_RR_MIN = 3.2
 
-VALIDATION_VOL_MIN = 0.0008
-VALIDATION_VOL_MAX = 0.05
+VALIDATION_VOL_MIN = 0.0004
+VALIDATION_VOL_MAX = 0.07
 
 LIVE_VOL_MIN = 0.0015
 LIVE_VOL_MAX = 0.03
@@ -64,12 +78,14 @@ VALIDATION_REQUIRE_SWEEP = False
 VALIDATION_REQUIRE_PAIR_REGIME_MATCH = False
 VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY = True
 
+# ===== PAIR PRIORITY ENGINE =====
 TOP_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
 MID_PAIRS = ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"]
 LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS]
 
-TOP_PAIR_LIMIT = 2
-MID_PAIR_LIMIT = 1
+# shortlist sedikit diperlebar agar sample trade lebih cepat muncul
+TOP_PAIR_LIMIT = 3
+MID_PAIR_LIMIT = 2
 LOW_PAIR_LIMIT = 1
 
 ACCOUNTS = [
@@ -133,16 +149,16 @@ def health_ready():
         "accounts": len(CLIENTS),
     }
 
-@app.get("/ai-memory")
-def get_ai_memory():
+@app.get("/debug/bootstrap/ai-memory")
+def get_ai_memory_bootstrap():
     return ai_memory
 
-@app.get("/accounts")
-def get_accounts():
+@app.get("/debug/bootstrap/accounts")
+def get_accounts_bootstrap():
     return {"accounts": []}
 
-@app.get("/positions")
-def get_positions():
+@app.get("/debug/bootstrap/positions")
+def get_positions_bootstrap():
     return {"positions": []}
 
 app.add_middleware(
@@ -205,6 +221,8 @@ candidate_list_live = []
 selected_symbols_live = []
 skip_reasons_live = []
 MAX_SKIP_REASONS = 300
+EXECUTION_DECISIONS = []
+MAX_EXECUTION_DECISIONS = 500
 
 # ===== AI MEMORY & FIREBASE =====
 
@@ -225,6 +243,7 @@ portfolio_alloc = {}  # {symbol: weight 0..1}
 position_entry_score = {}  # menyimpan score saat entry untuk RL update
 
 LAST_SIGNAL = None
+TELEGRAM_LAST_UPDATE_ID = None
 
 def add_order_audit(event_type, symbol, detail=None):
     global ORDER_AUDIT_LOG
@@ -396,10 +415,10 @@ def tier_limits():
 def tier_score_bonus(symbol):
     tier = get_pair_tier(symbol)
     if tier == "TOP":
-        return 6
+        return 5
     if tier == "MID":
         return 2
-    return -2
+    return 0
 
 def add_skip_reason(symbol, reason, extra=None):
     global skip_reasons_live
@@ -417,6 +436,25 @@ def add_skip_reason(symbol, reason, extra=None):
 
     if len(skip_reasons_live) > MAX_SKIP_REASONS:
         skip_reasons_live = skip_reasons_live[-MAX_SKIP_REASONS:]
+
+
+def add_execution_decision(stage, symbol, status, detail=None):
+    global EXECUTION_DECISIONS
+
+    row = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "stage": stage,
+        "symbol": symbol,
+        "status": status,
+    }
+
+    if detail:
+        row["detail"] = detail
+
+    EXECUTION_DECISIONS.append(row)
+
+    if len(EXECUTION_DECISIONS) > MAX_EXECUTION_DECISIONS:
+        EXECUTION_DECISIONS = EXECUTION_DECISIONS[-MAX_EXECUTION_DECISIONS:]
 
 ai_memory = {}  # simpan skor tiap simbol
 trade_history = []  # journal semua trade
@@ -711,6 +749,7 @@ def place_order_multi(symbol, side, sl, tp):
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
             stop_distance = abs(price - sl)
             if stop_distance == 0:
+                results.append({"account": acc["name"], "error": "stop_distance_zero"})
                 continue
             qty = risk_amount / stop_distance
             if qty * price < 100:
@@ -718,14 +757,45 @@ def place_order_multi(symbol, side, sl, tp):
             qty, price = adjust_precision(symbol, qty, price)
             if qty * price < 100:
                 print("❌ SKIP NOTIONAL < 100", symbol)
+                results.append({"account": acc["name"], "error": "notional_below_min", "qty": qty, "price": price})
                 continue
+
+            sl_price = normalize_price(symbol, sl)
+            tp_price = normalize_price(symbol, tp)
             order = c.futures_create_order(
                 symbol=symbol,
                 side=SIDE_BUY if side == "BUY" else SIDE_SELL,
                 type=FUTURE_ORDER_TYPE_MARKET,
                 quantity=qty
             )
-            results.append({"account": acc["name"], "status": "OK"})
+
+            close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+            c.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice=sl_price,
+                closePosition=True,
+                workingType="MARK_PRICE"
+            )
+            c.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                stopPrice=tp_price,
+                closePosition=True,
+                workingType="MARK_PRICE"
+            )
+
+            results.append({
+                "account": acc["name"],
+                "status": "OK",
+                "qty": qty,
+                "entry_price": price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "order_id": order.get("orderId") if isinstance(order, dict) else None,
+            })
             update_account_profit(c, acc["name"])
             check_withdraw(acc, c)
         except Exception as e:
@@ -798,6 +868,18 @@ def update_stop_loss(symbol, side, new_sl):
         print("SL update error:", e)
 
 # ================= TOTAL EQUITY & SAFETY =================
+def get_daily_loss_pct_now():
+    eq = get_total_equity()
+
+    if eq is None or eq <= 0:
+        return None
+
+    if DAILY_START_EQUITY is None or DAILY_START_EQUITY <= 0:
+        return 0.0
+
+    pct = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
+    return max(0.0, pct)
+
 def get_total_equity():
     if not CLIENTS:
         print("⚠️ get_total_equity: no active clients")
@@ -865,9 +947,10 @@ def safety_check():
         dd = 0
 
     if dd >= MAX_DRAWDOWN_PCT:
-        KILL_SWITCH = True
-        save_runtime_state()
-        send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
+        if not KILL_SWITCH:
+            KILL_SWITCH = True
+            save_runtime_state()
+            send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
         return False
 
     daily_loss_pct = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
@@ -875,42 +958,93 @@ def safety_check():
         daily_loss_pct = 0
 
     if daily_loss_pct >= DAILY_LOSS_PCT:
-        KILL_SWITCH = True
-        save_runtime_state()
-        send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss_pct:.2f}% → BOT STOP")
+        if not KILL_SWITCH:
+            KILL_SWITCH = True
+            save_runtime_state()
+            send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss_pct:.2f}% → BOT STOP")
         return False
 
     return True
 
 def check_telegram_commands():
-    global KILL_SWITCH, AUTO_TRADING
+    global KILL_SWITCH, AUTO_TRADING, TELEGRAM_LAST_UPDATE_ID
+    global DAILY_START_EQUITY, daily_loss, LAST_DAY
+
     token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        return
+
     url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {"timeout": 1}
+
+    if TELEGRAM_LAST_UPDATE_ID is not None:
+        params["offset"] = TELEGRAM_LAST_UPDATE_ID + 1
+
     try:
-        res = requests.get(url).json()
+        res = requests.get(url, params=params, timeout=5).json()
+
         for u in res.get("result", []):
-            text = u.get("message", {}).get("text", "")
-            if "/stop" in text:
-                KILL_SWITCH = True
-                save_runtime_state()
-                send_telegram("🛑 BOT STOPPED via Telegram")
+            update_id = u.get("update_id")
+            if update_id is not None:
+                TELEGRAM_LAST_UPDATE_ID = update_id
 
-            if "/start" in text:
-                KILL_SWITCH = False
-                save_runtime_state()
-                send_telegram("🚀 BOT RESUMED via Telegram")
+            text = (u.get("message", {}) or {}).get("text", "").strip()
 
-            if "/auto_on" in text:
-                AUTO_TRADING = True
-                save_runtime_state()
-                send_telegram("🟢 AUTO TRADING ENABLED")
+            if not text:
+                continue
 
-            if "/auto_off" in text:
-                AUTO_TRADING = False
-                save_runtime_state()
-                send_telegram("🔴 AUTO TRADING DISABLED")
-    except:
-        pass
+            if text == "/stop":
+                if not KILL_SWITCH:
+                    KILL_SWITCH = True
+                    save_runtime_state()
+                    send_telegram("🛑 BOT STOPPED via Telegram")
+                continue
+
+            if text == "/start":
+                daily_loss_pct = get_daily_loss_pct_now()
+
+                if daily_loss_pct is not None and daily_loss_pct >= DAILY_LOSS_PCT:
+                    send_telegram(
+                        f"⛔ BOT TETAP STOP: daily loss masih {daily_loss_pct:.2f}% "
+                        f"(limit {DAILY_LOSS_PCT:.2f}%). Gunakan /resetday jika memang mau reset baseline."
+                    )
+                    continue
+
+                if KILL_SWITCH:
+                    KILL_SWITCH = False
+                    save_runtime_state()
+                    send_telegram("🚀 BOT RESUMED via Telegram")
+                continue
+
+            if text == "/auto_on":
+                if not AUTO_TRADING:
+                    AUTO_TRADING = True
+                    save_runtime_state()
+                    send_telegram("🟢 AUTO TRADING ENABLED")
+                continue
+
+            if text == "/auto_off":
+                if AUTO_TRADING:
+                    AUTO_TRADING = False
+                    save_runtime_state()
+                    send_telegram("🔴 AUTO TRADING DISABLED")
+                continue
+
+            if text == "/resetday":
+                eq = get_total_equity()
+                if eq is not None and eq > 0:
+                    DAILY_START_EQUITY = eq
+                    daily_loss = 0
+                    LAST_DAY = time.strftime("%Y-%m-%d")
+                    KILL_SWITCH = False
+                    save_runtime_state()
+                    send_telegram(f"🔄 DAILY BASELINE RESET ke equity {eq:.4f}")
+                else:
+                    send_telegram("⚠️ RESETDAY gagal: equity tidak valid")
+                continue
+
+    except Exception as e:
+        print("telegram command error:", e)
 
 # ================= PERFORMANCE UPDATE =================
 def update_risk(result, pnl):
@@ -1012,7 +1146,7 @@ def ai_allow_trade(symbol):
         return True
 
     score = safe_score(mem)
-    threshold = 25 if VALIDATION_MODE else 35
+    threshold = 15 if VALIDATION_MODE else 35
 
     if score < threshold:
         print(f"🧠 AI BLOCK {symbol} score={score} threshold={threshold}")
@@ -1250,28 +1384,38 @@ def update_portfolio_allocation():
     global portfolio_alloc
 
     scores = {}
-    total = 0
+    total = 0.0
 
-    for sym, mem in ai_memory.items():
+    default_score = 50 if VALIDATION_MODE else 35
+
+    for sym in PAIRS:
+        mem = ai_memory.get(sym)
+
         if isinstance(mem, dict):
-            score = mem.get("score", 50)
-        else:
+            score = mem.get("score", default_score)
+        elif mem is not None:
             try:
                 score = float(mem)
             except:
-                score = 50
+                score = default_score
+        else:
+            score = default_score
 
-        scores[sym] = max(score, 1)
-        total += scores[sym]
+        score = max(float(score), 1.0)
+        scores[sym] = score
+        total += score
 
-    if total == 0:
-        portfolio_alloc = {}
+    if total <= 0:
+        even_weight = round(1 / max(len(PAIRS), 1), 6)
+        portfolio_alloc = {sym: even_weight for sym in PAIRS}
+        print("📊 PORTFOLIO fallback-even:", portfolio_alloc)
+        save_portfolio()
         return
 
-    for sym in scores:
-        portfolio_alloc[sym] = scores[sym] / total
+    portfolio_alloc = {sym: (scores[sym] / total) for sym in scores}
 
-    print("📊 PORTFOLIO:", portfolio_alloc)
+    top_rows = sorted(portfolio_alloc.items(), key=lambda x: x[1], reverse=True)[:5]
+    print("📊 PORTFOLIO TOP:", [(sym, round(w, 4)) for sym, w in top_rows])
     save_portfolio()
 
 def get_open_positions():
@@ -1904,6 +2048,36 @@ def debug_skip_reasons(limit: int = Query(default=100, ge=1, le=300)):
         "rows": rows
     }
 
+
+@app.get("/debug/portfolio")
+def debug_portfolio():
+    rows = []
+    for sym in PAIRS:
+        mem = ai_memory.get(sym)
+        rows.append({
+            "symbol": sym,
+            "tier": get_pair_tier(sym),
+            "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6),
+            "has_memory": mem is not None,
+            "memory_score": round(safe_score(mem) if mem is not None else (50 if VALIDATION_MODE else 35), 2),
+        })
+
+    rows.sort(key=lambda x: x["weight"], reverse=True)
+    return {
+        "count": len(rows),
+        "rows": rows,
+        "total_weight": round(sum(r["weight"] for r in rows), 6),
+    }
+
+
+@app.get("/debug/execution-decisions")
+def debug_execution_decisions(limit: int = Query(default=100, ge=1, le=500)):
+    rows = EXECUTION_DECISIONS[-limit:]
+    return {
+        "count": len(rows),
+        "rows": rows,
+    }
+
 @app.get("/debug/decision-board")
 def debug_decision_board():
     candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
@@ -1955,6 +2129,17 @@ def debug_decision_board():
             "executing_symbols": sorted(list(EXECUTION_IN_PROGRESS)),
         },
 
+        "portfolio": {
+            "rows": sorted(
+                [
+                    {"symbol": sym, "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6)}
+                    for sym in PAIRS
+                ],
+                key=lambda x: x["weight"],
+                reverse=True,
+            )[:10]
+        },
+
         "candidates": {
             "count": len(candidate_rows),
             "rows": candidate_rows[:20]
@@ -1969,6 +2154,11 @@ def debug_decision_board():
             "count": len(skip_rows),
             "summary": skip_summary_rows[:20],
             "rows": skip_rows[-20:]
+        },
+
+        "execution_decisions": {
+            "count": len(EXECUTION_DECISIONS),
+            "rows": EXECUTION_DECISIONS[-20:],
         },
 
         "analytics": {
@@ -2397,7 +2587,7 @@ def auto_trader():
                     candidate_list_live.append(row)
                     
                     if VALIDATION_MODE:
-                        print(f"🧪 CANDIDATE {symbol} tier={get_pair_tier(symbol)} side={final_side} score={score} rr={rr:.2f} regime={pair_regime} news={news_impact} session={session}")
+                        print(f"🧪 CANDIDATE {symbol} tier={get_pair_tier(symbol)} side={final_side} score={score} rr={rr:.2f} regime={pair_regime} news={news_impact} session={session} vol={vol:.4f}")
 
                 except Exception as e:
                     print(f"Scoring error {symbol}: {e}")
@@ -2414,6 +2604,12 @@ def auto_trader():
 
             if VALIDATION_MODE:
                 print("🎯 SELECTED SYMBOLS:", selected_symbols_live)
+
+            for sym in selected_symbols_live:
+                add_execution_decision("shortlist", sym, "PASS", {
+                    "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6),
+                    "tier": get_pair_tier(sym),
+                })
             
             for symbol in pairs:
                 try:
@@ -2430,6 +2626,7 @@ def auto_trader():
                     w = portfolio_alloc.get(symbol, 0)
                     if w <= 0:
                         add_skip_reason(symbol, "ZERO_PORTFOLIO_WEIGHT")
+                        add_execution_decision("portfolio", symbol, "BLOCK", {"weight": round(float(w), 6)})
                         continue
 
                     ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
@@ -2544,6 +2741,12 @@ def auto_trader():
                     signal["score"] = score
                     
                     ok, reason = should_execute_trade(signal)
+                    add_execution_decision("should_execute_trade", symbol, "PASS" if ok else "BLOCK", {
+                        "reason": reason,
+                        "score": round(float(signal["score"]), 2),
+                        "rr": round(rr, 2),
+                        "weight": round(float(w), 6),
+                    })
                     if not ok:
                         add_skip_reason(symbol, reason, {
                             "score": signal["score"],
@@ -2573,8 +2776,11 @@ def auto_trader():
 
                     if not btc_align["ok"]:
                         add_skip_reason(symbol, btc_align["reason"])
+                        add_execution_decision("btc_alignment", symbol, "BLOCK", btc_align)
                         print(f"🧠 BTC BLOCK {symbol} - {btc_align['reason']}")
                         continue
+
+                    add_execution_decision("btc_alignment", symbol, "PASS", btc_align)
 
                     signal["score"] = max(0, signal["score"] - btc_align["penalty"])
 
@@ -2589,8 +2795,19 @@ def auto_trader():
                             "alt_strength": round(alt_strength, 2),
                             "limit": divergence_limit
                         })
+                        add_execution_decision("strength_divergence", symbol, "BLOCK", {
+                            "btc_strength": round(btc_strength, 2),
+                            "alt_strength": round(alt_strength, 2),
+                            "limit": divergence_limit,
+                        })
                         print(f"🧠 Strength divergence block: BTC {btc_strength:.2f}% vs {symbol} {alt_strength:.2f}% limit={divergence_limit}")
                         continue
+
+                    add_execution_decision("strength_divergence", symbol, "PASS", {
+                        "btc_strength": round(btc_strength, 2),
+                        "alt_strength": round(alt_strength, 2),
+                        "limit": divergence_limit,
+                    })
 
                     positions = get_open_positions()
                     if len(positions) >= MAX_OPEN_TRADES:
@@ -2636,12 +2853,25 @@ def auto_trader():
                         "sweep_low": sweep_low,
                     })
 
+                    add_execution_decision("order_attempt", symbol, "PASS", {
+                        "side": signal["type"],
+                        "score": round(float(signal["score"]), 2),
+                        "weight": round(float(w), 6),
+                        "entry": round(float(signal["entry"]), 8),
+                        "sl": round(float(signal["sl"]), 8),
+                        "tp": round(float(signal["tp"]), 8),
+                    })
+
                     result = place_order_multi(
                         symbol=symbol,
                         side=signal["type"],
                         sl=signal["sl"],
                         tp=signal["tp"]
                     )
+
+                    add_execution_decision("order_result", symbol, "PASS" if not any(isinstance(r, dict) and r.get("error") for r in (result or [])) else "BLOCK", {
+                        "result": result,
+                    })
                     
                     GLOBAL_SYMBOL_LOCK.add(symbol)
 
