@@ -2,3 +2,4 @@
 __pycache__
 data.cpython-311.pyc
 main.cpython-311.pyc
+runtime_state.json

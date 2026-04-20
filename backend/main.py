@@ -32,61 +32,68 @@ def check_env():
 
 check_env()
 
-AUTO_MODE = True
-AUTO_TRADING = True
+AUTO_MODE = os.getenv("AUTO_MODE", "true").lower() == "true"
+AUTO_TRADING = os.getenv("AUTO_TRADING", "true").lower() == "true"
 
-# validation scan lebih cepat
-SCAN_INTERVAL = 10
+# ===== PROFILE / HARDENING =====
+MONTRA_PROFILE = os.getenv("MONTRA_PROFILE", "final_lock").lower()
+VALIDATION_MODE = os.getenv(
+    "VALIDATION_MODE",
+    "true" if MONTRA_PROFILE in ("validation", "sample_hunt") else "false"
+).lower() == "true"
 
-# fokus sekarang: cari sample trade dulu
-VALIDATION_MODE = True
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10" if VALIDATION_MODE else "15"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "46" if VALIDATION_MODE else "62"))
 
-# score dibuat lebih longgar supaya candidate lebih sering muncul
-MIN_SCORE = 46
-
-# safety core tetap dijaga
-MAX_OPEN_TRADES = 2
+# safety core tetap dijaga, tapi live-safe lebih ketat
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2" if VALIDATION_MODE else "1"))
 GLOBAL_SYMBOL_LOCK = set()
 SYMBOL_COOLDOWN = {}
 ORDER_AUDIT_LOG = []
 EXECUTION_IN_PROGRESS = set()
-COOLDOWN_SECONDS = 180   # 3 menit
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180" if VALIDATION_MODE else "900"))
 MAX_AUDIT_LOG = 500
 
 # websocket safety
-WS_MAX_AGE = 20
-WS_STALE_THRESHOLD = 5
-WS_RESTART_COOLDOWN = 30
+WS_MAX_AGE = int(os.getenv("WS_MAX_AGE", "20"))
+WS_STALE_THRESHOLD = int(os.getenv("WS_STALE_THRESHOLD", "5"))
+WS_RESTART_COOLDOWN = int(os.getenv("WS_RESTART_COOLDOWN", "30"))
 LAST_WS_HEAL = 0
 
-STATE_FILE = "runtime_state.json"
+STATE_FILE = os.getenv("STATE_FILE", "runtime_state.json")
 
 # ===== VALIDATION / LIVE GATES =====
-# validation = cari sample trade dulu
-VALIDATION_RR_MIN = 1.8
-LIVE_RR_MIN = 3.2
+VALIDATION_RR_MIN = float(os.getenv("VALIDATION_RR_MIN", "1.8"))
+LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "3.0"))
+VALIDATION_TARGET_RR = float(os.getenv("VALIDATION_TARGET_RR", "2.0"))
+LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "3.0"))
 
-VALIDATION_VOL_MIN = 0.0004
-VALIDATION_VOL_MAX = 0.07
+VALIDATION_VOL_MIN = float(os.getenv("VALIDATION_VOL_MIN", "0.0004"))
+VALIDATION_VOL_MAX = float(os.getenv("VALIDATION_VOL_MAX", "0.07"))
 
-LIVE_VOL_MIN = 0.0015
-LIVE_VOL_MAX = 0.03
+LIVE_VOL_MIN = float(os.getenv("LIVE_VOL_MIN", "0.0015"))
+LIVE_VOL_MAX = float(os.getenv("LIVE_VOL_MAX", "0.03"))
 
-VALIDATION_SESSION_ALLOW_ASIA = True
-VALIDATION_NEWS_BLOCK = False
-VALIDATION_REQUIRE_SWEEP = False
-VALIDATION_REQUIRE_PAIR_REGIME_MATCH = False
-VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY = True
+VALIDATION_SESSION_ALLOW_ASIA = os.getenv("VALIDATION_SESSION_ALLOW_ASIA", "true").lower() == "true"
+VALIDATION_NEWS_BLOCK = os.getenv("VALIDATION_NEWS_BLOCK", "false").lower() == "true"
+VALIDATION_REQUIRE_SWEEP = os.getenv("VALIDATION_REQUIRE_SWEEP", "false").lower() == "true"
+VALIDATION_REQUIRE_PAIR_REGIME_MATCH = os.getenv("VALIDATION_REQUIRE_PAIR_REGIME_MATCH", "false").lower() == "true"
+VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY", "true").lower() == "true"
+
+LIVE_NEWS_BLOCK = os.getenv("LIVE_NEWS_BLOCK", "true").lower() == "true"
+LIVE_NEWS_REVERSE = os.getenv("LIVE_NEWS_REVERSE", "false").lower() == "true"
+LIVE_REQUIRE_SWEEP = os.getenv("LIVE_REQUIRE_SWEEP", "true").lower() == "true"
+LIVE_REQUIRE_PAIR_REGIME_MATCH = os.getenv("LIVE_REQUIRE_PAIR_REGIME_MATCH", "true").lower() == "true"
+LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY", "false").lower() == "true"
 
 # ===== PAIR PRIORITY ENGINE =====
 TOP_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
 MID_PAIRS = ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"]
 LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS]
 
-# shortlist sedikit diperlebar agar sample trade lebih cepat muncul
-TOP_PAIR_LIMIT = 3
-MID_PAIR_LIMIT = 2
-LOW_PAIR_LIMIT = 1
+TOP_PAIR_LIMIT = int(os.getenv("TOP_PAIR_LIMIT", "3" if VALIDATION_MODE else "2"))
+MID_PAIR_LIMIT = int(os.getenv("MID_PAIR_LIMIT", "2" if VALIDATION_MODE else "1"))
+LOW_PAIR_LIMIT = int(os.getenv("LOW_PAIR_LIMIT", "1" if VALIDATION_MODE else "0"))
 
 ACCOUNTS = [
     {
@@ -398,6 +405,21 @@ def session_allowed(session):
         return session in ("ASIA", "LONDON", "NEWYORK")
     return session in ("LONDON", "NEWYORK")
 
+def active_news_block():
+    return VALIDATION_NEWS_BLOCK if VALIDATION_MODE else LIVE_NEWS_BLOCK
+
+def active_require_sweep():
+    return VALIDATION_REQUIRE_SWEEP if VALIDATION_MODE else LIVE_REQUIRE_SWEEP
+
+def active_require_pair_regime_match():
+    return VALIDATION_REQUIRE_PAIR_REGIME_MATCH if VALIDATION_MODE else LIVE_REQUIRE_PAIR_REGIME_MATCH
+
+def active_allow_sideways_score_penalty():
+    return VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY if VALIDATION_MODE else LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY
+
+def active_target_rr():
+    return VALIDATION_TARGET_RR if VALIDATION_MODE else max(LIVE_TARGET_RR, LIVE_RR_MIN)
+
 def get_pair_tier(symbol):
     if symbol in TOP_PAIRS:
         return "TOP"
@@ -411,6 +433,16 @@ def tier_limits():
         "MID": MID_PAIR_LIMIT,
         "LOW": LOW_PAIR_LIMIT,
     }
+
+def tier_score_floor(symbol):
+    tier = get_pair_tier(symbol)
+    if VALIDATION_MODE:
+        return MIN_SCORE if tier != "LOW" else max(MIN_SCORE, 50)
+    if tier == "TOP":
+        return max(MIN_SCORE, 62)
+    if tier == "MID":
+        return max(MIN_SCORE, 66)
+    return 999
 
 def tier_score_bonus(symbol):
     tier = get_pair_tier(symbol)
@@ -1125,6 +1157,62 @@ def set_symbol_cooldown(symbol, reason=""):
     add_order_audit("COOLDOWN_SET", symbol, {"reason": reason, "seconds": COOLDOWN_SECONDS})
     save_runtime_state()
 
+def clamp_runtime_state():
+    global current_risk, daily_loss, consecutive_loss
+    try:
+        current_risk = float(current_risk)
+    except Exception:
+        current_risk = float(BASE_RISK)
+    current_risk = max(MIN_RISK, min(MAX_RISK, current_risk))
+    daily_loss = max(0.0, float(daily_loss or 0.0))
+    consecutive_loss = max(0, int(consecutive_loss or 0))
+
+    now = time.time()
+    expired = [sym for sym, ts in SYMBOL_COOLDOWN.items() if (now - float(ts)) >= COOLDOWN_SECONDS]
+    for sym in expired:
+        SYMBOL_COOLDOWN.pop(sym, None)
+
+def get_exchange_open_symbols_strict():
+    if binance is None:
+        return None
+    try:
+        positions = binance.futures_position_information()
+        return {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
+    except Exception as e:
+        print("reconcile open symbols error:", e)
+        return None
+
+def reconcile_runtime_state_with_exchange():
+    actual_open = get_exchange_open_symbols_strict()
+    if actual_open is None:
+        return
+
+    stale_locks = sorted(list(GLOBAL_SYMBOL_LOCK - actual_open))
+    stale_snapshots = sorted([sym for sym in TRADE_SNAPSHOTS.keys() if sym not in actual_open])
+
+    if stale_locks:
+        print("🧹 Clearing stale locks:", stale_locks)
+    if stale_snapshots:
+        print("🧹 Clearing stale snapshots:", stale_snapshots)
+
+    GLOBAL_SYMBOL_LOCK.clear()
+    GLOBAL_SYMBOL_LOCK.update(actual_open)
+
+    for sym in stale_snapshots:
+        close_info = {
+            "result": "UNKNOWN",
+            "pnl": 0.0,
+            "regime": "RECOVERED",
+            "vol": 0.0,
+            "entry_score": position_entry_score.pop(sym, 50),
+            "note": "startup_reconcile_no_open_position",
+        }
+        add_order_audit("STALE_SNAPSHOT_RECOVERED", sym, close_info)
+        move_snapshot_to_replay(sym, close_info)
+        EXECUTION_IN_PROGRESS.discard(sym)
+
+    save_runtime_state()
+
 # ===== AI MEMORY FUNCTIONS =====
 def update_ai_memory(symbol, result):
     global ai_memory
@@ -1430,8 +1518,16 @@ def get_open_positions():
 
 # ⭐ NEW: centralized decision
 def should_execute_trade(signal):
-    score = signal.get("score", 0)
+    score = float(signal.get("score", 0) or 0)
     symbol = signal.get("symbol")
+    side = signal.get("type")
+    rr = float(signal.get("rr", 0) or 0)
+    pair_regime = signal.get("pair_regime")
+    sweep_high = bool(signal.get("sweep_high", False))
+    sweep_low = bool(signal.get("sweep_low", False))
+
+    if not symbol or side not in ("BUY", "SELL"):
+        return False, "INVALID_SIGNAL"
 
     if KILL_SWITCH:
         return False, "KILL_SWITCH"
@@ -1439,9 +1535,12 @@ def should_execute_trade(signal):
     if not AUTO_TRADING:
         return False, "AUTO_OFF"
 
+    if not safety_check():
+        return False, "SAFETY_BLOCK"
+
     if symbol in disabled_pairs:
         return False, "DISABLED_PAIR"
-        
+
     if symbol in EXECUTION_IN_PROGRESS:
         return False, "EXECUTION_IN_PROGRESS"
 
@@ -1454,8 +1553,26 @@ def should_execute_trade(signal):
     if not ai_allow_trade(symbol):
         return False, "AI_BLOCK"
 
-    if score < MIN_SCORE:
-        return False, "LOW_SCORE"
+    min_score_needed = tier_score_floor(symbol)
+    if score < min_score_needed:
+        return False, f"LOW_SCORE_{min_score_needed}"
+
+    if rr and rr < active_rr_min():
+        return False, f"LOW_RR_{active_rr_min()}"
+
+    if active_require_sweep():
+        if side == "BUY" and not sweep_low:
+            return False, "NO_SWEEP_LOW"
+        if side == "SELL" and not sweep_high:
+            return False, "NO_SWEEP_HIGH"
+
+    if active_require_pair_regime_match() and pair_regime:
+        if pair_regime == "SIDEWAYS":
+            return False, "PAIR_REGIME_SIDEWAYS"
+        if pair_regime == "BULL" and side != "BUY":
+            return False, "PAIR_REGIME_BULL_MISMATCH"
+        if pair_regime == "BEAR" and side != "SELL":
+            return False, "PAIR_REGIME_BEAR_MISMATCH"
 
     positions = get_open_positions()
 
@@ -1466,7 +1583,7 @@ def should_execute_trade(signal):
         return False, "POSITION_ALREADY_OPEN"
 
     strategy = get_strategy(symbol)
-    if strategy == "DEFENSIVE" and score < 75:
+    if strategy == "DEFENSIVE" and score < max(75, min_score_needed):
         return False, "DEFENSIVE_SKIP"
 
     return True, "OK"
@@ -1703,13 +1820,18 @@ def trade(payload: dict = Body(...)):
         entry = float(payload.get("entry"))
         sl = float(payload.get("sl"))
         tp = float(payload.get("tp"))
-        risk_percent = float(payload.get("risk", 1))
+        risk_percent = max(0.1, min(float(payload.get("risk", 1)), 2.0))
         balance_info = binance.futures_account_balance()
         usdt_balance = next((b for b in balance_info if b["asset"] == "USDT"), None)
         balance = float(usdt_balance["balance"]) if usdt_balance else 0
         risk_amount = balance * (risk_percent / 100)
         stop_distance = abs(entry - sl)
+        if stop_distance <= 0:
+            return {"error": "invalid_stop_distance"}
         quantity = round(risk_amount / stop_distance, 3)
+        quantity, _ = adjust_precision(symbol, quantity, entry)
+        if quantity <= 0:
+            return {"error": "quantity_below_min"}
         result = place_futures_order(symbol, side, quantity, sl, tp)
         send_telegram(f"""
 🚀 TRADE EXECUTED
@@ -1895,6 +2017,7 @@ def health_bot():
         "mode": MONTRA_MODE,
         "auto_mode": AUTO_MODE,
         "auto_trading": AUTO_TRADING,
+        "profile": MONTRA_PROFILE,
         "validation_mode": VALIDATION_MODE,
         "kill_switch": KILL_SWITCH,
         "max_open_trades": MAX_OPEN_TRADES,
@@ -2382,13 +2505,17 @@ def auto_trader():
             print(f"📰 NEWS IMPACT: {news_impact}")
 
             # === NEWS STATE ===
-            news_reverse = (news_impact == "HIGH" and not VALIDATION_MODE)
+            news_reverse = (news_impact == "HIGH" and not VALIDATION_MODE and LIVE_NEWS_REVERSE and not active_news_block())
 
             if news_impact == "HIGH":
-                if VALIDATION_MODE:
-                    print("📰 HIGH IMPACT NEWS → validation mode: no reverse, score penalty only")
+                if active_news_block():
+                    print("📰 HIGH IMPACT NEWS → BLOCK")
+                    time.sleep(SCAN_INTERVAL)
+                    continue
+                elif news_reverse:
+                    print("📰 HIGH IMPACT NEWS → reverse enabled")
                 else:
-                    print("📰 HIGH IMPACT NEWS → SMC tetap jalan, arah akan di-reverse")
+                    print("📰 HIGH IMPACT NEWS → score penalty only")
 
             if vol < active_vol_min():
                 print(f"⏸️ Skip: low volatility ({vol:.4f})")
@@ -2486,7 +2613,7 @@ def auto_trader():
                     sweep_high = highs[-1] > recent_high
                     sweep_low = lows[-1] < recent_low
 
-                    if VALIDATION_REQUIRE_SWEEP:
+                    if active_require_sweep():
                         if signal_type == "BUY" and not sweep_low:
                             continue
                         if signal_type == "SELL" and not sweep_high:
@@ -2503,8 +2630,8 @@ def auto_trader():
                     
                     pair_regime = get_multi_tf_regime(symbol)
 
-                    if not VALIDATION_REQUIRE_PAIR_REGIME_MATCH:
-                        if pair_regime == "SIDEWAYS" and VALIDATION_ALLOW_SIDEWAYS_SCORE_PENALTY:
+                    if not active_require_pair_regime_match():
+                        if pair_regime == "SIDEWAYS" and active_allow_sideways_score_penalty():
                             pass
                     else:
                         if pair_regime == "SIDEWAYS":
@@ -2517,12 +2644,13 @@ def auto_trader():
                             add_skip_reason(symbol, "PAIR_REGIME_BEAR_MISMATCH")
                             continue
                     
+                    rr_target = active_target_rr()
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
-                        tp = last_price + (last_price - sl) * 2
+                        tp = last_price + (last_price - sl) * rr_target
                     else:
                         sl = float(ob_candle[2])  # high OB
-                        tp = last_price - (sl - last_price) * 2
+                        tp = last_price - (sl - last_price) * rr_target
                         
                     rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
                     if rr < active_rr_min():
@@ -2565,7 +2693,7 @@ def auto_trader():
 
                     score += tier_score_bonus(symbol)
 
-                    if pair_regime == "SIDEWAYS" and VALIDATION_MODE:
+                    if pair_regime == "SIDEWAYS" and active_allow_sideways_score_penalty():
                         score -= 4
 
                     score = max(0, min(score, 100))
@@ -2687,7 +2815,7 @@ def auto_trader():
                     sweep_high = highs[-1] > recent_high
                     sweep_low = lows[-1] < recent_low
 
-                    if VALIDATION_REQUIRE_SWEEP:
+                    if active_require_sweep():
                         if signal_type == "BUY" and not sweep_low:
                             add_skip_reason(symbol, "NO_SWEEP_LOW")
                             continue
@@ -2706,7 +2834,7 @@ def auto_trader():
                     
                     pair_regime = get_multi_tf_regime(symbol)
 
-                    if VALIDATION_REQUIRE_PAIR_REGIME_MATCH:
+                    if active_require_pair_regime_match():
                         if pair_regime == "SIDEWAYS":
                             continue
                         if pair_regime == "BULL" and final_side != "BUY":
@@ -2714,12 +2842,13 @@ def auto_trader():
                         if pair_regime == "BEAR" and final_side != "SELL":
                             continue
                     
+                    rr_target = active_target_rr()
                     if final_side == "BUY":
                         sl = float(ob_candle[3])  # low OB
-                        tp = last_price + (last_price - sl) * 2
+                        tp = last_price + (last_price - sl) * rr_target
                     else:
                         sl = float(ob_candle[2])  # high OB
-                        tp = last_price - (sl - last_price) * 2
+                        tp = last_price - (sl - last_price) * rr_target
                         
                     rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
                     if rr < active_rr_min():
@@ -2731,8 +2860,24 @@ def auto_trader():
                         "entry": last_price,
                         "sl": sl,
                         "tp": tp,
-                        "score": scores_map.get(symbol, 0)
+                        "score": scores_map.get(symbol, 0),
+                        "pair_regime": pair_regime,
+                        "sweep_high": sweep_high,
+                        "sweep_low": sweep_low,
+                        "rr": round(rr, 2),
                     }
+
+                    min_score_needed = tier_score_floor(symbol)
+                    if signal["score"] < min_score_needed:
+                        add_skip_reason(symbol, "LOW_SCORE_FINAL_LOCK", {
+                            "score": round(float(signal["score"]), 2),
+                            "min_score": min_score_needed,
+                        })
+                        add_execution_decision("score_floor", symbol, "BLOCK", {
+                            "score": round(float(signal["score"]), 2),
+                            "min_score": min_score_needed,
+                        })
+                        continue
 
                     ml_prob = ml_predict(build_ml_features(
                         symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
@@ -2918,6 +3063,7 @@ def start_background_tasks():
 
     _bot_started = True
     load_runtime_state()
+    clamp_runtime_state()
 
     if MONTRA_MODE == "api_only":
         print("⚠️ API ONLY mode → no WS, no bot, no trader")
@@ -2930,6 +3076,7 @@ def start_background_tasks():
         for p in get_open_positions():
             sym = p["symbol"]
             GLOBAL_SYMBOL_LOCK.add(sym)
+        reconcile_runtime_state_with_exchange()
         if GLOBAL_SYMBOL_LOCK:
             print("🔒 Recovered symbol locks:", sorted(list(GLOBAL_SYMBOL_LOCK)))
     except Exception as e:
