@@ -18,13 +18,43 @@ BASE_RISK = float(os.getenv("BASE_RISK", 1))  # % per trade
 MIN_RISK = 0.3
 MAX_RISK = 2
 
-PAIRS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "SUIUSDT","ADAUSDT","LTCUSDT","LINKUSDT","BCHUSDT",
-    "DOGEUSDT","TRXUSDT","AVAXUSDT","XLMUSDT","TAOUSDT",
-    "XAUUSDT","HYPEUSDT","XMRUSDT","XAGUSDT","ZECUSDT",
-    "ENJUSDT","FILUSDT","AAVEUSDT","TONUSDT","ETCUSDT",
-    "ATOMUSDT","DASHUSDT","QNTUSDT","MANAUSDT","ZENUSDT"
+# =========================
+# MONTRA PAIR UNIVERSE (recommended)
+# =========================
+# Core live universe: hanya pair yang lebih cocok untuk final-lock intraday
+TOP_PAIRS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+    "XRPUSDT", "DOGEUSDT", "TRXUSDT"
 ]
+
+MID_PAIRS = [
+    "HYPEUSDT", "SUIUSDT", "ADAUSDT", "LINKUSDT",
+    "BCHUSDT", "XLMUSDT", "LTCUSDT", "AVAXUSDT",
+    "TONUSDT", "ATOMUSDT", "1000PEPEUSDT"
+]
+
+# Pair yang boleh dipantau / diuji di fase validation,
+# tapi jangan dijadikan core live dulu sampai ada bukti journal
+VALIDATION_ONLY = [
+    "TAOUSDT", "AAVEUSDT", "ETCUSDT", "FILUSDT",
+    "QNTUSDT", "XMRUSDT", "ZECUSDT"
+]
+
+# Pair yang disarankan keluar dari core MONTRA sekarang
+REMOVE_FROM_CORE = [
+    "XAUUSDT", "XAGUSDT", "DASHUSDT",
+    "ZENUSDT", "ENJUSDT", "MANAUSDT"
+]
+
+# PAIRS = universe yang benar-benar dipakai backend untuk scan.
+# Kalau mau validation ikut scan VALIDATION_ONLY, nyalakan env MONTRA_INCLUDE_VALIDATION_ONLY=true
+INCLUDE_VALIDATION_ONLY = os.getenv("MONTRA_INCLUDE_VALIDATION_ONLY", "false").lower() == "true"
+
+PAIRS = TOP_PAIRS + MID_PAIRS
+if INCLUDE_VALIDATION_ONLY:
+    PAIRS += VALIDATION_ONLY
+
+# Deduplicate sambil mempertahankan urutan
+PAIRS = list(dict.fromkeys(PAIRS))
 
 MONTRA_MODE = os.getenv("MONTRA_MODE", "api_only")

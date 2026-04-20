@@ -87,8 +87,16 @@ LIVE_REQUIRE_PAIR_REGIME_MATCH = os.getenv("LIVE_REQUIRE_PAIR_REGIME_MATCH", "tr
 LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY", "false").lower() == "true"
 
 # ===== PAIR PRIORITY ENGINE =====
-TOP_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
-MID_PAIRS = ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"]
+# Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
+# bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["HYPEUSDT", "SUIUSDT", "ADAUSDT", "LINKUSDT", "BCHUSDT", "XLMUSDT", "LTCUSDT", "AVAXUSDT", "TONUSDT", "ATOMUSDT", "1000PEPEUSDT"])
+VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
+REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
+
+# PAIRS dari config tetap jadi source of truth universe scan.
+# REMOVE_FROM_CORE diproteksi ulang di sini bila config masih membawa pair tersebut.
+PAIRS = [p for p in PAIRS if p not in REMOVE_FROM_CORE]
 LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS]
 
 TOP_PAIR_LIMIT = int(os.getenv("TOP_PAIR_LIMIT", "3" if VALIDATION_MODE else "2"))
@@ -1911,9 +1919,12 @@ def health_ready():
 @app.get("/health/pairs")
 def health_pairs():
     return {
+        "scan_pairs": PAIRS,
         "top_pairs": TOP_PAIRS,
         "mid_pairs": MID_PAIRS,
         "low_pairs": LOW_PAIRS,
+        "validation_only": VALIDATION_ONLY,
+        "remove_from_core": REMOVE_FROM_CORE,
         "limits": tier_limits(),
     }
 
