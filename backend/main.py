@@ -388,6 +388,7 @@ LAST_STOP_PRICE = {}
 # === DEBUG CANDIDATE LIVE ===
 candidate_list_live = []
 selected_symbols_live = []
+selected_rows_live = []
 skip_reasons_live = []
 MAX_SKIP_REASONS = 300
 EXECUTION_DECISIONS = []
@@ -1082,14 +1083,20 @@ def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     requests.post(url, json={"chat_id": chat_id, "text": msg})
 
-def cancel_existing_orders(symbol):
+def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = True):
     if binance is None:
         print("⚠️ cancel skipped: binance client not ready")
         return False
     try:
         orders = signed_call(binance, binance.futures_get_open_orders, symbol=symbol, label="MAIN")
         for o in orders:
-            if o["type"] in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
+            otype = o.get("type")
+            should_cancel = False
+            if cancel_sl and otype == "STOP_MARKET":
+                should_cancel = True
+            if cancel_tp and otype == "TAKE_PROFIT_MARKET":
+                should_cancel = True
+            if should_cancel:
                 try:
                     signed_call(binance, binance.futures_cancel_order, symbol=symbol, orderId=o["orderId"], label="MAIN")
                 except Exception as e:
@@ -1282,7 +1289,7 @@ def update_stop_loss(symbol, side, new_sl):
         if last is not None and abs(last - new_sl) <= max(tick, 1e-12):
             return
         for _ in range(3):
-            cancel_existing_orders(symbol)
+            cancel_existing_orders(symbol, cancel_tp=False, cancel_sl=True)
             time.sleep(1.0)
             try:
                 signed_call(binance, binance.futures_create_order, label="MAIN",
@@ -2564,8 +2571,8 @@ def debug_candidates():
 @app.get("/debug/selected")
 def debug_selected():
     return {
-        "count": len(selected_symbols_live),
-        "rows": selected_symbols_live
+        "count": len(selected_rows_live),
+        "rows": selected_rows_live
     }
 
 @app.get("/debug/skip-reasons")
@@ -2686,8 +2693,8 @@ def debug_decision_board():
         },
 
         "selected": {
-            "count": len(selected_symbols_live),
-            "rows": selected_symbols_live
+            "count": len(selected_rows_live),
+            "rows": selected_rows_live
         },
 
         "skip_reasons": {
@@ -2881,7 +2888,7 @@ def apply_news_bias(signal_type, news_reverse):
     return signal_type
 
 def auto_trader():
-    global candidate_list_live, selected_symbols_live, skip_reasons_live
+    global candidate_list_live, selected_symbols_live, selected_rows_live, skip_reasons_live
     while True:
         try:
             check_telegram_commands()
@@ -2960,6 +2967,7 @@ def auto_trader():
 
             candidate_list_live = []
             selected_symbols_live = []
+            selected_rows_live = []
             skip_reasons_live = []
 
             pairs = PAIRS.copy()
@@ -3124,8 +3132,13 @@ def auto_trader():
                         "tier": tier,
                         "score": score,
                         "side": final_side,
+                        "type": final_side,
+                        "entry": round(float(last_price), 8),
+                        "sl": round(float(sl), 8),
+                        "tp": round(float(tp), 8),
                         "rr": round(rr, 2),
                         "pair_regime": pair_regime,
+                        "regime": pair_regime,
                         "news_impact": news_impact,
                         "session": session,
                         "structure_grade": structure_grade,
@@ -3144,6 +3157,7 @@ def auto_trader():
             selected_symbols = set()
             candidate_symbols = set()
             candidate_rank_map = {}
+            selected_row_map = {}
 
             for tier_name, limit in tier_limits().items():
                 rows = sorted(candidate_map[tier_name], key=lambda x: x["score"], reverse=True)
@@ -3159,13 +3173,25 @@ def auto_trader():
                     }
                     if idx <= limit:
                         selected_symbols.add(sym)
+                        selected_row_map[sym] = {
+                            **row,
+                            "rank": idx,
+                            "limit": limit,
+                            "portfolio_weight": round(float(portfolio_alloc.get(sym, 0.0)), 6),
+                        }
 
             selected_symbols_live = sorted(list(selected_symbols))
+            selected_rows_live = sorted(
+                list(selected_row_map.values()),
+                key=lambda x: x.get("score", 0),
+                reverse=True,
+            )
 
             if VALIDATION_MODE:
                 print("🎯 SELECTED SYMBOLS:", selected_symbols_live)
 
-            for sym in selected_symbols_live:
+            for row in selected_rows_live:
+                sym = row["symbol"]
                 add_execution_decision("shortlist", sym, "PASS", {
                     "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6),
                     "tier": get_pair_tier(sym),
