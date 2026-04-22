@@ -86,6 +86,14 @@ LIVE_REQUIRE_SWEEP = os.getenv("LIVE_REQUIRE_SWEEP", "true").lower() == "true"
 LIVE_REQUIRE_PAIR_REGIME_MATCH = os.getenv("LIVE_REQUIRE_PAIR_REGIME_MATCH", "true").lower() == "true"
 LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY", "false").lower() == "true"
 
+# ===== STRUCTURE ENGINE V2 =====
+STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "12"))
+STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "5"))
+STRUCTURE_RECLAIM_TOLERANCE = float(os.getenv("STRUCTURE_RECLAIM_TOLERANCE", "0.0012"))
+STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.18"))
+STRUCTURE_STRONG_SCORE_BONUS = int(os.getenv("STRUCTURE_STRONG_SCORE_BONUS", "6"))
+STRUCTURE_MEDIUM_SCORE_PENALTY = int(os.getenv("STRUCTURE_MEDIUM_SCORE_PENALTY", "4"))
+
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
@@ -535,6 +543,163 @@ def tier_score_bonus(symbol):
         return 5
     if tier == "MID":
         return 2
+    return 0
+
+def detect_recent_fvg(ohlcv, bars=None):
+    bars = bars or STRUCTURE_FVG_LOOKBACK
+    fvg_up = None
+    fvg_down = None
+
+    if len(ohlcv) < 3:
+        return {"up": None, "down": None}
+
+    start = max(2, len(ohlcv) - (bars + 2))
+
+    for i in range(start, len(ohlcv)):
+        c1 = ohlcv[i - 2]
+        c3 = ohlcv[i]
+
+        c1_high = float(c1[2])
+        c1_low = float(c1[3])
+        c3_high = float(c3[2])
+        c3_low = float(c3[3])
+
+        if c1_high < c3_low:
+            gap = {
+                "top": c3_low,
+                "bottom": c1_high,
+                "index": i,
+                "age": len(ohlcv) - 1 - i,
+            }
+            if fvg_up is None or gap["age"] < fvg_up["age"]:
+                fvg_up = gap
+
+        if c1_low > c3_high:
+            gap = {
+                "top": c1_low,
+                "bottom": c3_high,
+                "index": i,
+                "age": len(ohlcv) - 1 - i,
+            }
+            if fvg_down is None or gap["age"] < fvg_down["age"]:
+                fvg_down = gap
+
+    return {"up": fvg_up, "down": fvg_down}
+
+def analyze_structure_v2(ohlcv, last_price=None):
+    if len(ohlcv) < max(STRUCTURE_SWING_LOOKBACK + 2, 20):
+        return {
+            "ok": False,
+            "reason": "NO_STRUCTURE",
+            "grade": "NONE",
+            "signal_type": None,
+            "fvg_up": False,
+            "fvg_down": False,
+            "swing_break_up": False,
+            "swing_break_down": False,
+            "reclaim_up": False,
+            "reclaim_down": False,
+            "displacement_up": False,
+            "displacement_down": False,
+            "context_high": None,
+            "context_low": None,
+        }
+
+    highs = [float(c[2]) for c in ohlcv]
+    lows = [float(c[3]) for c in ohlcv]
+    opens = [float(c[1]) for c in ohlcv]
+    closes = [float(c[4]) for c in ohlcv]
+
+    last_open = opens[-1]
+    last_close = closes[-1] if last_price is None else float(last_price)
+    last_high = highs[-1]
+    last_low = lows[-1]
+
+    prev_high = max(highs[-(STRUCTURE_SWING_LOOKBACK + 1):-1])
+    prev_low = min(lows[-(STRUCTURE_SWING_LOOKBACK + 1):-1])
+
+    candle_range = max(last_high - last_low, 1e-9)
+    candle_body = abs(last_close - last_open)
+    body_ratio = candle_body / candle_range
+
+    displacement_up = last_close > last_open and body_ratio >= STRUCTURE_MIN_BODY_RATIO
+    displacement_down = last_close < last_open and body_ratio >= STRUCTURE_MIN_BODY_RATIO
+
+    tol_high = prev_high * STRUCTURE_RECLAIM_TOLERANCE
+    tol_low = prev_low * STRUCTURE_RECLAIM_TOLERANCE
+
+    swing_break_up = last_close > (prev_high + tol_high)
+    swing_break_down = last_close < (prev_low - tol_low)
+
+    reclaim_up = last_low < (prev_low - tol_low) and last_close > prev_low and last_close > last_open
+    reclaim_down = last_high > (prev_high + tol_high) and last_close < prev_high and last_close < last_open
+
+    fvg = detect_recent_fvg(ohlcv)
+    fvg_up = fvg["up"] is not None
+    fvg_down = fvg["down"] is not None
+
+    strong_buy = swing_break_up and fvg_up and displacement_up
+    strong_sell = swing_break_down and fvg_down and displacement_down
+
+    medium_buy = (
+        (reclaim_up and (fvg_up or displacement_up)) or
+        (swing_break_up and fvg_up) or
+        (reclaim_up and displacement_up)
+    )
+
+    medium_sell = (
+        (reclaim_down and (fvg_down or displacement_down)) or
+        (swing_break_down and fvg_down) or
+        (reclaim_down and displacement_down)
+    )
+
+    signal_type = None
+    grade = "NONE"
+    reason = "NO_STRUCTURE"
+
+    if strong_buy:
+        signal_type = "BUY"
+        grade = "STRONG"
+        reason = "STRUCTURE_STRONG_BUY"
+    elif strong_sell:
+        signal_type = "SELL"
+        grade = "STRONG"
+        reason = "STRUCTURE_STRONG_SELL"
+    elif medium_buy:
+        signal_type = "BUY"
+        grade = "MEDIUM"
+        reason = "STRUCTURE_MEDIUM_BUY"
+    elif medium_sell:
+        signal_type = "SELL"
+        grade = "MEDIUM"
+        reason = "STRUCTURE_MEDIUM_SELL"
+
+    return {
+        "ok": signal_type is not None,
+        "reason": reason,
+        "grade": grade,
+        "signal_type": signal_type,
+        "fvg_up": fvg_up,
+        "fvg_down": fvg_down,
+        "fvg_up_zone": fvg["up"],
+        "fvg_down_zone": fvg["down"],
+        "swing_break_up": swing_break_up,
+        "swing_break_down": swing_break_down,
+        "reclaim_up": reclaim_up,
+        "reclaim_down": reclaim_down,
+        "displacement_up": displacement_up,
+        "displacement_down": displacement_down,
+        "context_high": prev_high,
+        "context_low": prev_low,
+        "body_ratio": round(body_ratio, 4),
+    }
+
+def structure_score_adjustment(structure):
+    grade = structure.get("grade")
+    if grade == "STRONG":
+        return STRUCTURE_STRONG_SCORE_BONUS
+    if grade == "MEDIUM":
+        return -STRUCTURE_MEDIUM_SCORE_PENALTY
     return 0
 
 def add_skip_reason(symbol, reason, extra=None):
@@ -2654,34 +2819,19 @@ def auto_trader():
                     else:
                         last_price = float(ohlcv[-1][4])
 
-                    # === STRUCTURE LOGIC ===
+                    # === STRUCTURE LOGIC V2 ===
                     highs = [float(c[2]) for c in ohlcv]
                     lows = [float(c[3]) for c in ohlcv]
 
-                    hh = highs[-1] > highs[-5]
-                    ll = lows[-1] < lows[-5]
-
-                    # === FVG DETECTION ===
-                    fvg_up = False
-                    fvg_down = False
-
-                    if len(ohlcv) >= 3:
-                        c1 = ohlcv[-3]
-                        c2 = ohlcv[-2]
-                        c3 = ohlcv[-1]
-
-                        if float(c1[2]) < float(c3[3]):
-                            fvg_up = True
-                        if float(c1[3]) > float(c3[2]):
-                            fvg_down = True
-
-                    if hh and fvg_up:
-                        signal_type = "BUY"
-                    elif ll and fvg_down:
-                        signal_type = "SELL"
-                    else:
-                        add_skip_reason(symbol, "NO_STRUCTURE")
+                    structure = analyze_structure_v2(ohlcv, last_price=last_price)
+                    if not structure["ok"]:
+                        add_skip_reason(symbol, structure["reason"])
                         continue
+
+                    signal_type = structure["signal_type"]
+                    structure_grade = structure["grade"]
+                    fvg_up = structure["fvg_up"]
+                    fvg_down = structure["fvg_down"]
 
                     # === FILTER FAKE MOVE (liquidity sweep) ===
                     last_candle = ohlcv[-1]
@@ -2759,7 +2909,8 @@ def auto_trader():
                         "entry": last_price,
                         "sl": sl,
                         "tp": tp,
-                        "score": 85
+                        "score": 85 if structure_grade == "STRONG" else 72,
+                        "structure_grade": structure_grade,
                     }
 
                     score = meta_score(symbol, signal, regime, vol)
@@ -2768,6 +2919,7 @@ def auto_trader():
                         symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
                     ))
                     score = round((score * 0.8) + (ml_prob * 100 * 0.2))
+                    score += structure_score_adjustment(structure)
                                                           
                     if news_impact == "HIGH":
                         score -= 2 if VALIDATION_MODE else 6
@@ -2777,6 +2929,8 @@ def auto_trader():
                         score += 5
                     if sweep_high or sweep_low:
                         score += 5
+                    if structure.get("reclaim_up") or structure.get("reclaim_down"):
+                        score += 3
 
                     # === NEWS FACTOR ===
                     if news_impact == "HIGH":
@@ -2802,6 +2956,7 @@ def auto_trader():
                         "pair_regime": pair_regime,
                         "news_impact": news_impact,
                         "session": session,
+                        "structure_grade": structure_grade,
                     }
 
                     candidate_map[tier].append(row)
@@ -2873,34 +3028,19 @@ def auto_trader():
                     else:
                         last_price = float(ohlcv[-1][4])
 
-                    # === STRUCTURE LOGIC ===
+                    # === STRUCTURE LOGIC V2 ===
                     highs = [float(c[2]) for c in ohlcv]
                     lows = [float(c[3]) for c in ohlcv]
 
-                    hh = highs[-1] > highs[-5]
-                    ll = lows[-1] < lows[-5]
-
-                    # === FVG DETECTION ===
-                    fvg_up = False
-                    fvg_down = False
-
-                    if len(ohlcv) >= 3:
-                        c1 = ohlcv[-3]
-                        c2 = ohlcv[-2]
-                        c3 = ohlcv[-1]
-
-                        if float(c1[2]) < float(c3[3]):
-                            fvg_up = True
-                        if float(c1[3]) > float(c3[2]):
-                            fvg_down = True
-
-                    if hh and fvg_up:
-                        signal_type = "BUY"
-                    elif ll and fvg_down:
-                        signal_type = "SELL"
-                    else:
-                        add_skip_reason(symbol, "NO_STRUCTURE")
+                    structure = analyze_structure_v2(ohlcv, last_price=last_price)
+                    if not structure["ok"]:
+                        add_skip_reason(symbol, structure["reason"])
                         continue
+
+                    signal_type = structure["signal_type"]
+                    structure_grade = structure["grade"]
+                    fvg_up = structure["fvg_up"]
+                    fvg_down = structure["fvg_down"]
 
                     # === FILTER FAKE MOVE (liquidity sweep) ===
                     last_candle = ohlcv[-1]
@@ -2973,6 +3113,7 @@ def auto_trader():
                         "sweep_high": sweep_high,
                         "sweep_low": sweep_low,
                         "rr": round(rr, 2),
+                        "structure_grade": structure_grade,
                     }
 
                     min_score_needed = tier_score_floor(symbol)
