@@ -32,6 +32,22 @@ type AccountRow = {
   error?: string;
 };
 
+type PositionRow = {
+  symbol: string;
+  type: "BUY" | "SELL";
+  entry?: number;
+  mark?: number;
+  sl?: number | null;
+  tp?: number | null;
+  rr?: number | null;
+  size?: number;
+  position_amt?: number;
+  unrealized?: number;
+  leverage?: number;
+  locked?: boolean;
+  has_snapshot?: boolean;
+};
+
 type SkipSummaryRow = {
   reason: string;
   count: number;
@@ -81,6 +97,10 @@ type DecisionBoard = {
   selected: {
     count: number;
     rows: BackendSignal[];
+  };
+  live_positions?: {
+    count: number;
+    rows: PositionRow[];
   };
   skip_reasons: {
     count: number;
@@ -146,6 +166,26 @@ const cardStyle: CSSProperties = {
 function formatNum(value: unknown, digits = 2) {
   const num = Number(value);
   return Number.isFinite(num) ? num.toFixed(digits) : "-";
+}
+
+function positionToSignal(position: PositionRow | null): BackendSignal | null {
+  if (!position) return null;
+  return {
+    symbol: position.symbol,
+    type: position.type,
+    entry: Number(position.entry ?? 0),
+    sl: Number(position.sl ?? 0),
+    tp: Number(position.tp ?? 0),
+    rr: position.rr ?? undefined,
+    score: undefined,
+    regime: undefined,
+    pair_regime: undefined,
+    pair_tier: undefined,
+    size: position.size,
+    unrealized: position.unrealized,
+    leverage: position.leverage,
+    mark: position.mark,
+  };
 }
 
 function StatusPill({ label, ok, warn }: { label: string; ok?: boolean; warn?: boolean }) {
@@ -265,6 +305,7 @@ export default function App() {
   const [pairHealth, setPairHealth] = useState<PairHealth | null>(null);
   const [decisionBoard, setDecisionBoard] = useState<DecisionBoard | null>(null);
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [positions, setPositions] = useState<PositionRow[]>([]);
   const [aiMemory, setAiMemory] = useState<Record<string, any>>({});
   const [apiError, setApiError] = useState<string>("");
   const [loading, setLoading] = useState(true);
@@ -276,12 +317,13 @@ export default function App() {
 
     const fetchAll = async () => {
       try {
-        const [liveRes, readyRes, pairsRes, boardRes, accountsRes, memoryRes] = await Promise.all([
+        const [liveRes, readyRes, pairsRes, boardRes, accountsRes, positionsRes, memoryRes] = await Promise.all([
           axios.get(`${API_URL}/health/live`),
           axios.get(`${API_URL}/health/ready`),
           axios.get(`${API_URL}/health/pairs`),
           axios.get(`${API_URL}/debug/decision-board`),
           axios.get(`${API_URL}/accounts`),
+          axios.get(`${API_URL}/positions`),
           axios.get(`${API_URL}/ai-memory`),
         ]);
 
@@ -295,14 +337,17 @@ export default function App() {
         setPairHealth(nextPairs);
         setDecisionBoard(nextBoard);
         setAccounts(accountsRes.data?.accounts || []);
+        setPositions(positionsRes.data?.rows || nextBoard.live_positions?.rows || []);
         setAiMemory(memoryRes.data || {});
         setApiError("");
 
         const backendSignal = nextBoard.selected?.rows?.[0] || nextBoard.candidates?.rows?.[0] || null;
-        if (backendSignal && (!inspectedSignal || inspectedSignal.symbol !== backendSignal.symbol || inspectedSignal.type !== backendSignal.type)) {
-          setInspectedSignal(backendSignal);
-          setManualSymbol(backendSignal.symbol);
-        } else if (!backendSignal && nextPairs.scan_pairs?.length && !nextPairs.scan_pairs.includes(manualSymbol)) {
+        const livePositionSignal = positionToSignal((positionsRes.data?.rows || nextBoard.live_positions?.rows || [])[0] || null);
+        const preferredSignal = backendSignal || livePositionSignal;
+        if (preferredSignal && (!inspectedSignal || inspectedSignal.symbol !== preferredSignal.symbol || inspectedSignal.type !== preferredSignal.type)) {
+          setInspectedSignal(preferredSignal);
+          setManualSymbol(preferredSignal.symbol);
+        } else if (!preferredSignal && nextPairs.scan_pairs?.length && !nextPairs.scan_pairs.includes(manualSymbol)) {
           setManualSymbol(nextPairs.scan_pairs[0]);
         }
       } catch (error: any) {
@@ -323,8 +368,10 @@ export default function App() {
   }, [inspectedSignal, manualSymbol]);
 
   const selectedSignal = decisionBoard?.selected?.rows?.[0] || null;
+  const livePosition = positions?.[0] || decisionBoard?.live_positions?.rows?.[0] || null;
+  const livePositionSignal = positionToSignal(livePosition);
   const topCandidate = decisionBoard?.candidates?.rows?.[0] || null;
-  const activeSignal = inspectedSignal || selectedSignal || topCandidate || null;
+  const activeSignal = inspectedSignal || selectedSignal || livePositionSignal || topCandidate || null;
 
   const sortedAiMemory = useMemo(() => {
     return Object.entries(aiMemory)
@@ -336,10 +383,11 @@ export default function App() {
   const symbolOptions = useMemo(() => {
     const set = new Set<string>();
     pairHealth?.scan_pairs?.forEach((s) => set.add(s));
+    positions.forEach((p) => set.add(p.symbol));
     if (activeSignal?.symbol) set.add(activeSignal.symbol);
     if (manualSymbol) set.add(manualSymbol);
     return Array.from(set);
-  }, [pairHealth, activeSignal, manualSymbol]);
+  }, [pairHealth, positions, activeSignal, manualSymbol]);
 
   const chartSymbol = activeSignal?.symbol || manualSymbol;
   const wsHealthy = Boolean(decisionBoard?.ws?.running && decisionBoard?.ws?.thread_alive && !decisionBoard?.ws?.last_error);
@@ -382,10 +430,17 @@ export default function App() {
             </Section>
 
             <SignalCard
-              title="Backend selected"
+              title="Selected signal (scan)"
               signal={selectedSignal}
               onInspect={setInspectedSignal}
               active={Boolean(activeSignal && selectedSignal && activeSignal.symbol === selectedSignal.symbol && activeSignal.type === selectedSignal.type)}
+            />
+
+            <SignalCard
+              title="Live position"
+              signal={livePositionSignal}
+              onInspect={setInspectedSignal}
+              active={Boolean(activeSignal && livePositionSignal && activeSignal.symbol === livePositionSignal.symbol && activeSignal.type === livePositionSignal.type)}
             />
 
             <Section title="Accounts">

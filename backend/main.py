@@ -190,7 +190,10 @@ def get_accounts_bootstrap():
 
 @app.get("/debug/bootstrap/positions")
 def get_positions_bootstrap():
-    return {"positions": []}
+    try:
+        return {"positions": build_live_position_rows()[:10]}
+    except Exception:
+        return {"positions": []}
 
 app.add_middleware(
     CORSMiddleware,
@@ -217,6 +220,9 @@ LAST_MAIN_POSITIONS_TS = 0.0
 LAST_MAIN_POSITIONS_ERROR = None
 LAST_MAIN_POSITIONS_ERROR_TS = 0.0
 POSITIONS_CACHE_LOCK = threading.Lock()
+LAST_MAIN_OPEN_ORDERS = []
+LAST_MAIN_OPEN_ORDERS_TS = 0.0
+OPEN_ORDERS_CACHE_LOCK = threading.Lock()
 
 def is_rate_limit_error(exc):
     msg = str(exc)
@@ -258,6 +264,111 @@ def fetch_main_positions(force=False, max_age=None, label="MAIN"):
                 print(f"⚠️ {label} using cached positions after rate limit")
                 return cached
         raise
+
+
+def get_cached_main_open_orders(max_age=None):
+    if max_age is None:
+        max_age = POSITION_CACHE_TTL
+    with OPEN_ORDERS_CACHE_LOCK:
+        age = time.time() - LAST_MAIN_OPEN_ORDERS_TS
+        if LAST_MAIN_OPEN_ORDERS_TS and age <= max_age:
+            return [dict(o) for o in LAST_MAIN_OPEN_ORDERS]
+    return None
+
+
+def set_cached_main_open_orders(orders):
+    global LAST_MAIN_OPEN_ORDERS, LAST_MAIN_OPEN_ORDERS_TS
+    with OPEN_ORDERS_CACHE_LOCK:
+        LAST_MAIN_OPEN_ORDERS = [dict(o) for o in (orders or [])]
+        LAST_MAIN_OPEN_ORDERS_TS = time.time()
+
+
+def fetch_main_open_orders(force=False, max_age=None, label="MAIN"):
+    if binance is None:
+        return []
+
+    cached = None if force else get_cached_main_open_orders(max_age=max_age)
+    if cached is not None:
+        return cached
+
+    try:
+        orders = signed_call(binance, binance.futures_get_open_orders, label=label)
+        set_cached_main_open_orders(orders)
+        return orders
+    except Exception as e:
+        if is_rate_limit_error(e):
+            cached = get_cached_main_open_orders(max_age=60)
+            if cached is not None:
+                print(f"⚠️ {label} using cached open orders after rate limit")
+                return cached
+        raise
+
+
+def build_exit_lookup(open_orders):
+    rows = {}
+    for o in open_orders or []:
+        symbol = o.get("symbol")
+        if not symbol:
+            continue
+        stop_price = float(o.get("stopPrice", 0) or 0)
+        if stop_price <= 0:
+            continue
+        row = rows.setdefault(symbol, {"sl": None, "tp": None})
+        order_type = o.get("type")
+        if order_type == "STOP_MARKET":
+            row["sl"] = stop_price
+        elif order_type == "TAKE_PROFIT_MARKET":
+            row["tp"] = stop_price
+    return rows
+
+
+def build_live_position_rows(positions=None, open_orders=None):
+    if positions is None:
+        positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label="MAIN")
+    if open_orders is None:
+        open_orders = fetch_main_open_orders(force=False, max_age=POSITION_CACHE_TTL, label="MAIN")
+
+    exit_lookup = build_exit_lookup(open_orders)
+    rows = []
+
+    for p in positions or []:
+        amt = float(p.get("positionAmt", 0) or 0)
+        if abs(amt) <= 0:
+            continue
+
+        symbol = p.get("symbol")
+        entry = float(p.get("entryPrice", 0) or 0)
+        mark = float(p.get("markPrice", 0) or 0)
+        unrealized = float(p.get("unRealizedProfit", 0) or 0)
+        leverage = float(p.get("leverage", 0) or 0)
+        side = "BUY" if amt > 0 else "SELL"
+
+        exit_row = exit_lookup.get(symbol, {})
+        sl = exit_row.get("sl")
+        tp = exit_row.get("tp")
+
+        rr = None
+        if entry and sl and tp and abs(entry - sl) > 1e-9:
+            rr = round(abs(tp - entry) / abs(entry - sl), 2)
+
+        rows.append({
+            "symbol": symbol,
+            "type": side,
+            "entry": entry,
+            "mark": mark,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+            "size": abs(amt),
+            "position_amt": amt,
+            "unrealized": unrealized,
+            "leverage": leverage,
+            "locked": symbol in GLOBAL_SYMBOL_LOCK,
+            "has_snapshot": symbol in TRADE_SNAPSHOTS,
+        })
+
+    rows.sort(key=lambda x: abs(float(x.get("unrealized", 0))), reverse=True)
+    return rows
 
 def mark_client_runtime(client_obj, label):
     if client_obj is None:
@@ -2697,6 +2808,11 @@ def debug_decision_board():
             "rows": selected_rows_live
         },
 
+        "live_positions": {
+            "count": len(build_live_position_rows()),
+            "rows": build_live_position_rows()[:10],
+        },
+
         "skip_reasons": {
             "count": len(skip_rows),
             "summary": skip_summary_rows[:20],
@@ -2723,9 +2839,19 @@ def position_detail(symbol: str):
         positions = signed_call(binance, binance.futures_position_information, symbol=symbol, label="MAIN")
         trades = signed_call(binance, binance.futures_account_trades, symbol=symbol, label="MAIN")
         pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
-        return {"position": pos, "trades": trades[-50:]}
+        open_orders = signed_call(binance, binance.futures_get_open_orders, symbol=symbol, label="MAIN")
+        exits = build_exit_lookup(open_orders).get(symbol, {})
+        return {"position": pos, "trades": trades[-50:], "sl": exits.get("sl"), "tp": exits.get("tp")}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/positions")
+def get_positions():
+    try:
+        rows = build_live_position_rows()
+        return {"count": len(rows), "rows": rows}
+    except Exception as e:
+        return {"count": 0, "rows": [], "error": str(e)}
 
 @app.get("/accounts")
 def get_accounts():
@@ -2736,13 +2862,13 @@ def get_accounts():
             balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
-            unrealized = float(usdt["crossUnPnl"]) if usdt else 0
-            equity = balance + unrealized
             if c is binance:
                 positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label=acc["name"])
             else:
                 positions = signed_call(c, c.futures_position_information, label=acc["name"])
-            active = [p for p in positions if float(p["positionAmt"]) != 0]
+            active = [p for p in positions if float(p.get("positionAmt", 0) or 0) != 0]
+            unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in active)
+            equity = balance + unrealized
             data.append({
                 "name": acc["name"],
                 "balance": balance,
