@@ -86,13 +86,21 @@ LIVE_REQUIRE_SWEEP = os.getenv("LIVE_REQUIRE_SWEEP", "true").lower() == "true"
 LIVE_REQUIRE_PAIR_REGIME_MATCH = os.getenv("LIVE_REQUIRE_PAIR_REGIME_MATCH", "true").lower() == "true"
 LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY", "false").lower() == "true"
 
-# ===== STRUCTURE ENGINE V2 =====
-STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "12"))
-STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "5"))
-STRUCTURE_RECLAIM_TOLERANCE = float(os.getenv("STRUCTURE_RECLAIM_TOLERANCE", "0.0012"))
-STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.18"))
+# ===== STRUCTURE ENGINE V3 =====
+STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
+STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
+STRUCTURE_RECLAIM_TOLERANCE = float(os.getenv("STRUCTURE_RECLAIM_TOLERANCE", "0.0018"))
+STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.14"))
+STRUCTURE_RECENT_WINDOW = int(os.getenv("STRUCTURE_RECENT_WINDOW", "3"))
+STRUCTURE_ZONE_TOLERANCE = float(os.getenv("STRUCTURE_ZONE_TOLERANCE", "0.0018"))
 STRUCTURE_STRONG_SCORE_BONUS = int(os.getenv("STRUCTURE_STRONG_SCORE_BONUS", "6"))
-STRUCTURE_MEDIUM_SCORE_PENALTY = int(os.getenv("STRUCTURE_MEDIUM_SCORE_PENALTY", "4"))
+STRUCTURE_MEDIUM_SCORE_PENALTY = int(os.getenv("STRUCTURE_MEDIUM_SCORE_PENALTY", "2"))
+
+# ===== EXECUTION / NOTIONAL QUALITY =====
+TOP_MIN_TRADE_NOTIONAL = float(os.getenv("TOP_MIN_TRADE_NOTIONAL", "150"))
+MID_MIN_TRADE_NOTIONAL = float(os.getenv("MID_MIN_TRADE_NOTIONAL", "120"))
+LOW_MIN_TRADE_NOTIONAL = float(os.getenv("LOW_MIN_TRADE_NOTIONAL", "100"))
+DEFAULT_MIN_TRADE_NOTIONAL = float(os.getenv("DEFAULT_MIN_TRADE_NOTIONAL", "120"))
 
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
@@ -647,8 +655,9 @@ def detect_recent_fvg(ohlcv, bars=None):
 
     return {"up": fvg_up, "down": fvg_down}
 
-def analyze_structure_v2(ohlcv, last_price=None):
-    if len(ohlcv) < max(STRUCTURE_SWING_LOOKBACK + 2, 20):
+def analyze_structure_v3(ohlcv, last_price=None):
+    min_bars = max(STRUCTURE_SWING_LOOKBACK + STRUCTURE_RECENT_WINDOW, 20)
+    if len(ohlcv) < min_bars:
         return {
             "ok": False,
             "reason": "NO_STRUCTURE",
@@ -660,8 +669,14 @@ def analyze_structure_v2(ohlcv, last_price=None):
             "swing_break_down": False,
             "reclaim_up": False,
             "reclaim_down": False,
+            "recent_break_up": False,
+            "recent_break_down": False,
+            "recent_reclaim_up": False,
+            "recent_reclaim_down": False,
             "displacement_up": False,
             "displacement_down": False,
+            "directional_up": False,
+            "directional_down": False,
             "context_high": None,
             "context_low": None,
         }
@@ -671,23 +686,45 @@ def analyze_structure_v2(ohlcv, last_price=None):
     opens = [float(c[1]) for c in ohlcv]
     closes = [float(c[4]) for c in ohlcv]
 
-    last_open = opens[-1]
-    last_close = closes[-1] if last_price is None else float(last_price)
-    last_high = highs[-1]
-    last_low = lows[-1]
+    recent_n = max(2, STRUCTURE_RECENT_WINDOW)
+    recent_highs = highs[-recent_n:]
+    recent_lows = lows[-recent_n:]
+    recent_opens = opens[-recent_n:]
+    recent_closes = closes[-recent_n:]
 
-    prev_high = max(highs[-(STRUCTURE_SWING_LOOKBACK + 1):-1])
-    prev_low = min(lows[-(STRUCTURE_SWING_LOOKBACK + 1):-1])
+    last_open = recent_opens[-1]
+    last_close = recent_closes[-1] if last_price is None else float(last_price)
+    last_high = recent_highs[-1]
+    last_low = recent_lows[-1]
 
-    candle_range = max(last_high - last_low, 1e-9)
-    candle_body = abs(last_close - last_open)
-    body_ratio = candle_body / candle_range
-
-    displacement_up = last_close > last_open and body_ratio >= STRUCTURE_MIN_BODY_RATIO
-    displacement_down = last_close < last_open and body_ratio >= STRUCTURE_MIN_BODY_RATIO
+    prev_high = max(highs[-(STRUCTURE_SWING_LOOKBACK + recent_n):-recent_n])
+    prev_low = min(lows[-(STRUCTURE_SWING_LOOKBACK + recent_n):-recent_n])
 
     tol_high = prev_high * STRUCTURE_RECLAIM_TOLERANCE
     tol_low = prev_low * STRUCTURE_RECLAIM_TOLERANCE
+
+    last_range = max(last_high - last_low, 1e-9)
+    last_body = abs(last_close - last_open)
+    last_body_ratio = last_body / last_range
+
+    recent_ranges = [max(h - l, 1e-9) for h, l in zip(recent_highs, recent_lows)]
+    recent_bodies = [abs(c - o) for c, o in zip(recent_closes, recent_opens)]
+    recent_body_ratios = [b / r for b, r in zip(recent_bodies, recent_ranges)]
+    recent_body_ratio_max = max(recent_body_ratios) if recent_body_ratios else last_body_ratio
+
+    displacement_up = any(
+        c > o and (abs(c - o) / max(h - l, 1e-9)) >= STRUCTURE_MIN_BODY_RATIO
+        for o, h, l, c in zip(recent_opens, recent_highs, recent_lows, recent_closes)
+    )
+    displacement_down = any(
+        c < o and (abs(c - o) / max(h - l, 1e-9)) >= STRUCTURE_MIN_BODY_RATIO
+        for o, h, l, c in zip(recent_opens, recent_highs, recent_lows, recent_closes)
+    )
+
+    bullish_count = sum(1 for c, o in zip(recent_closes, recent_opens) if c > o)
+    bearish_count = sum(1 for c, o in zip(recent_closes, recent_opens) if c < o)
+    directional_up = bullish_count >= max(2, recent_n - 1)
+    directional_down = bearish_count >= max(2, recent_n - 1)
 
     swing_break_up = last_close > (prev_high + tol_high)
     swing_break_down = last_close < (prev_low - tol_low)
@@ -695,23 +732,53 @@ def analyze_structure_v2(ohlcv, last_price=None):
     reclaim_up = last_low < (prev_low - tol_low) and last_close > prev_low and last_close > last_open
     reclaim_down = last_high > (prev_high + tol_high) and last_close < prev_high and last_close < last_open
 
-    fvg = detect_recent_fvg(ohlcv)
-    fvg_up = fvg["up"] is not None
-    fvg_down = fvg["down"] is not None
+    recent_break_up = max(recent_closes) > (prev_high + tol_high) or (
+        max(recent_highs) > (prev_high + tol_high) and last_close >= (prev_high - tol_high * 0.35)
+    )
+    recent_break_down = min(recent_closes) < (prev_low - tol_low) or (
+        min(recent_lows) < (prev_low - tol_low) and last_close <= (prev_low + tol_low * 0.35)
+    )
 
-    strong_buy = swing_break_up and fvg_up and displacement_up
-    strong_sell = swing_break_down and fvg_down and displacement_down
+    recent_reclaim_up = min(recent_lows) < (prev_low - tol_low) and max(recent_closes) > prev_low
+    recent_reclaim_down = max(recent_highs) > (prev_high + tol_high) and min(recent_closes) < prev_high
+
+    fvg = detect_recent_fvg(ohlcv, bars=max(STRUCTURE_FVG_LOOKBACK, recent_n + 2))
+    fvg_up_zone = fvg["up"]
+    fvg_down_zone = fvg["down"]
+    fvg_up = fvg_up_zone is not None
+    fvg_down = fvg_down_zone is not None
+
+    zone_tol = STRUCTURE_ZONE_TOLERANCE
+    near_fvg_up = False
+    near_fvg_down = False
+    if fvg_up_zone:
+        band_low = fvg_up_zone["bottom"] * (1 - zone_tol)
+        band_high = fvg_up_zone["top"] * (1 + zone_tol)
+        near_fvg_up = band_low <= last_close <= band_high or last_close >= fvg_up_zone["bottom"]
+    if fvg_down_zone:
+        band_low = fvg_down_zone["bottom"] * (1 - zone_tol)
+        band_high = fvg_down_zone["top"] * (1 + zone_tol)
+        near_fvg_down = band_low <= last_close <= band_high or last_close <= fvg_down_zone["top"]
+
+    strong_buy = (
+        (swing_break_up and fvg_up and displacement_up) or
+        (reclaim_up and fvg_up and displacement_up)
+    )
+    strong_sell = (
+        (swing_break_down and fvg_down and displacement_down) or
+        (reclaim_down and fvg_down and displacement_down)
+    )
 
     medium_buy = (
-        (reclaim_up and (fvg_up or displacement_up)) or
-        (swing_break_up and fvg_up) or
-        (reclaim_up and displacement_up)
+        (recent_break_up and (fvg_up or near_fvg_up) and (displacement_up or directional_up)) or
+        (recent_reclaim_up and (fvg_up or near_fvg_up or displacement_up)) or
+        (directional_up and near_fvg_up and recent_body_ratio_max >= max(0.08, STRUCTURE_MIN_BODY_RATIO * 0.75))
     )
 
     medium_sell = (
-        (reclaim_down and (fvg_down or displacement_down)) or
-        (swing_break_down and fvg_down) or
-        (reclaim_down and displacement_down)
+        (recent_break_down and (fvg_down or near_fvg_down) and (displacement_down or directional_down)) or
+        (recent_reclaim_down and (fvg_down or near_fvg_down or displacement_down)) or
+        (directional_down and near_fvg_down and recent_body_ratio_max >= max(0.08, STRUCTURE_MIN_BODY_RATIO * 0.75))
     )
 
     signal_type = None
@@ -742,20 +809,30 @@ def analyze_structure_v2(ohlcv, last_price=None):
         "signal_type": signal_type,
         "fvg_up": fvg_up,
         "fvg_down": fvg_down,
-        "fvg_up_zone": fvg["up"],
-        "fvg_down_zone": fvg["down"],
+        "fvg_up_zone": fvg_up_zone,
+        "fvg_down_zone": fvg_down_zone,
+        "near_fvg_up": near_fvg_up,
+        "near_fvg_down": near_fvg_down,
         "swing_break_up": swing_break_up,
         "swing_break_down": swing_break_down,
         "reclaim_up": reclaim_up,
         "reclaim_down": reclaim_down,
+        "recent_break_up": recent_break_up,
+        "recent_break_down": recent_break_down,
+        "recent_reclaim_up": recent_reclaim_up,
+        "recent_reclaim_down": recent_reclaim_down,
         "displacement_up": displacement_up,
         "displacement_down": displacement_down,
+        "directional_up": directional_up,
+        "directional_down": directional_down,
         "context_high": prev_high,
         "context_low": prev_low,
-        "body_ratio": round(body_ratio, 4),
+        "body_ratio": round(last_body_ratio, 4),
+        "recent_body_ratio_max": round(recent_body_ratio_max, 4),
     }
 
 def structure_score_adjustment(structure):
+
     grade = structure.get("grade")
     if grade == "STRONG":
         return STRUCTURE_STRONG_SCORE_BONUS
@@ -989,6 +1066,16 @@ def adjust_precision(symbol, qty, price):
     price = floor_to_step(price, tick)
     return qty, price
 
+def get_min_trade_notional(symbol):
+    tier = get_pair_tier(symbol)
+    if tier == "TOP":
+        return TOP_MIN_TRADE_NOTIONAL
+    if tier == "MID":
+        return MID_MIN_TRADE_NOTIONAL
+    if tier == "LOW":
+        return LOW_MIN_TRADE_NOTIONAL
+    return DEFAULT_MIN_TRADE_NOTIONAL
+
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -1095,12 +1182,19 @@ def place_order_multi(symbol, side, sl, tp):
                 results.append({"account": acc["name"], "error": "stop_distance_zero"})
                 continue
             qty = risk_amount / stop_distance
-            if qty * price < 100:
-                qty = ceil_to_step(100 / price, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+            min_notional = get_min_trade_notional(symbol)
+            if qty * price < min_notional:
+                qty = ceil_to_step(min_notional / price, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
             qty, price = adjust_precision(symbol, qty, price)
-            if qty * price < 100:
-                print("❌ SKIP NOTIONAL < 100", symbol)
-                results.append({"account": acc["name"], "error": "notional_below_min", "qty": qty, "price": price})
+            if qty * price < min_notional:
+                print(f"❌ SKIP NOTIONAL < {min_notional}", symbol)
+                results.append({
+                    "account": acc["name"],
+                    "error": "notional_below_min",
+                    "qty": qty,
+                    "price": price,
+                    "min_notional": min_notional,
+                })
                 continue
 
             sl_price = normalize_price(symbol, sl)
@@ -2144,8 +2238,14 @@ def trade(payload: dict = Body(...)):
             return {"error": "invalid_stop_distance"}
         quantity = round(risk_amount / stop_distance, 3)
         quantity, _ = adjust_precision(symbol, quantity, entry)
+        min_notional = get_min_trade_notional(symbol)
+        if quantity * entry < min_notional:
+            quantity = ceil_to_step(min_notional / entry, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+            quantity, _ = adjust_precision(symbol, quantity, entry)
         if quantity <= 0:
             return {"error": "quantity_below_min"}
+        if quantity * entry < min_notional:
+            return {"error": "notional_below_min", "min_notional": min_notional}
         result = place_futures_order(symbol, side, quantity, sl, tp)
         send_telegram(f"""
 🚀 TRADE EXECUTED
@@ -2895,7 +2995,7 @@ def auto_trader():
                     highs = [float(c[2]) for c in ohlcv]
                     lows = [float(c[3]) for c in ohlcv]
 
-                    structure = analyze_structure_v2(ohlcv, last_price=last_price)
+                    structure = analyze_structure_v3(ohlcv, last_price=last_price)
                     if not structure["ok"]:
                         add_skip_reason(symbol, structure["reason"])
                         continue
@@ -3104,7 +3204,7 @@ def auto_trader():
                     highs = [float(c[2]) for c in ohlcv]
                     lows = [float(c[3]) for c in ohlcv]
 
-                    structure = analyze_structure_v2(ohlcv, last_price=last_price)
+                    structure = analyze_structure_v3(ohlcv, last_price=last_price)
                     if not structure["ok"]:
                         add_skip_reason(symbol, structure["reason"])
                         continue
