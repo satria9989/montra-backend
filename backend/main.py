@@ -198,6 +198,58 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KE
 BINANCE_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "10000"))
 BINANCE_TIME_SYNC_INTERVAL = int(os.getenv("BINANCE_TIME_SYNC_INTERVAL", "900"))
 BINANCE_MAX_TIME_RETRIES = int(os.getenv("BINANCE_MAX_TIME_RETRIES", "1"))
+BINANCE_RATE_LIMIT_RETRIES = int(os.getenv("BINANCE_RATE_LIMIT_RETRIES", "1"))
+POSITION_CACHE_TTL = float(os.getenv("POSITION_CACHE_TTL", "8"))
+POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "15"))
+TRAILING_LOOP_INTERVAL = float(os.getenv("TRAILING_LOOP_INTERVAL", "10"))
+POSITION_RATE_LIMIT_SLEEP = float(os.getenv("POSITION_RATE_LIMIT_SLEEP", "20"))
+
+LAST_MAIN_POSITIONS = []
+LAST_MAIN_POSITIONS_TS = 0.0
+LAST_MAIN_POSITIONS_ERROR = None
+LAST_MAIN_POSITIONS_ERROR_TS = 0.0
+POSITIONS_CACHE_LOCK = threading.Lock()
+
+def is_rate_limit_error(exc):
+    msg = str(exc)
+    return "-1003" in msg or "Too many requests" in msg
+
+def get_cached_main_positions(max_age=None):
+    if max_age is None:
+        max_age = POSITION_CACHE_TTL
+    with POSITIONS_CACHE_LOCK:
+        age = time.time() - LAST_MAIN_POSITIONS_TS
+        if LAST_MAIN_POSITIONS_TS and age <= max_age:
+            return [dict(p) for p in LAST_MAIN_POSITIONS]
+    return None
+
+def set_cached_main_positions(positions, error=None):
+    global LAST_MAIN_POSITIONS, LAST_MAIN_POSITIONS_TS, LAST_MAIN_POSITIONS_ERROR, LAST_MAIN_POSITIONS_ERROR_TS
+    with POSITIONS_CACHE_LOCK:
+        LAST_MAIN_POSITIONS = [dict(p) for p in (positions or [])]
+        LAST_MAIN_POSITIONS_TS = time.time()
+        LAST_MAIN_POSITIONS_ERROR = error
+        LAST_MAIN_POSITIONS_ERROR_TS = time.time() if error else 0.0
+
+def fetch_main_positions(force=False, max_age=None, label="MAIN"):
+    if binance is None:
+        return []
+
+    cached = None if force else get_cached_main_positions(max_age=max_age)
+    if cached is not None:
+        return cached
+
+    try:
+        positions = signed_call(binance, binance.futures_position_information, label=label)
+        set_cached_main_positions(positions)
+        return positions
+    except Exception as e:
+        if is_rate_limit_error(e):
+            cached = get_cached_main_positions(max_age=60)
+            if cached is not None:
+                print(f"⚠️ {label} using cached positions after rate limit")
+                return cached
+        raise
 
 def mark_client_runtime(client_obj, label):
     if client_obj is None:
@@ -248,21 +300,30 @@ def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_ti
 
     sync_binance_time(client_obj, label=label, force=False)
 
-    attempts = 1 + max(0, int(BINANCE_MAX_TIME_RETRIES if retry_on_time_error else 0))
+    time_attempts = 1 + max(0, int(BINANCE_MAX_TIME_RETRIES if retry_on_time_error else 0))
+    rate_attempts = 1 + max(0, int(BINANCE_RATE_LIMIT_RETRIES))
+    total_attempts = max(time_attempts, rate_attempts)
     last_error = None
 
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, total_attempts + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             last_error = e
             msg = str(e)
             time_error = ("-1021" in msg) or ("outside of the recvWindow" in msg)
+            rate_error = is_rate_limit_error(e)
 
-            if time_error and attempt < attempts:
-                print(f"⚠️ {label} signed_call time drift detected (attempt {attempt}/{attempts})")
+            if time_error and attempt < time_attempts:
+                print(f"⚠️ {label} signed_call time drift detected (attempt {attempt}/{time_attempts})")
                 sync_binance_time(client_obj, label=label, force=True)
                 time.sleep(0.25)
+                continue
+
+            if rate_error and attempt < rate_attempts:
+                sleep_for = min(POSITION_RATE_LIMIT_SLEEP, 8 + (attempt * 4))
+                print(f"⚠️ {label} signed_call rate limited, retrying in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
                 continue
 
             raise
@@ -1758,9 +1819,7 @@ def update_portfolio_allocation():
 
 def get_open_positions():
     try:
-        if binance is None:
-            return []
-        positions = signed_call(binance, binance.futures_position_information, label="MAIN")
+        positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label="MAIN")
         return [p for p in positions if float(p["positionAmt"]) != 0]
     except Exception as e:
         print("Error get_open_positions:", e)
@@ -1863,7 +1922,7 @@ def monitor_positions_for_memory_update():
     while True:
         try:
             if binance is None:
-                time.sleep(10)
+                time.sleep(POSITION_MONITOR_INTERVAL)
                 continue
             try:
                 current_regime = get_multi_tf_regime("BTCUSDT")
@@ -1873,7 +1932,7 @@ def monitor_positions_for_memory_update():
             except:
                 pass
 
-            positions = signed_call(binance, binance.futures_position_information, label="MAIN")
+            positions = fetch_main_positions(force=True, max_age=POSITION_MONITOR_INTERVAL, label="MAIN")
             current_state = {}
             for p in positions:
                 amt = float(p["positionAmt"])
@@ -1886,7 +1945,7 @@ def monitor_positions_for_memory_update():
                         "size": abs(amt),
                         "entry": float(p["entryPrice"]),
                         "unrealized": float(p["unRealizedProfit"]),
-                        "leverage": float(p["leverage"])
+                        "leverage": float(p.get("leverage", 0) or 0)
                     }
 
             for symbol, last in last_position_state.items():
@@ -1933,8 +1992,13 @@ def monitor_positions_for_memory_update():
 
         except Exception as e:
             print("Monitor position error:", e)
+            if is_rate_limit_error(e):
+                time.sleep(POSITION_RATE_LIMIT_SLEEP)
+            else:
+                time.sleep(POSITION_MONITOR_INTERVAL)
+            continue
 
-        time.sleep(10)
+        time.sleep(POSITION_MONITOR_INTERVAL)
 
 # ================= BASIC ENDPOINTS =================
 @app.get("/")
@@ -2567,7 +2631,10 @@ def get_accounts():
             balance = float(usdt["balance"]) if usdt else 0
             unrealized = float(usdt["crossUnPnl"]) if usdt else 0
             equity = balance + unrealized
-            positions = signed_call(c, c.futures_position_information, label=acc["name"])
+            if c is binance:
+                positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label=acc["name"])
+            else:
+                positions = signed_call(c, c.futures_position_information, label=acc["name"])
             active = [p for p in positions if float(p["positionAmt"]) != 0]
             data.append({
                 "name": acc["name"],
@@ -2672,16 +2739,18 @@ def smart_trailing():
     while True:
         try:
             if binance is None:
-                time.sleep(5)
+                time.sleep(TRAILING_LOOP_INTERVAL)
                 continue
-            positions = signed_call(binance, binance.futures_position_information, label="MAIN")
+            positions = fetch_main_positions(force=False, max_age=TRAILING_LOOP_INTERVAL, label="MAIN")
             for p in positions:
                 amt = float(p["positionAmt"])
                 if amt == 0:
                     continue
                 symbol = p["symbol"]
                 entry = float(p["entryPrice"])
-                price = float(p["markPrice"])
+                price = float(p.get("markPrice", p.get("entryPrice", 0)) or 0)
+                if entry <= 0 or price <= 0:
+                    continue
                 side = "BUY" if amt > 0 else "SELL"
                 current_sl = LAST_STOP_PRICE.get(symbol)
                 if current_sl is not None and abs(current_sl - entry) <= EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
@@ -2698,10 +2767,13 @@ def smart_trailing():
                         new_sl = price + (move * 0.3)
                     if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
                         update_stop_loss(symbol, side, new_sl)
-            time.sleep(5)
+            time.sleep(TRAILING_LOOP_INTERVAL)
         except Exception as e:
             print("Trailing error:", e)
-            time.sleep(5)
+            if is_rate_limit_error(e):
+                time.sleep(POSITION_RATE_LIMIT_SLEEP)
+            else:
+                time.sleep(TRAILING_LOOP_INTERVAL)
 
 def apply_news_bias(signal_type, news_reverse):
     if news_reverse:
