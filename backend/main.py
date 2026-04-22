@@ -89,8 +89,8 @@ LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
-TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT"])
-MID_PAIRS = globals().get("MID_PAIRS", ["HYPEUSDT", "SUIUSDT", "ADAUSDT", "LINKUSDT", "BCHUSDT", "XLMUSDT", "LTCUSDT", "AVAXUSDT", "TONUSDT", "ATOMUSDT", "1000PEPEUSDT"])
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"])
 VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
 REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
 
@@ -2603,7 +2603,8 @@ def auto_trader():
                     elif ll and fvg_down:
                         signal_type = "SELL"
                     else:
-                        continue  # skip kalau no structure
+                        add_skip_reason(symbol, "NO_STRUCTURE")
+                        continue
 
                     # === FILTER FAKE MOVE (liquidity sweep) ===
                     last_candle = ohlcv[-1]
@@ -2613,8 +2614,10 @@ def auto_trader():
                     wick_down = min(float(last_candle[1]), float(last_candle[4])) - float(last_candle[3])
 
                     if wick_up > wick_down * 2 and signal_type == "BUY":
+                        add_skip_reason(symbol, "FAKE_MOVE_WICK_UP")
                         continue
                     if wick_down > wick_up * 2 and signal_type == "SELL":
+                        add_skip_reason(symbol, "FAKE_MOVE_WICK_DOWN")
                         continue
 
                     # === LIQUIDITY SWEEP CHECK ===
@@ -2626,8 +2629,10 @@ def auto_trader():
 
                     if active_require_sweep():
                         if signal_type == "BUY" and not sweep_low:
+                            add_skip_reason(symbol, "NO_SWEEP_LOW")
                             continue
                         if signal_type == "SELL" and not sweep_high:
+                            add_skip_reason(symbol, "NO_SWEEP_HIGH")
                             continue
 
                     # === BUY RUMOR / SELL NEWS ===
@@ -2733,11 +2738,23 @@ def auto_trader():
 
             # --- Eksekusi trade dengan decision engine ---
             selected_symbols = set()
+            candidate_symbols = set()
+            candidate_rank_map = {}
 
             for tier_name, limit in tier_limits().items():
                 rows = sorted(candidate_map[tier_name], key=lambda x: x["score"], reverse=True)
-                for row in rows[:limit]:
-                    selected_symbols.add(row["symbol"])
+                for idx, row in enumerate(rows, start=1):
+                    sym = row["symbol"]
+                    candidate_symbols.add(sym)
+                    candidate_rank_map[sym] = {
+                        "tier": tier_name,
+                        "rank": idx,
+                        "score": round(float(row.get("score", 0)), 2),
+                        "rr": round(float(row.get("rr", 0)), 2),
+                        "limit": limit,
+                    }
+                    if idx <= limit:
+                        selected_symbols.add(sym)
 
             selected_symbols_live = sorted(list(selected_symbols))
 
@@ -2753,7 +2770,10 @@ def auto_trader():
             for symbol in pairs:
                 try:
                     if symbol not in selected_symbols:
-                        add_skip_reason(symbol, "NOT_IN_SHORTLIST")
+                        if symbol in candidate_symbols:
+                            shortlist_meta = candidate_rank_map.get(symbol, {})
+                            add_skip_reason(symbol, "NOT_IN_SHORTLIST", shortlist_meta)
+                            add_execution_decision("shortlist", symbol, "BLOCK", shortlist_meta)
                         continue
                     if not check_pair_health(symbol):
                         add_skip_reason(symbol, "PAIR_HEALTH_FAIL_EXEC")
