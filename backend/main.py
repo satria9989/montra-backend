@@ -187,19 +187,96 @@ app.add_middleware(
 # 🔥 OPENAI CLIENT
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
+BINANCE_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "10000"))
+BINANCE_TIME_SYNC_INTERVAL = int(os.getenv("BINANCE_TIME_SYNC_INTERVAL", "900"))
+BINANCE_MAX_TIME_RETRIES = int(os.getenv("BINANCE_MAX_TIME_RETRIES", "1"))
+
+def mark_client_runtime(client_obj, label):
+    if client_obj is None:
+        return None
+    try:
+        client_obj._montra_label = label
+        client_obj._last_time_sync = 0
+    except Exception:
+        pass
+    return client_obj
+
+def get_client_label(client_obj, fallback="BINANCE"):
+    return getattr(client_obj, "_montra_label", fallback)
+
+def sync_binance_time(client_obj, label=None, force=False):
+    if client_obj is None:
+        return False
+
+    label = label or get_client_label(client_obj)
+    now = time.time()
+    last_sync = getattr(client_obj, "_last_time_sync", 0)
+
+    if not force and last_sync and (now - last_sync) < BINANCE_TIME_SYNC_INTERVAL:
+        return True
+
+    try:
+        server_time = client_obj.get_server_time()["serverTime"]
+        local_time = int(time.time() * 1000)
+        offset = int(server_time - local_time)
+        client_obj.timestamp_offset = offset
+        client_obj._last_time_sync = now
+        print(f"🕒 {label} timestamp_offset synced: {offset} ms")
+        return True
+    except Exception as e:
+        print(f"❌ {label} sync_binance_time error:", e)
+        return False
+
+def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_time_error=True, **kwargs):
+    if client_obj is None:
+        raise RuntimeError("binance client not ready")
+
+    label = label or get_client_label(client_obj)
+    if recv_window is None:
+        recv_window = BINANCE_RECV_WINDOW
+
+    if recv_window and "recvWindow" not in kwargs:
+        kwargs["recvWindow"] = recv_window
+
+    sync_binance_time(client_obj, label=label, force=False)
+
+    attempts = 1 + max(0, int(BINANCE_MAX_TIME_RETRIES if retry_on_time_error else 0))
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            time_error = ("-1021" in msg) or ("outside of the recvWindow" in msg)
+
+            if time_error and attempt < attempts:
+                print(f"⚠️ {label} signed_call time drift detected (attempt {attempt}/{attempts})")
+                sync_binance_time(client_obj, label=label, force=True)
+                time.sleep(0.25)
+                continue
+
+            raise
+
+    raise last_error
+
 binance = None
 if os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_SECRET"):
-    binance = Client(
+    binance = mark_client_runtime(Client(
         os.getenv("BINANCE_API_KEY"),
         os.getenv("BINANCE_SECRET")
-    )
+    ), "MAIN")
+    sync_binance_time(binance, "MAIN", force=True)
 
 CLIENTS = []
 for acc in ACCOUNTS:
     if acc["api_key"] and acc["secret"]:
+        acc_client = mark_client_runtime(Client(acc["api_key"], acc["secret"]), acc["name"])
+        sync_binance_time(acc_client, acc["name"], force=True)
         CLIENTS.append({
             "name": acc["name"],
-            "client": Client(acc["api_key"], acc["secret"]),
+            "client": acc_client,
             "risk": acc["risk"]
         })
 print("🔥 ACTIVE ACCOUNTS:", len(CLIENTS))
@@ -697,11 +774,11 @@ def cancel_existing_orders(symbol):
         print("⚠️ cancel skipped: binance client not ready")
         return False
     try:
-        orders = binance.futures_get_open_orders(symbol=symbol)
+        orders = signed_call(binance, binance.futures_get_open_orders, symbol=symbol, label="MAIN")
         for o in orders:
             if o["type"] in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
                 try:
-                    binance.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+                    signed_call(binance, binance.futures_cancel_order, symbol=symbol, orderId=o["orderId"], label="MAIN")
                 except Exception as e:
                     print("Cancel single order error:", e)
         time.sleep(1.0)
@@ -718,14 +795,14 @@ def place_futures_order(symbol, side, quantity, sl, tp):
         tp = normalize_price(symbol, tp)
         cancel_existing_orders(symbol)
         time.sleep(1.0)
-        order = binance.futures_create_order(
+        order = signed_call(binance, binance.futures_create_order, label="MAIN",
             symbol=symbol,
             side=SIDE_BUY if side == "BUY" else SIDE_SELL,
             type=FUTURE_ORDER_TYPE_MARKET,
             quantity=quantity
         )
         time.sleep(0.3)
-        binance.futures_create_order(
+        signed_call(binance, binance.futures_create_order, label="MAIN",
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
             type=FUTURE_ORDER_TYPE_STOP_MARKET,
@@ -733,7 +810,7 @@ def place_futures_order(symbol, side, quantity, sl, tp):
             closePosition=True,
             workingType="MARK_PRICE"
         )
-        binance.futures_create_order(
+        signed_call(binance, binance.futures_create_order, label="MAIN",
             symbol=symbol,
             side=SIDE_SELL if side == "BUY" else SIDE_BUY,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
@@ -747,7 +824,7 @@ def place_futures_order(symbol, side, quantity, sl, tp):
 
 def update_account_profit(client, name):
     try:
-        balance_info = client.futures_account_balance()
+        balance_info = signed_call(client, client.futures_account_balance, label=name)
         usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
         unrealized = float(usdt["crossUnPnl"]) if usdt else 0
         ACCOUNT_PROFIT[name] = unrealized
@@ -781,7 +858,7 @@ def place_order_multi(symbol, side, sl, tp):
                 risk_pct = base_risk + (profit / 1000)
             else:
                 risk_pct = base_risk
-            balance_info = c.futures_account_balance()
+            balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
             alloc = min(portfolio_alloc.get(symbol, 0.25), 0.12)
@@ -802,7 +879,7 @@ def place_order_multi(symbol, side, sl, tp):
 
             sl_price = normalize_price(symbol, sl)
             tp_price = normalize_price(symbol, tp)
-            order = c.futures_create_order(
+            order = signed_call(c, c.futures_create_order, label=acc["name"],
                 symbol=symbol,
                 side=SIDE_BUY if side == "BUY" else SIDE_SELL,
                 type=FUTURE_ORDER_TYPE_MARKET,
@@ -810,7 +887,7 @@ def place_order_multi(symbol, side, sl, tp):
             )
 
             close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
-            c.futures_create_order(
+            signed_call(c, c.futures_create_order, label=acc["name"],
                 symbol=symbol,
                 side=close_side,
                 type=FUTURE_ORDER_TYPE_STOP_MARKET,
@@ -818,7 +895,7 @@ def place_order_multi(symbol, side, sl, tp):
                 closePosition=True,
                 workingType="MARK_PRICE"
             )
-            c.futures_create_order(
+            signed_call(c, c.futures_create_order, label=acc["name"],
                 symbol=symbol,
                 side=close_side,
                 type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
@@ -856,7 +933,7 @@ def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
     q2 = round(quantity * 0.3, 3)
     q3 = round(quantity * 0.3, 3)
     for tp, q in [(tp1, q1), (tp2, q2), (tp3, q3)]:
-        binance.futures_create_order(
+        signed_call(binance, binance.futures_create_order, label="MAIN",
             symbol=symbol,
             side=side_close,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
@@ -888,7 +965,7 @@ def update_stop_loss(symbol, side, new_sl):
             cancel_existing_orders(symbol)
             time.sleep(1.0)
             try:
-                binance.futures_create_order(
+                signed_call(binance, binance.futures_create_order, label="MAIN",
                     symbol=symbol,
                     side=SIDE_SELL if side == "BUY" else SIDE_BUY,
                     type=FUTURE_ORDER_TYPE_STOP_MARKET,
@@ -931,7 +1008,7 @@ def get_total_equity():
     for acc in CLIENTS:
         try:
             c = acc["client"]
-            balance_info = c.futures_account_balance()
+            balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
 
             if not usdt:
@@ -1184,7 +1261,7 @@ def get_exchange_open_symbols_strict():
     if binance is None:
         return None
     try:
-        positions = binance.futures_position_information()
+        positions = signed_call(binance, binance.futures_position_information, label="MAIN")
         return {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
     except Exception as e:
         print("reconcile open symbols error:", e)
@@ -1518,7 +1595,7 @@ def get_open_positions():
     try:
         if binance is None:
             return []
-        positions = binance.futures_position_information()
+        positions = signed_call(binance, binance.futures_position_information, label="MAIN")
         return [p for p in positions if float(p["positionAmt"]) != 0]
     except Exception as e:
         print("Error get_open_positions:", e)
@@ -1631,7 +1708,7 @@ def monitor_positions_for_memory_update():
             except:
                 pass
 
-            positions = binance.futures_position_information()
+            positions = signed_call(binance, binance.futures_position_information, label="MAIN")
             current_state = {}
             for p in positions:
                 amt = float(p["positionAmt"])
@@ -1829,7 +1906,7 @@ def trade(payload: dict = Body(...)):
         sl = float(payload.get("sl"))
         tp = float(payload.get("tp"))
         risk_percent = max(0.1, min(float(payload.get("risk", 1)), 2.0))
-        balance_info = binance.futures_account_balance()
+        balance_info = signed_call(binance, binance.futures_account_balance, label="MAIN")
         usdt_balance = next((b for b in balance_info if b["asset"] == "USDT"), None)
         balance = float(usdt_balance["balance"]) if usdt_balance else 0
         risk_amount = balance * (risk_percent / 100)
@@ -1879,7 +1956,7 @@ def get_positions():
     try:
         if binance is None:
             return {"positions": []}
-        positions = binance.futures_position_information()
+        positions = signed_call(binance, binance.futures_position_information, label="MAIN")
         active = []
         for p in positions:
             amt = float(p["positionAmt"])
@@ -2307,8 +2384,8 @@ def position_detail(symbol: str):
     if binance is None:
         return {"position": None, "trades": []}    
     try:
-        positions = binance.futures_position_information(symbol=symbol)
-        trades = binance.futures_account_trades(symbol=symbol)
+        positions = signed_call(binance, binance.futures_position_information, symbol=symbol, label="MAIN")
+        trades = signed_call(binance, binance.futures_account_trades, symbol=symbol, label="MAIN")
         pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
         return {"position": pos, "trades": trades[-50:]}
     except Exception as e:
@@ -2320,12 +2397,12 @@ def get_accounts():
     for acc in CLIENTS:
         try:
             c = acc["client"]
-            balance_info = c.futures_account_balance()
+            balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
             unrealized = float(usdt["crossUnPnl"]) if usdt else 0
             equity = balance + unrealized
-            positions = c.futures_position_information()
+            positions = signed_call(c, c.futures_position_information, label=acc["name"])
             active = [p for p in positions if float(p["positionAmt"]) != 0]
             data.append({
                 "name": acc["name"],
@@ -2432,7 +2509,7 @@ def smart_trailing():
             if binance is None:
                 time.sleep(5)
                 continue
-            positions = binance.futures_position_information()
+            positions = signed_call(binance, binance.futures_position_information, label="MAIN")
             for p in positions:
                 amt = float(p["positionAmt"])
                 if amt == 0:
@@ -2997,7 +3074,7 @@ def auto_trader():
                         continue
 
                     dynamic_risk = get_dynamic_risk(regime, vol)
-                    balance_info = binance.futures_account_balance()
+                    balance_info = signed_call(binance, binance.futures_account_balance, label="MAIN")
                     usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
                     balance = float(usdt["balance"]) if usdt else 0
                     risk_amount = balance * dynamic_risk * w
