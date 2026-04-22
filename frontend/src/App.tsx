@@ -430,7 +430,7 @@ export default function App() {
 
           <div style={{ display: "grid", gap: 16 }}>
             <Section
-              title="Chart / inspected signal"
+              title="Chart 2.0 / inspected signal"
               right={
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ fontSize: 12, color: "#8ea4c9" }}>Symbol</span>
@@ -457,9 +457,12 @@ export default function App() {
               }
             >
               <div style={{ fontSize: 12, color: "#8ea4c9", marginBottom: 12 }}>
-                Source of truth untuk signal: backend `/debug/decision-board`. Chart hanya menampilkan candle backend dan overlay signal backend yang sedang diinspeksi.
+                Source of truth untuk signal: backend `/debug/decision-board`. Chart 2.0 hanya membaca candle backend, lalu menambahkan overlay struktur dan likuiditas yang dihitung lokal dari candle backend. Tidak ada signal baru yang dibuat di frontend, dan panel bawah adalah proxy jujur berbasis harga/volume — bukan feed Coinglass/funding/OI real-time.
               </div>
               <Chart symbol={chartSymbol} selected={activeSignal} apiUrl={API_URL} />
+              <div style={{ marginTop: 10, fontSize: 11, color: "#6f819f" }}>
+                ANALYSIS = HTF OB/FVG + liquidity bands + selected signal backend. DEBUG = ANALYSIS + premium/discount + sweep markers + delta/participation proxies.
+              </div>
             </Section>
 
             <Section title="Portfolio + runtime snapshot">
