@@ -8,8 +8,8 @@ type BackendSignal = {
   symbol: string;
   type: "BUY" | "SELL";
   entry: number;
-  sl: number;
-  tp: number;
+  sl: number | null;
+  tp: number | null;
   score?: number;
   rr?: number | string;
   regime?: string;
@@ -46,6 +46,10 @@ type PositionRow = {
   leverage?: number;
   locked?: boolean;
   has_snapshot?: boolean;
+  protective_resolved?: boolean;
+  sl_resolved?: boolean;
+  tp_resolved?: boolean;
+  account?: string;
 };
 
 type SkipSummaryRow = {
@@ -145,6 +149,12 @@ type ApiError = {
   message: string;
 };
 
+type AccountsResponse = {
+  accounts: AccountRow[];
+  cached?: boolean;
+  warning?: string;
+};
+
 const API_URL = (process.env.REACT_APP_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 const POLL_MS = 10_000;
 
@@ -170,12 +180,14 @@ function formatNum(value: unknown, digits = 2) {
 
 function positionToSignal(position: PositionRow | null): BackendSignal | null {
   if (!position) return null;
+  const sl = position.sl == null ? null : Number(position.sl);
+  const tp = position.tp == null ? null : Number(position.tp);
   return {
     symbol: position.symbol,
     type: position.type,
     entry: Number(position.entry ?? 0),
-    sl: Number(position.sl ?? 0),
-    tp: Number(position.tp ?? 0),
+    sl: Number.isFinite(Number(sl)) ? sl : null,
+    tp: Number.isFinite(Number(tp)) ? tp : null,
     rr: position.rr ?? undefined,
     score: undefined,
     regime: undefined,
@@ -185,6 +197,10 @@ function positionToSignal(position: PositionRow | null): BackendSignal | null {
     unrealized: position.unrealized,
     leverage: position.leverage,
     mark: position.mark,
+    protective_resolved: position.protective_resolved,
+    sl_resolved: position.sl_resolved,
+    tp_resolved: position.tp_resolved,
+    account: position.account,
   };
 }
 
@@ -299,12 +315,63 @@ function SignalCard({
   );
 }
 
+function LivePositionsSection({
+  positions,
+  activeSignal,
+  onInspect,
+}: {
+  positions: PositionRow[];
+  activeSignal: BackendSignal | null;
+  onInspect: (signal: BackendSignal) => void;
+}) {
+  return (
+    <Section title={`Live positions (${positions.length})`}>
+      {positions.length === 0 ? (
+        <div style={{ color: "#6f819f", fontSize: 12 }}>Belum ada posisi live.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 10, maxHeight: 360, overflow: "auto", paddingRight: 4 }}>
+          {positions.map((pos) => {
+            const signal = positionToSignal(pos);
+            if (!signal) return null;
+            const active = Boolean(activeSignal && activeSignal.symbol === signal.symbol && activeSignal.type === signal.type);
+            const protectiveResolved = Boolean(pos.protective_resolved);
+            return (
+              <div key={`${pos.symbol}-${pos.type}`} style={{ border: `1px solid ${active ? "#1f6feb" : "#132037"}`, borderRadius: 10, padding: 10, background: active ? "#0b1730" : "#08111f" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontWeight: 800 }}>{pos.symbol}</div>
+                    <div style={{ fontSize: 12, color: pos.type === "BUY" ? "#00ffaa" : "#ff7272", fontWeight: 700 }}>{pos.type}</div>
+                  </div>
+                  <button
+                    onClick={() => onInspect(signal)}
+                    style={{ border: "1px solid #1f6feb", background: active ? "#1f6feb" : "transparent", color: "#fff", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 12, fontWeight: 700 }}
+                  >
+                    {active ? "Sedang dilihat" : "Inspect"}
+                  </button>
+                </div>
+                <KeyValue label="Entry" value={formatNum(pos.entry, 4)} accent="#8fd3ff" />
+                <KeyValue label="Mark" value={formatNum(pos.mark, 4)} />
+                <KeyValue label="Unrealized" value={`$${formatNum(pos.unrealized, 2)}`} accent={Number(pos.unrealized) >= 0 ? "#00ffaa" : "#ff7272"} />
+                <KeyValue label="Size" value={formatNum(pos.size, 4)} />
+                <KeyValue label="SL" value={pos.sl_resolved ? formatNum(pos.sl, 4) : "Pending"} accent={pos.sl_resolved ? "#ff7272" : "#ffb000"} />
+                <KeyValue label="TP" value={pos.tp_resolved ? formatNum(pos.tp, 4) : "Pending"} accent={pos.tp_resolved ? "#00ffaa" : "#ffb000"} />
+                <KeyValue label="Protection" value={protectiveResolved ? "Resolved" : "Resolving"} accent={protectiveResolved ? "#00ffaa" : "#ffb000"} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 export default function App() {
   const [healthLive, setHealthLive] = useState<HealthLive | null>(null);
   const [healthReady, setHealthReady] = useState<HealthReady | null>(null);
   const [pairHealth, setPairHealth] = useState<PairHealth | null>(null);
   const [decisionBoard, setDecisionBoard] = useState<DecisionBoard | null>(null);
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [accountsWarning, setAccountsWarning] = useState<string>("");
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [aiMemory, setAiMemory] = useState<Record<string, any>>({});
   const [apiError, setApiError] = useState<string>("");
@@ -315,14 +382,13 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    const fetchAll = async () => {
+    const fetchCore = async () => {
       try {
-        const [liveRes, readyRes, pairsRes, boardRes, accountsRes, positionsRes, memoryRes] = await Promise.all([
+        const [liveRes, readyRes, pairsRes, boardRes, positionsRes, memoryRes] = await Promise.all([
           axios.get(`${API_URL}/health/live`),
           axios.get(`${API_URL}/health/ready`),
           axios.get(`${API_URL}/health/pairs`),
           axios.get(`${API_URL}/debug/decision-board`),
-          axios.get(`${API_URL}/accounts`),
           axios.get(`${API_URL}/positions`),
           axios.get(`${API_URL}/ai-memory`),
         ]);
@@ -331,24 +397,34 @@ export default function App() {
 
         const nextBoard = boardRes.data as DecisionBoard;
         const nextPairs = pairsRes.data as PairHealth;
+        const nextPositions = (positionsRes.data?.rows || nextBoard.live_positions?.rows || []) as PositionRow[];
 
         setHealthLive(liveRes.data);
         setHealthReady(readyRes.data);
         setPairHealth(nextPairs);
         setDecisionBoard(nextBoard);
-        setAccounts(accountsRes.data?.accounts || []);
-        setPositions(positionsRes.data?.rows || nextBoard.live_positions?.rows || []);
+        setPositions(nextPositions);
         setAiMemory(memoryRes.data || {});
         setApiError("");
 
         const backendSignal = nextBoard.selected?.rows?.[0] || nextBoard.candidates?.rows?.[0] || null;
-        const livePositionSignal = positionToSignal((positionsRes.data?.rows || nextBoard.live_positions?.rows || [])[0] || null);
-        const preferredSignal = backendSignal || livePositionSignal;
-        if (preferredSignal && (!inspectedSignal || inspectedSignal.symbol !== preferredSignal.symbol || inspectedSignal.type !== preferredSignal.type)) {
-          setInspectedSignal(preferredSignal);
-          setManualSymbol(preferredSignal.symbol);
-        } else if (!preferredSignal && nextPairs.scan_pairs?.length && !nextPairs.scan_pairs.includes(manualSymbol)) {
-          setManualSymbol(nextPairs.scan_pairs[0]);
+        const firstLiveSignal = positionToSignal(nextPositions[0] || null);
+        const preferredSignal = backendSignal || firstLiveSignal;
+
+        setInspectedSignal((prev) => {
+          if (prev) {
+            const matchedCandidate = [nextBoard.selected?.rows?.[0], nextBoard.candidates?.rows?.[0], ...(nextBoard.candidates?.rows || [])].find((row) => row?.symbol === prev.symbol && row?.type === prev.type);
+            if (matchedCandidate) return matchedCandidate;
+            const matchedPosition = nextPositions.find((row) => row.symbol === prev.symbol && row.type === prev.type);
+            if (matchedPosition) return positionToSignal(matchedPosition);
+          }
+          return preferredSignal || prev || null;
+        });
+
+        if (preferredSignal?.symbol) {
+          setManualSymbol((prev) => (prev === preferredSignal.symbol ? prev : preferredSignal.symbol));
+        } else if (!preferredSignal && nextPairs.scan_pairs?.length) {
+          setManualSymbol((prev) => (nextPairs.scan_pairs.includes(prev) ? prev : nextPairs.scan_pairs[0]));
         }
       } catch (error: any) {
         if (cancelled) return;
@@ -359,13 +435,38 @@ export default function App() {
       }
     };
 
-    fetchAll();
-    const id = window.setInterval(fetchAll, POLL_MS);
+    fetchCore();
+    const id = window.setInterval(fetchCore, 8_000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [inspectedSignal, manualSymbol]);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchAccounts = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/accounts`);
+        if (cancelled) return;
+        const payload = res.data as AccountsResponse;
+        setAccounts(payload.accounts || []);
+        setAccountsWarning(payload.warning || (payload.cached ? "accounts summary using cached snapshot" : ""));
+      } catch (error: any) {
+        if (cancelled) return;
+        const msg = (error as ApiError)?.message || error?.message || "Gagal membaca accounts.";
+        setAccountsWarning(msg);
+      }
+    };
+
+    fetchAccounts();
+    const id = window.setInterval(fetchAccounts, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
 
   const selectedSignal = decisionBoard?.selected?.rows?.[0] || null;
   const livePosition = positions?.[0] || decisionBoard?.live_positions?.rows?.[0] || null;
@@ -436,14 +537,14 @@ export default function App() {
               active={Boolean(activeSignal && selectedSignal && activeSignal.symbol === selectedSignal.symbol && activeSignal.type === selectedSignal.type)}
             />
 
-            <SignalCard
-              title="Live position"
-              signal={livePositionSignal}
+            <LivePositionsSection
+              positions={positions}
+              activeSignal={activeSignal}
               onInspect={setInspectedSignal}
-              active={Boolean(activeSignal && livePositionSignal && activeSignal.symbol === livePositionSignal.symbol && activeSignal.type === livePositionSignal.type)}
             />
 
             <Section title="Accounts">
+              {accountsWarning ? <div style={{ marginBottom: 10, fontSize: 12, color: accountsWarning.includes("cached") ? "#ffb000" : "#ff9b9b" }}>{accountsWarning}</div> : null}
               <div style={{ display: "grid", gap: 10 }}>
                 {accounts.length === 0 ? (
                   <div style={{ color: "#6f819f", fontSize: 12 }}>Belum ada data akun.</div>
@@ -494,7 +595,8 @@ export default function App() {
                     onChange={(e) => {
                       setManualSymbol(e.target.value);
                       const found = [selectedSignal, topCandidate, ...(decisionBoard?.candidates?.rows || [])].find((row) => row?.symbol === e.target.value) || null;
-                      setInspectedSignal(found || null);
+                      const liveFound = positions.find((row) => row.symbol === e.target.value) || null;
+                      setInspectedSignal(found || positionToSignal(liveFound));
                     }}
                     style={{
                       background: "#08111f",

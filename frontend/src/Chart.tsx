@@ -12,8 +12,8 @@ type Signal = {
   symbol: string;
   type: "BUY" | "SELL";
   entry: number;
-  sl: number;
-  tp: number;
+  sl: number | null;
+  tp: number | null;
   score?: number;
   rr?: number | string;
   reason?: string;
@@ -61,6 +61,16 @@ type SweepMarker = {
 };
 
 const API_URL = (process.env.REACT_APP_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+
+function hasValidPrice(value: unknown) {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0;
+}
+
+function formatPrice(value: unknown, digits = 4) {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? num.toFixed(digits) : "-";
+}
 
 function normalizeCandle(row: any): Candle | null {
   if (Array.isArray(row)) {
@@ -402,9 +412,9 @@ export default function Chart({ symbol, selected, apiUrl }: Props) {
     };
 
     if ((mode === "ANALYSIS" || mode === "DEBUG") && selected) {
-      addLevel(Number(selected.entry), "#4fc3ff", "ENTRY");
-      addLevel(Number(selected.sl), "#ff7272", "SL");
-      addLevel(Number(selected.tp), "#00ffaa", "TP");
+      if (hasValidPrice(selected.entry)) addLevel(Number(selected.entry), "#4fc3ff", "ENTRY");
+      if (hasValidPrice(selected.sl)) addLevel(Number(selected.sl), "#ff7272", "SL");
+      if (hasValidPrice(selected.tp)) addLevel(Number(selected.tp), "#00ffaa", "TP");
       const lastTime = candles15m[candles15m.length - 1]?.time;
       if (lastTime) {
         candleSeries.setMarkers([
@@ -558,13 +568,16 @@ export default function Chart({ symbol, selected, apiUrl }: Props) {
         });
       }
 
-      if (selected && (mode === "ANALYSIS" || mode === "DEBUG")) {
+      if (selected && (mode === "ANALYSIS" || mode === "DEBUG") && hasValidPrice(selected.entry)) {
         const entryY = priceToY(Number(selected.entry));
         if (entryY != null) {
+          const rrLabel = hasValidPrice(selected.sl) && hasValidPrice(selected.tp)
+            ? (typeof selected.rr === "string" ? selected.rr : formatNum(Number(selected.rr), 2))
+            : "pending";
           ctx.save();
           ctx.fillStyle = "rgba(79,195,255,0.95)";
           ctx.font = "bold 11px Inter, sans-serif";
-          ctx.fillText(`Selected ${selected.type} · score ${formatNum(Number(selected.score), 0)} · RR ${typeof selected.rr === "string" ? selected.rr : formatNum(Number(selected.rr), 2)}`,
+          ctx.fillText(`Selected ${selected.type} · score ${formatNum(Number(selected.score), 0)} · RR ${rrLabel}`,
             10,
             Math.max(16, entryY - 10)
           );
@@ -646,12 +659,13 @@ export default function Chart({ symbol, selected, apiUrl }: Props) {
           }}
         >
           <span><strong>{selected.symbol}</strong> {selected.type}</span>
-          <span>Entry {Number(selected.entry).toFixed(4)}</span>
-          <span style={{ color: "#ff7272" }}>SL {Number(selected.sl).toFixed(4)}</span>
-          <span style={{ color: "#00ffaa" }}>TP {Number(selected.tp).toFixed(4)}</span>
+          <span>Entry {formatPrice(selected.entry)}</span>
+          <span style={{ color: hasValidPrice(selected.sl) ? "#ff7272" : "#ffb000" }}>SL {formatPrice(selected.sl)}</span>
+          <span style={{ color: hasValidPrice(selected.tp) ? "#00ffaa" : "#ffb000" }}>TP {formatPrice(selected.tp)}</span>
           <span>Score {selected.score ?? "-"}</span>
           <span>Tier {selected.pair_tier || "-"}</span>
-          <span>Regime {selected.pair_regime || "-"}</span>
+          <span>Regime {selected.pair_regime || selected.reason || "-"}</span>
+          {!hasValidPrice(selected.sl) || !hasValidPrice(selected.tp) ? <span style={{ color: "#ffb000" }}>Protective orders resolving</span> : null}
           {selected.reason ? <span style={{ color: "#ffb000" }}>Reason {selected.reason}</span> : null}
         </div>
       ) : null}

@@ -224,6 +224,11 @@ LAST_MAIN_OPEN_ORDERS = []
 LAST_MAIN_OPEN_ORDERS_TS = 0.0
 OPEN_ORDERS_CACHE_LOCK = threading.Lock()
 
+LAST_ACCOUNTS_SUMMARY = []
+LAST_ACCOUNTS_SUMMARY_TS = 0.0
+ACCOUNTS_CACHE_LOCK = threading.Lock()
+
+
 def is_rate_limit_error(exc):
     msg = str(exc)
     return "-1003" in msg or "Too many requests" in msg
@@ -304,6 +309,20 @@ def fetch_main_open_orders(force=False, max_age=None, label="MAIN"):
         raise
 
 
+def get_cached_accounts_summary(max_age=30):
+    with ACCOUNTS_CACHE_LOCK:
+        if LAST_ACCOUNTS_SUMMARY_TS and (time.time() - LAST_ACCOUNTS_SUMMARY_TS) <= max_age:
+            return [dict(r) for r in LAST_ACCOUNTS_SUMMARY]
+    return None
+
+
+def set_cached_accounts_summary(rows):
+    global LAST_ACCOUNTS_SUMMARY, LAST_ACCOUNTS_SUMMARY_TS
+    with ACCOUNTS_CACHE_LOCK:
+        LAST_ACCOUNTS_SUMMARY = [dict(r) for r in (rows or [])]
+        LAST_ACCOUNTS_SUMMARY_TS = time.time()
+
+
 def build_exit_lookup(open_orders):
     rows = {}
     for o in open_orders or []:
@@ -351,6 +370,9 @@ def build_live_position_rows(positions=None, open_orders=None):
         if entry and sl and tp and abs(entry - sl) > 1e-9:
             rr = round(abs(tp - entry) / abs(entry - sl), 2)
 
+        sl_ok = sl is not None and float(sl or 0) > 0
+        tp_ok = tp is not None and float(tp or 0) > 0
+
         rows.append({
             "symbol": symbol,
             "type": side,
@@ -365,6 +387,10 @@ def build_live_position_rows(positions=None, open_orders=None):
             "leverage": leverage,
             "locked": symbol in GLOBAL_SYMBOL_LOCK,
             "has_snapshot": symbol in TRADE_SNAPSHOTS,
+            "protective_resolved": bool(sl_ok and tp_ok),
+            "sl_resolved": bool(sl_ok),
+            "tp_resolved": bool(tp_ok),
+            "account": "MAIN",
         })
 
     rows.sort(key=lambda x: abs(float(x.get("unrealized", 0))), reverse=True)
@@ -2856,12 +2882,13 @@ def get_positions():
 @app.get("/accounts")
 def get_accounts():
     data = []
+    had_error = False
     for acc in CLIENTS:
         try:
             c = acc["client"]
             balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
-            balance = float(usdt["balance"]) if usdt else 0
+            balance = float((usdt or {}).get("balance", 0) or 0)
             if c is binance:
                 positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label=acc["name"])
             else:
@@ -2877,7 +2904,17 @@ def get_accounts():
                 "positions": len(active)
             })
         except Exception as e:
+            had_error = True
             data.append({"name": acc["name"], "error": str(e)})
+
+    if data and not had_error:
+        set_cached_accounts_summary(data)
+        return {"accounts": data}
+
+    cached = get_cached_accounts_summary(max_age=45)
+    if cached is not None:
+        return {"accounts": cached, "cached": True, "warning": "accounts summary using cached snapshot"}
+
     return {"accounts": data}
 
 @app.post("/kill-switch")
