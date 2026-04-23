@@ -214,6 +214,14 @@ POSITION_CACHE_TTL = float(os.getenv("POSITION_CACHE_TTL", "8"))
 POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "15"))
 TRAILING_LOOP_INTERVAL = float(os.getenv("TRAILING_LOOP_INTERVAL", "10"))
 POSITION_RATE_LIMIT_SLEEP = float(os.getenv("POSITION_RATE_LIMIT_SLEEP", "20"))
+MARKET_KLINES_CACHE_TTL_15M = float(os.getenv("MARKET_KLINES_CACHE_TTL_15M", "20"))
+MARKET_KLINES_CACHE_TTL_1H = float(os.getenv("MARKET_KLINES_CACHE_TTL_1H", "120"))
+MARKET_KLINES_CACHE_TTL_4H = float(os.getenv("MARKET_KLINES_CACHE_TTL_4H", "300"))
+WS_DEGRADED_MODE_ALLOW = os.getenv("WS_DEGRADED_MODE_ALLOW", "true").lower() == "true"
+WS_DEGRADED_GRACE_SECONDS = float(os.getenv("WS_DEGRADED_GRACE_SECONDS", "120"))
+WS_FULL_STALE_BLOCK_SECONDS = float(os.getenv("WS_FULL_STALE_BLOCK_SECONDS", "600"))
+MAX_TRADE_HISTORY = int(os.getenv("MAX_TRADE_HISTORY", "1000"))
+CLOSE_REALIZED_LOOKBACK_MINUTES = int(os.getenv("CLOSE_REALIZED_LOOKBACK_MINUTES", "180"))
 
 LAST_MAIN_POSITIONS = []
 LAST_MAIN_POSITIONS_TS = 0.0
@@ -227,6 +235,10 @@ OPEN_ORDERS_CACHE_LOCK = threading.Lock()
 LAST_ACCOUNTS_SUMMARY = []
 LAST_ACCOUNTS_SUMMARY_TS = 0.0
 ACCOUNTS_CACHE_LOCK = threading.Lock()
+
+MARKET_KLINES_CACHE = {}
+MARKET_KLINES_CACHE_LOCK = threading.Lock()
+LAST_WS_GOOD_TS = 0.0
 
 
 def is_rate_limit_error(exc):
@@ -321,6 +333,44 @@ def set_cached_accounts_summary(rows):
     with ACCOUNTS_CACHE_LOCK:
         LAST_ACCOUNTS_SUMMARY = [dict(r) for r in (rows or [])]
         LAST_ACCOUNTS_SUMMARY_TS = time.time()
+
+
+def get_market_cache_ttl(interval: str) -> float:
+    if interval == "15m":
+        return MARKET_KLINES_CACHE_TTL_15M
+    if interval == "1h":
+        return MARKET_KLINES_CACHE_TTL_1H
+    if interval == "4h":
+        return MARKET_KLINES_CACHE_TTL_4H
+    return max(MARKET_KLINES_CACHE_TTL_15M, 20.0)
+
+
+def fetch_futures_klines_cached(symbol, interval="15m", limit=100, max_age=None):
+    if binance is None:
+        return []
+    if max_age is None:
+        max_age = get_market_cache_ttl(interval)
+
+    key = (symbol, interval, int(limit))
+    now = time.time()
+    with MARKET_KLINES_CACHE_LOCK:
+        cached = MARKET_KLINES_CACHE.get(key)
+        if cached and (now - cached.get("ts", 0.0)) <= max_age:
+            return cached.get("data", [])
+
+    try:
+        data = binance.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        with MARKET_KLINES_CACHE_LOCK:
+            MARKET_KLINES_CACHE[key] = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        if is_rate_limit_error(e):
+            with MARKET_KLINES_CACHE_LOCK:
+                cached = MARKET_KLINES_CACHE.get(key)
+                if cached:
+                    print(f"⚠️ MARKET CACHE fallback {symbol} {interval} after rate limit")
+                    return cached.get("data", [])
+        raise
 
 
 def build_exit_lookup(open_orders):
@@ -618,6 +668,10 @@ def build_runtime_state():
         "locked_symbols": sorted(list(GLOBAL_SYMBOL_LOCK)),
         "trade_snapshots": TRADE_SNAPSHOTS,
         "trade_replay_log": TRADE_REPLAY_LOG[-MAX_REPLAY_LOG:],
+        "trade_history": trade_history[-MAX_TRADE_HISTORY:],
+        "last_position_state": last_position_state,
+        "position_entry_score": position_entry_score,
+        "portfolio_alloc": portfolio_alloc,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -631,7 +685,7 @@ def save_runtime_state():
 def load_runtime_state():
     global KILL_SWITCH, START_EQUITY, DAILY_START_EQUITY, LAST_DAY
     global daily_loss, consecutive_loss, current_risk, SYMBOL_COOLDOWN, GLOBAL_SYMBOL_LOCK
-    global TRADE_SNAPSHOTS, TRADE_REPLAY_LOG
+    global TRADE_SNAPSHOTS, TRADE_REPLAY_LOG, trade_history, last_position_state, position_entry_score, portfolio_alloc
 
     if not os.path.exists(STATE_FILE):
         return
@@ -664,6 +718,22 @@ def load_runtime_state():
         replay_log = data.get("trade_replay_log", [])
         if isinstance(replay_log, list):
             TRADE_REPLAY_LOG = replay_log[-MAX_REPLAY_LOG:]
+
+        saved_history = data.get("trade_history", [])
+        if isinstance(saved_history, list):
+            trade_history = saved_history[-MAX_TRADE_HISTORY:]
+
+        saved_last_position_state = data.get("last_position_state", {})
+        if isinstance(saved_last_position_state, dict):
+            last_position_state = saved_last_position_state
+
+        saved_position_entry_score = data.get("position_entry_score", {})
+        if isinstance(saved_position_entry_score, dict):
+            position_entry_score.update(saved_position_entry_score)
+
+        saved_portfolio_alloc = data.get("portfolio_alloc", {})
+        if isinstance(saved_portfolio_alloc, dict):
+            portfolio_alloc.update(saved_portfolio_alloc)
 
         print("✅ Runtime state loaded")
 
@@ -1776,6 +1846,11 @@ def update_ai_memory(symbol, result):
     mem["score"] = max(0, min(100, mem["score"]))
     print(f"🧠 AI Memory updated: {symbol} score={mem['score']} after {result}")
     save_ai_memory()
+    try:
+        update_portfolio_allocation()
+    except Exception as e:
+        print("update_portfolio_allocation after ai memory error:", e)
+    save_runtime_state()
 
 def ai_allow_trade(symbol):
     mem = ai_memory.get(symbol)
@@ -1798,19 +1873,63 @@ def get_ohlcv_cached(symbol, interval="15m"):
         return live
     return None
 
-def ws_data_healthy():
+def ws_health_snapshot():
+    global LAST_WS_GOOD_TS
+
     if MONTRA_MODE == "api_only":
-        return True
+        return {
+            "healthy": True,
+            "degraded": False,
+            "block": False,
+            "reason": "API_ONLY",
+            "stale": [],
+            "sample_age": {},
+            "since_good": 0.0,
+        }
 
     status = get_ws_status()
+    sample = {}
+    watchlist = PAIRS[:10]
+    for sym in PAIRS[:5]:
+        sample[sym] = round(get_live_age(sym), 2)
+
+    stale = count_stale_symbols(watchlist, max_age=WS_MAX_AGE)
+    now = time.time()
+
+    healthy = status["thread_alive"] and len(stale) < WS_STALE_THRESHOLD
+    if healthy:
+        LAST_WS_GOOD_TS = now
+
+    since_good = 0.0 if LAST_WS_GOOD_TS == 0 else max(0.0, now - LAST_WS_GOOD_TS)
+    degraded = False
+    block = False
+    reason = "OK"
+
     if not status["thread_alive"]:
-        return False
+        block = True
+        reason = "THREAD_DEAD"
+    elif len(stale) >= WS_STALE_THRESHOLD:
+        if WS_DEGRADED_MODE_ALLOW and LAST_WS_GOOD_TS and since_good <= WS_DEGRADED_GRACE_SECONDS:
+            degraded = True
+            reason = "STALE_DEGRADED"
+        else:
+            block = True
+            reason = "STALE_BLOCK"
 
-    stale = count_stale_symbols(PAIRS[:10], max_age=WS_MAX_AGE)
-    if len(stale) >= WS_STALE_THRESHOLD:
-        return False
+    return {
+        "healthy": healthy,
+        "degraded": degraded,
+        "block": block,
+        "reason": reason,
+        "stale": stale,
+        "sample_age": sample,
+        "since_good": round(since_good, 2),
+    }
 
-    return True
+
+def ws_data_healthy():
+    snap = ws_health_snapshot()
+    return not snap["block"]
 
 def ws_auto_heal():
     global LAST_WS_HEAL
@@ -1841,7 +1960,7 @@ def ws_auto_heal():
     
 def _get_trend(symbol):
     try:
-        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=50)
+        klines = fetch_futures_klines_cached(symbol, interval="1h", limit=50)
         closes = [float(k[4]) for k in klines]
         if closes[-1] > closes[0]:
             return "BULLISH"
@@ -1855,7 +1974,7 @@ def _get_trend(symbol):
 
 def _get_strength(symbol):
     try:
-        klines = binance.futures_klines(symbol=symbol, interval="1h", limit=2)
+        klines = fetch_futures_klines_cached(symbol, interval="1h", limit=2)
         if len(klines) < 2:
             return 0.0
         prev_close = float(klines[0][4])
@@ -1884,7 +2003,7 @@ def btc_alignment(symbol, signal_trend):
 
 def get_regime_tf(symbol, interval):
     try:
-        klines = binance.futures_klines(symbol=symbol, interval=interval, limit=50)
+        klines = fetch_futures_klines_cached(symbol, interval=interval, limit=50)
         closes = [float(k[4]) for k in klines]
         change = (closes[-1] - closes[0]) / closes[0]
         if abs(change) < 0.004:
@@ -1912,7 +2031,7 @@ def get_multi_tf_regime(symbol="BTCUSDT"):
 
 def get_volatility(symbol="BTCUSDT"):
     try:
-        klines = binance.futures_klines(symbol=symbol, interval="15m", limit=20)
+        klines = fetch_futures_klines_cached(symbol, interval="15m", limit=20)
         ranges = []
         for k in klines:
             high = float(k[2])
@@ -2155,6 +2274,28 @@ last_position_state = {}
 last_regime = None
 last_vol = None
 
+def resolve_closed_trade_pnl(symbol, fallback_pnl=0.0):
+    if binance is None:
+        return float(fallback_pnl or 0.0)
+    try:
+        trades = signed_call(binance, binance.futures_account_trades, symbol=symbol, label="MAIN")
+        now_ms = int(time.time() * 1000)
+        window_ms = max(1, CLOSE_REALIZED_LOOKBACK_MINUTES) * 60 * 1000
+        realized = []
+        for t in trades[-50:]:
+            rpnl = float(t.get("realizedPnl", 0) or 0)
+            tms = int(t.get("time", 0) or 0)
+            if abs(rpnl) <= 0:
+                continue
+            if tms and (now_ms - tms) <= window_ms:
+                realized.append(rpnl)
+        if realized:
+            return float(sum(realized))
+    except Exception as e:
+        print(f"resolve_closed_trade_pnl error {symbol}: {e}")
+    return float(fallback_pnl or 0.0)
+
+
 def monitor_positions_for_memory_update():
     global last_position_state, last_regime, last_vol
     while True:
@@ -2170,7 +2311,7 @@ def monitor_positions_for_memory_update():
             except:
                 pass
 
-            positions = fetch_main_positions(force=True, max_age=POSITION_MONITOR_INTERVAL, label="MAIN")
+            positions = fetch_main_positions(force=False, max_age=POSITION_MONITOR_INTERVAL, label="MAIN")
             current_state = {}
             for p in positions:
                 amt = float(p["positionAmt"])
@@ -2188,7 +2329,7 @@ def monitor_positions_for_memory_update():
 
             for symbol, last in last_position_state.items():
                 if symbol not in current_state:
-                    pnl = last.get("unrealized", 0.0)
+                    pnl = resolve_closed_trade_pnl(symbol, last.get("unrealized", 0.0))
                     result = "WIN" if pnl > 0 else "LOSS"
                     print(f"📊 Position closed: {symbol} PnL={pnl:.2f} {result}")
 
@@ -2207,6 +2348,8 @@ def monitor_positions_for_memory_update():
                         "vol": last_vol if last_vol else 0.0,
                         "score": entry_score
                     })
+                    if len(trade_history) > MAX_TRADE_HISTORY:
+                        del trade_history[:-MAX_TRADE_HISTORY]
                     print(f"📝 Journal updated: {symbol} {result}")
 
                     send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
@@ -2227,6 +2370,7 @@ def monitor_positions_for_memory_update():
                     set_symbol_cooldown(symbol, reason=f"position_closed_{result.lower()}")
 
             last_position_state = current_state
+            save_runtime_state()
 
         except Exception as e:
             print("Monitor position error:", e)
@@ -2686,6 +2830,25 @@ def analytics_by_regime():
 
     return {"rows": list(rows.values())}
 
+@app.get("/debug/ws-detail")
+def debug_ws_detail():
+    status = get_ws_status()
+    gate = ws_health_snapshot()
+    return {
+        "running": status["running"],
+        "thread_alive": status["thread_alive"],
+        "restart_count": status["restart_count"],
+        "last_error": status["last_error"],
+        "healthy": gate["healthy"],
+        "degraded": gate["degraded"],
+        "block": gate["block"],
+        "reason": gate["reason"],
+        "stale": gate["stale"],
+        "sample_age": gate["sample_age"],
+        "since_good": gate["since_good"],
+    }
+
+
 @app.get("/debug/pair-tiers")
 def debug_pair_tiers():
     rows = []
@@ -2777,11 +2940,14 @@ def debug_decision_board():
         for reason, count in sorted(skip_summary.items(), key=lambda x: x[1], reverse=True)
     ]
 
-    ws_sample = {}
-    for sym in PAIRS[:5]:
-        ws_sample[sym] = round(get_live_age(sym), 2)
-
     ws_status = get_ws_status()
+    ws_gate = ws_health_snapshot()
+
+    portfolio_rows = sorted(
+        [{"symbol": sym, "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6)} for sym in PAIRS],
+        key=lambda x: x["weight"],
+        reverse=True,
+    )[:10]
 
     return {
         "mode": MONTRA_MODE,
@@ -2795,7 +2961,13 @@ def debug_decision_board():
             "thread_alive": ws_status["thread_alive"],
             "restart_count": ws_status["restart_count"],
             "last_error": ws_status["last_error"],
-            "sample_age": ws_sample,
+            "sample_age": ws_gate["sample_age"],
+            "healthy": ws_gate["healthy"],
+            "degraded": ws_gate["degraded"],
+            "block": ws_gate["block"],
+            "reason": ws_gate["reason"],
+            "stale": ws_gate["stale"],
+            "since_good": ws_gate["since_good"],
         },
 
         "risk": {
@@ -2814,14 +2986,7 @@ def debug_decision_board():
         },
 
         "portfolio": {
-            "rows": sorted(
-                [
-                    {"symbol": sym, "weight": round(float(portfolio_alloc.get(sym, 0.0)), 6)}
-                    for sym in PAIRS
-                ],
-                key=lambda x: x["weight"],
-                reverse=True,
-            )[:10]
+            "rows": portfolio_rows
         },
 
         "candidates": {
@@ -3057,8 +3222,19 @@ def auto_trader():
             check_telegram_commands()
             ws_auto_heal()
 
-            if not ws_data_healthy():
-                print("⏸️ Skip trade: WS data not healthy")
+            ws_gate = ws_health_snapshot()
+            if ws_gate["block"]:
+                candidate_list_live = []
+                selected_symbols_live = []
+                selected_rows_live = []
+                skip_reasons_live = [{
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": "_SYSTEM_",
+                    "reason": "WS_DATA_NOT_HEALTHY",
+                    "detail": ws_gate,
+                }]
+                add_execution_decision("ws_gate", "_SYSTEM_", "BLOCK", ws_gate)
+                print(f"⏸️ Skip trade: WS data not healthy ({ws_gate['reason']})")
                 time.sleep(5)
                 continue
             if KILL_SWITCH:
@@ -3154,7 +3330,7 @@ def auto_trader():
                         add_skip_reason(symbol, "AI_BLOCK")
                         continue
 
-                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
                     
                     live = get_live_candle(symbol)
                     if live and get_live_age(symbol) < 10:
@@ -3381,7 +3557,7 @@ def auto_trader():
                         add_execution_decision("portfolio", symbol, "BLOCK", {"weight": round(float(w), 6)})
                         continue
 
-                    ohlcv = binance.futures_klines(symbol=symbol, interval="15m", limit=100)
+                    ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
                     
                     live = get_live_candle(symbol)
                     if live and get_live_age(symbol) < 10:
@@ -3680,6 +3856,10 @@ def start_background_tasks():
         return
 
     load_exchange_cache()
+    try:
+        update_portfolio_allocation()
+    except Exception as e:
+        print("startup portfolio allocation error:", e)
     start_ws(PAIRS, interval="15m")
 
     try:
