@@ -61,6 +61,7 @@ type SweepMarker = {
 };
 
 const API_URL = (process.env.REACT_APP_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+const CHART_POLL_MS = 60_000;
 
 function hasValidPrice(value: unknown) {
   const num = Number(value);
@@ -292,7 +293,7 @@ export default function Chart({ symbol, selected, apiUrl }: Props) {
     };
 
     fetchData();
-    const id = window.setInterval(fetchData, 15_000);
+    const id = window.setInterval(fetchData, CHART_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);

@@ -77,6 +77,12 @@ type DecisionBoard = {
     restart_count: number;
     last_error: string | null;
     sample_age: Record<string, number>;
+    healthy?: boolean;
+    degraded?: boolean;
+    block?: boolean;
+    reason?: string;
+    stale?: string[];
+    since_good?: number;
   };
   risk: {
     start_equity: number | null;
@@ -156,7 +162,8 @@ type AccountsResponse = {
 };
 
 const API_URL = (process.env.REACT_APP_API_URL || "http://localhost:8000").replace(/\/+$/, "");
-const POLL_MS = 10_000;
+const POLL_MS = 30_000;
+const ACCOUNTS_POLL_MS = 45_000;
 
 const shellStyle: CSSProperties = {
   minHeight: "100vh",
@@ -436,7 +443,7 @@ export default function App() {
     };
 
     fetchCore();
-    const id = window.setInterval(fetchCore, 8_000);
+    const id = window.setInterval(fetchCore, POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -461,7 +468,7 @@ export default function App() {
     };
 
     fetchAccounts();
-    const id = window.setInterval(fetchAccounts, 15_000);
+    const id = window.setInterval(fetchAccounts, ACCOUNTS_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -491,7 +498,13 @@ export default function App() {
   }, [pairHealth, positions, activeSignal, manualSymbol]);
 
   const chartSymbol = activeSignal?.symbol || manualSymbol;
-  const wsHealthy = Boolean(decisionBoard?.ws?.running && decisionBoard?.ws?.thread_alive && !decisionBoard?.ws?.last_error);
+  const wsHealthy = Boolean(
+    decisionBoard?.ws?.healthy === true &&
+    decisionBoard?.ws?.block !== true &&
+    decisionBoard?.ws?.running &&
+    decisionBoard?.ws?.thread_alive &&
+    !decisionBoard?.ws?.last_error
+  );
   const scanUniverse = pairHealth?.scan_pairs?.length || 0;
 
   return (

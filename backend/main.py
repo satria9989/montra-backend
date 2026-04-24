@@ -262,6 +262,13 @@ def set_cached_main_positions(positions, error=None):
         LAST_MAIN_POSITIONS_ERROR = error
         LAST_MAIN_POSITIONS_ERROR_TS = time.time() if error else 0.0
 
+
+def invalidate_main_positions_cache():
+    global LAST_MAIN_POSITIONS_TS
+    with POSITIONS_CACHE_LOCK:
+        LAST_MAIN_POSITIONS_TS = 0.0
+
+
 def fetch_main_positions(force=False, max_age=None, label="MAIN"):
     if binance is None:
         return []
@@ -298,6 +305,12 @@ def set_cached_main_open_orders(orders):
     with OPEN_ORDERS_CACHE_LOCK:
         LAST_MAIN_OPEN_ORDERS = [dict(o) for o in (orders or [])]
         LAST_MAIN_OPEN_ORDERS_TS = time.time()
+
+
+def invalidate_main_open_orders_cache():
+    global LAST_MAIN_OPEN_ORDERS_TS
+    with OPEN_ORDERS_CACHE_LOCK:
+        LAST_MAIN_OPEN_ORDERS_TS = 0.0
 
 
 def fetch_main_open_orders(force=False, max_age=None, label="MAIN"):
@@ -1309,6 +1322,7 @@ def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = Tru
                 except Exception as e:
                     print("Cancel single order error:", e)
         time.sleep(1.0)
+        invalidate_main_open_orders_cache()
         return True
     except Exception as e:
         print("Cancel error:", e)
@@ -1345,6 +1359,8 @@ def place_futures_order(symbol, side, quantity, sl, tp):
             closePosition=True,
             workingType="MARK_PRICE"
         )
+        invalidate_main_positions_cache()
+        invalidate_main_open_orders_cache()
         return {"status": "FILLED", "order": order}
     except Exception as e:
         return {"error": str(e)}
@@ -1818,17 +1834,16 @@ def reconcile_runtime_state_with_exchange():
     GLOBAL_SYMBOL_LOCK.update(actual_open)
 
     for sym in stale_snapshots:
-        close_info = {
-            "result": "UNKNOWN",
-            "pnl": 0.0,
-            "regime": "RECOVERED",
-            "vol": 0.0,
-            "entry_score": position_entry_score.pop(sym, 50),
-            "note": "startup_reconcile_no_open_position",
-        }
-        add_order_audit("STALE_SNAPSHOT_RECOVERED", sym, close_info)
-        move_snapshot_to_replay(sym, close_info)
-        EXECUTION_IN_PROGRESS.discard(sym)
+        close_info = finalize_closed_trade(
+            sym,
+            fallback_pnl=0.0,
+            regime="RECOVERED",
+            vol=0.0,
+            note="startup_reconcile_no_open_position",
+            send_notice=False,
+            audit_event="STALE_SNAPSHOT_RECOVERED",
+        )
+        print(f"🧹 Reconciled stale snapshot: {sym} {close_info}")
 
     save_runtime_state()
 
@@ -1896,7 +1911,9 @@ def ws_health_snapshot():
     stale = count_stale_symbols(watchlist, max_age=WS_MAX_AGE)
     now = time.time()
 
-    healthy = status["thread_alive"] and len(stale) < WS_STALE_THRESHOLD
+    thread_alive = bool(status.get("thread_alive"))
+    socket_running = bool(status.get("running"))
+    healthy = thread_alive and socket_running and len(stale) < WS_STALE_THRESHOLD
     if healthy:
         LAST_WS_GOOD_TS = now
 
@@ -1905,9 +1922,12 @@ def ws_health_snapshot():
     block = False
     reason = "OK"
 
-    if not status["thread_alive"]:
+    if not thread_alive:
         block = True
         reason = "THREAD_DEAD"
+    elif not socket_running:
+        block = True
+        reason = "SOCKET_DOWN"
     elif len(stale) >= WS_STALE_THRESHOLD:
         if WS_DEGRADED_MODE_ALLOW and LAST_WS_GOOD_TS and since_good <= WS_DEGRADED_GRACE_SECONDS:
             degraded = True
@@ -1946,11 +1966,13 @@ def ws_auto_heal():
 
     need_restart = False
 
-    if not status["thread_alive"]:
+    if not status.get("thread_alive"):
         print("❌ WS watchdog: thread dead")
         need_restart = True
-
-    if len(stale) >= WS_STALE_THRESHOLD:
+    elif not status.get("running"):
+        print("❌ WS watchdog: socket down")
+        need_restart = True
+    elif len(stale) >= WS_STALE_THRESHOLD:
         print(f"❌ WS watchdog: stale symbols = {stale}")
         need_restart = True
 
@@ -2296,6 +2318,72 @@ def resolve_closed_trade_pnl(symbol, fallback_pnl=0.0):
     return float(fallback_pnl or 0.0)
 
 
+def finalize_closed_trade(
+    symbol,
+    fallback_pnl=0.0,
+    regime=None,
+    vol=None,
+    note=None,
+    send_notice=True,
+    audit_event="POSITION_CLOSED",
+):
+    pnl = resolve_closed_trade_pnl(symbol, fallback_pnl)
+    if pnl > 0:
+        result = "WIN"
+    elif pnl < 0:
+        result = "LOSS"
+    else:
+        result = "UNKNOWN"
+
+    entry_score = position_entry_score.pop(symbol, 50)
+    used_regime = regime if regime is not None else (last_regime if last_regime else "UNKNOWN")
+    used_vol = vol if vol is not None else (last_vol if last_vol else 0.0)
+
+    close_info = {
+        "result": result,
+        "pnl": pnl,
+        "regime": used_regime,
+        "vol": used_vol,
+        "entry_score": entry_score,
+    }
+    if note:
+        close_info["note"] = note
+
+    if result in ("WIN", "LOSS"):
+        update_pair_stats(symbol, result, pnl)
+        update_risk(result, pnl)
+        update_ai_memory(symbol, result)
+        update_rl_weights(result, entry_score)
+
+        trade_history.append({
+            "symbol": symbol,
+            "result": result,
+            "pnl": pnl,
+            "regime": used_regime,
+            "vol": used_vol,
+            "score": entry_score,
+            "note": note,
+        })
+        if len(trade_history) > MAX_TRADE_HISTORY:
+            del trade_history[:-MAX_TRADE_HISTORY]
+        print(f"📝 Journal updated: {symbol} {result}")
+    else:
+        print(f"⚠️ Closed trade unresolved: {symbol} PnL=0.00; memory/journal not updated as loss")
+
+    add_order_audit(audit_event, symbol, close_info)
+    move_snapshot_to_replay(symbol, close_info)
+
+    GLOBAL_SYMBOL_LOCK.discard(symbol)
+    EXECUTION_IN_PROGRESS.discard(symbol)
+    if result in ("WIN", "LOSS"):
+        set_symbol_cooldown(symbol, reason=f"position_closed_{result.lower()}")
+
+    if send_notice and result in ("WIN", "LOSS"):
+        send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
+
+    return close_info
+
+
 def monitor_positions_for_memory_update():
     global last_position_state, last_regime, last_vol
     while True:
@@ -2329,45 +2417,31 @@ def monitor_positions_for_memory_update():
 
             for symbol, last in last_position_state.items():
                 if symbol not in current_state:
-                    pnl = resolve_closed_trade_pnl(symbol, last.get("unrealized", 0.0))
-                    result = "WIN" if pnl > 0 else "LOSS"
-                    print(f"📊 Position closed: {symbol} PnL={pnl:.2f} {result}")
+                    close_info = finalize_closed_trade(
+                        symbol,
+                        fallback_pnl=last.get("unrealized", 0.0),
+                        regime=last_regime if last_regime else "UNKNOWN",
+                        vol=last_vol if last_vol else 0.0,
+                        send_notice=True,
+                        audit_event="POSITION_CLOSED",
+                    )
+                    print(f"📊 Position closed: {symbol} {close_info}")
 
-                    update_pair_stats(symbol, result, pnl)
-                    update_risk(result, pnl)
-                    update_ai_memory(symbol, result)
-
-                    entry_score = position_entry_score.pop(symbol, 50)
-                    update_rl_weights(result, entry_score)
-
-                    trade_history.append({
-                        "symbol": symbol,
-                        "result": result,
-                        "pnl": pnl,
-                        "regime": last_regime if last_regime else "UNKNOWN",
-                        "vol": last_vol if last_vol else 0.0,
-                        "score": entry_score
-                    })
-                    if len(trade_history) > MAX_TRADE_HISTORY:
-                        del trade_history[:-MAX_TRADE_HISTORY]
-                    print(f"📝 Journal updated: {symbol} {result}")
-
-                    send_telegram(f"✅ Trade closed: {symbol} {result} PnL=${pnl:.2f}")
-
-                    close_info = {
-                        "result": result,
-                        "pnl": pnl,
-                        "regime": last_regime if last_regime else "UNKNOWN",
-                        "vol": last_vol if last_vol else 0.0,
-                        "entry_score": entry_score,
-                    }
-
-                    add_order_audit("POSITION_CLOSED", symbol, close_info)
-                    move_snapshot_to_replay(symbol, close_info)
-
-                    GLOBAL_SYMBOL_LOCK.discard(symbol)
-                    EXECUTION_IN_PROGRESS.discard(symbol)
-                    set_symbol_cooldown(symbol, reason=f"position_closed_{result.lower()}")
+            # Snapshot safety: if runtime state contains a trade snapshot but the
+            # exchange no longer has that symbol open, finalize it even after a
+            # restart or monitor gap.
+            for symbol in list(TRADE_SNAPSHOTS.keys()):
+                if symbol not in current_state:
+                    close_info = finalize_closed_trade(
+                        symbol,
+                        fallback_pnl=0.0,
+                        regime=last_regime if last_regime else "UNKNOWN",
+                        vol=last_vol if last_vol else 0.0,
+                        note="snapshot_missing_from_exchange",
+                        send_notice=True,
+                        audit_event="SNAPSHOT_CLOSED_RECOVERED",
+                    )
+                    print(f"🧩 Snapshot close recovered: {symbol} {close_info}")
 
             last_position_state = current_state
             save_runtime_state()
@@ -2410,7 +2484,8 @@ def ticker(symbol: str):
 @app.get("/ohlcv/{symbol}")
 def ohlcv(symbol: str, timeframe: str = Query(default="15m"), limit: int = Query(default=100, ge=1, le=1000)):
     try:
-        return {"symbol": symbol, "timeframe": timeframe, "limit": limit, "data": get_ohlcv(symbol, timeframe=timeframe, limit=limit)}
+        data = fetch_futures_klines_cached(symbol, interval=timeframe, limit=limit)
+        return {"symbol": symbol, "timeframe": timeframe, "limit": limit, "data": data}
     except Exception as e:
         return {"error": str(e)}
 
@@ -2949,6 +3024,12 @@ def debug_decision_board():
         reverse=True,
     )[:10]
 
+    try:
+        live_rows = build_live_position_rows()
+    except Exception as e:
+        live_rows = []
+        add_execution_decision("decision_board_positions", "_SYSTEM_", "WARN", {"error": str(e)})
+
     return {
         "mode": MONTRA_MODE,
         "validation_mode": VALIDATION_MODE,
@@ -3000,8 +3081,8 @@ def debug_decision_board():
         },
 
         "live_positions": {
-            "count": len(build_live_position_rows()),
-            "rows": build_live_position_rows()[:10],
+            "count": len(live_rows),
+            "rows": live_rows[:10],
         },
 
         "skip_reasons": {
@@ -3043,6 +3124,131 @@ def get_positions():
         return {"count": len(rows), "rows": rows}
     except Exception as e:
         return {"count": 0, "rows": [], "error": str(e)}
+
+
+@app.post("/positions/{symbol}/protect")
+def protect_position(symbol: str, payload: dict = Body(...)):
+    """
+    Emergency/manual exchange-level protection resolver.
+
+    Payload:
+    {
+        "side": "BUY" | "SELL",  # optional; auto-derived from open position if omitted
+        "sl": 450.0,
+        "tp": 470.0
+    }
+    """
+    if binance is None:
+        return {"status": "rejected", "reason": "binance client not ready"}
+
+    symbol = symbol.upper().strip()
+    sl_raw = payload.get("sl")
+    tp_raw = payload.get("tp")
+    side_raw = payload.get("side")
+
+    if sl_raw is None or tp_raw is None:
+        return {"status": "rejected", "reason": "sl and tp required"}
+
+    try:
+        sl = float(sl_raw)
+        tp = float(tp_raw)
+    except Exception:
+        return {"status": "rejected", "reason": "sl and tp must be numeric"}
+
+    if sl <= 0 or tp <= 0:
+        return {"status": "rejected", "reason": "sl and tp must be > 0"}
+
+    try:
+        positions = signed_call(binance, binance.futures_position_information, symbol=symbol, label="MAIN")
+        pos = next((p for p in positions if abs(float(p.get("positionAmt", 0) or 0)) > 0), None)
+        if not pos:
+            return {"status": "rejected", "reason": "no open position for symbol"}
+
+        amt = float(pos.get("positionAmt", 0) or 0)
+        entry = float(pos.get("entryPrice", 0) or 0)
+        mark = float(pos.get("markPrice", 0) or 0)
+        side = str(side_raw or ("BUY" if amt > 0 else "SELL")).upper()
+
+        if side not in ("BUY", "SELL"):
+            return {"status": "rejected", "reason": "side must be BUY or SELL"}
+
+        ref_price = mark if mark > 0 else entry
+        if side == "BUY":
+            if sl >= ref_price:
+                return {"status": "rejected", "reason": "BUY protection invalid: SL must be below mark/entry"}
+            if tp <= ref_price:
+                return {"status": "rejected", "reason": "BUY protection invalid: TP must be above mark/entry"}
+            close_side = SIDE_SELL
+        else:
+            if sl <= ref_price:
+                return {"status": "rejected", "reason": "SELL protection invalid: SL must be above mark/entry"}
+            if tp >= ref_price:
+                return {"status": "rejected", "reason": "SELL protection invalid: TP must be below mark/entry"}
+            close_side = SIDE_BUY
+
+        sl_price = normalize_price(symbol, sl)
+        tp_price = normalize_price(symbol, tp)
+
+        cancel_ok = cancel_existing_orders(symbol, cancel_tp=True, cancel_sl=True)
+        if not cancel_ok:
+            return {"status": "rejected", "reason": "failed to cancel existing protective orders"}
+
+        sl_order = signed_call(
+            binance,
+            binance.futures_create_order,
+            label="MAIN",
+            symbol=symbol,
+            side=close_side,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=sl_price,
+            closePosition=True,
+            workingType="MARK_PRICE",
+        )
+
+        tp_order = signed_call(
+            binance,
+            binance.futures_create_order,
+            label="MAIN",
+            symbol=symbol,
+            side=close_side,
+            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=tp_price,
+            closePosition=True,
+            workingType="MARK_PRICE",
+        )
+
+        invalidate_main_positions_cache()
+        invalidate_main_open_orders_cache()
+
+        detail = {
+            "side": side,
+            "entry": entry,
+            "mark": mark,
+            "sl": sl_price,
+            "tp": tp_price,
+            "position_amt": amt,
+        }
+        add_order_audit("MANUAL_PROTECT_OK", symbol, detail)
+
+        return {
+            "status": "OK",
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "mark": mark,
+            "sl": sl_price,
+            "tp": tp_price,
+            "orders": {
+                "sl": sl_order,
+                "tp": tp_order,
+            },
+        }
+
+    except Exception as e:
+        err = str(e)
+        add_order_audit("MANUAL_PROTECT_ERROR", symbol, {"error": err})
+        return {"status": "error", "error": err}
+
 
 @app.get("/accounts")
 def get_accounts():
@@ -3220,6 +3426,21 @@ def auto_trader():
     while True:
         try:
             check_telegram_commands()
+
+            if KILL_SWITCH:
+                print("🛑 KILL SWITCH ACTIVE")
+                time.sleep(5)
+                continue
+
+            if not AUTO_MODE:
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            if not AUTO_TRADING:
+                print("⏸️ AUTO TRADING DISABLED")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
             ws_auto_heal()
 
             ws_gate = ws_health_snapshot()
@@ -3237,19 +3458,8 @@ def auto_trader():
                 print(f"⏸️ Skip trade: WS data not healthy ({ws_gate['reason']})")
                 time.sleep(5)
                 continue
-            if KILL_SWITCH:
-                print("🛑 KILL SWITCH ACTIVE")
-                time.sleep(5)
-                continue
             if not safety_check():
                 time.sleep(10)
-                continue
-            if not AUTO_MODE:
-                time.sleep(SCAN_INTERVAL)
-                continue
-            if not AUTO_TRADING:
-                print("⏸️ AUTO TRADING DISABLED")
-                time.sleep(SCAN_INTERVAL)
                 continue
             if daily_loss >= MAX_DAILY_LOSS:
                 print("🚫 Skip trade: daily loss limit")
