@@ -2910,10 +2910,19 @@ def debug_ws_detail():
     status = get_ws_status()
     gate = ws_health_snapshot()
     return {
-        "running": status["running"],
-        "thread_alive": status["thread_alive"],
-        "restart_count": status["restart_count"],
-        "last_error": status["last_error"],
+        "running": status.get("running"),
+        "thread_alive": status.get("thread_alive"),
+        "app_alive": status.get("app_alive"),
+        "restart_count": status.get("restart_count"),
+        "last_error": status.get("last_error"),
+
+        "message_count": status.get("message_count"),
+        "last_message_age": status.get("last_message_age"),
+        "last_stream": status.get("last_stream"),
+        "last_event": status.get("last_event"),
+        "subscribed_count": status.get("subscribed_count"),
+        "subscribed_sample": status.get("subscribed_sample"),
+
         "healthy": gate["healthy"],
         "degraded": gate["degraded"],
         "block": gate["block"],
