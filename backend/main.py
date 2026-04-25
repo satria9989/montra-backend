@@ -42,7 +42,9 @@ VALIDATION_MODE = os.getenv(
     "true" if MONTRA_PROFILE in ("validation", "sample_hunt") else "false"
 ).lower() == "true"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10" if VALIDATION_MODE else "15"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10" if VALIDATION_MODE else "30"))
+SCAN_INTERVAL_TOP = int(os.getenv("SCAN_INTERVAL_TOP", "30"))
+SCAN_INTERVAL_MID = int(os.getenv("SCAN_INTERVAL_MID", "60"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "46" if VALIDATION_MODE else "62"))
 
 # safety core tetap dijaga, tapi live-safe lebih ketat
@@ -51,22 +53,22 @@ GLOBAL_SYMBOL_LOCK = set()
 SYMBOL_COOLDOWN = {}
 ORDER_AUDIT_LOG = []
 EXECUTION_IN_PROGRESS = set()
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180" if VALIDATION_MODE else "900"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180" if VALIDATION_MODE else "360"))
 MAX_AUDIT_LOG = 500
 
 # websocket safety
 WS_MAX_AGE = int(os.getenv("WS_MAX_AGE", "20"))
 WS_STALE_THRESHOLD = int(os.getenv("WS_STALE_THRESHOLD", "5"))
-WS_RESTART_COOLDOWN = int(os.getenv("WS_RESTART_COOLDOWN", "30"))
+WS_RESTART_COOLDOWN = int(os.getenv("WS_RESTART_COOLDOWN", "300"))
 LAST_WS_HEAL = 0
 
 STATE_FILE = os.getenv("STATE_FILE", "runtime_state.json")
 
 # ===== VALIDATION / LIVE GATES =====
 VALIDATION_RR_MIN = float(os.getenv("VALIDATION_RR_MIN", "1.8"))
-LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "3.0"))
+LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "2.0"))
 VALIDATION_TARGET_RR = float(os.getenv("VALIDATION_TARGET_RR", "2.0"))
-LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "3.0"))
+LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "2.5"))
 
 VALIDATION_VOL_MIN = float(os.getenv("VALIDATION_VOL_MIN", "0.0004"))
 VALIDATION_VOL_MAX = float(os.getenv("VALIDATION_VOL_MAX", "0.07"))
@@ -90,17 +92,28 @@ LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY
 # Guardrail live agar RR tidak "valid di angka" tetapi terlalu mepet untuk fee/spread/wick.
 MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0015"))  # 0.15%
 MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0030"))      # 0.30%
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.0008"))                # 0.08%; aktif jika signal membawa spread_pct
 FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))                    # haircut RR untuk fee/slippage/noise
 STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
 ORDER_ID_PREFIX = (os.getenv("ORDER_ID_PREFIX", "M") or "M").strip()[:8]
-SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.12"))
+SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.15"))
+
+# ===== CIRCUIT BREAKER / SPREAD GATE =====
+CONSECUTIVE_ERRORS = 0
+CIRCUIT_BREAKER_UNTIL = 0.0
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", os.getenv("MAX_CONSECUTIVE_ERRORS", "10")))
+CIRCUIT_BREAKER_PAUSE = float(os.getenv("CIRCUIT_BREAKER_PAUSE", "60"))
+WS_FALLBACK_POLL_INTERVAL = float(os.getenv("WS_FALLBACK_POLL_INTERVAL", "5"))
+SPREAD_THRESHOLD_TOP = float(os.getenv("SPREAD_THRESHOLD_TOP", "0.0008"))
+SPREAD_THRESHOLD_MID = float(os.getenv("SPREAD_THRESHOLD_MID", "0.0015"))
+SPREAD_WARN_MULTIPLIER = float(os.getenv("SPREAD_WARN_MULTIPLIER", "0.8"))
+SPREAD_CACHE_TTL = float(os.getenv("SPREAD_CACHE_TTL", "5"))
+SPREAD_ORDER_BOOK_LIMIT = int(os.getenv("SPREAD_ORDER_BOOK_LIMIT", "5"))
 
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
 STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
 STRUCTURE_RECLAIM_TOLERANCE = float(os.getenv("STRUCTURE_RECLAIM_TOLERANCE", "0.0018"))
-STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.14"))
+STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.35"))
 STRUCTURE_RECENT_WINDOW = int(os.getenv("STRUCTURE_RECENT_WINDOW", "3"))
 STRUCTURE_ZONE_TOLERANCE = float(os.getenv("STRUCTURE_ZONE_TOLERANCE", "0.0018"))
 STRUCTURE_STRONG_SCORE_BONUS = int(os.getenv("STRUCTURE_STRONG_SCORE_BONUS", "6"))
@@ -172,6 +185,11 @@ from ws_feed import (
     restart_ws,
     is_ws_running,
 )
+from utils.spread import (
+    check_spread_gate,
+    get_live_spread,
+    get_spread_cache_snapshot,
+)
 
 # ================= INIT =================
 app = FastAPI(title="Montra Backend", version="1.0")
@@ -218,20 +236,20 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KE
 
 BINANCE_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "10000"))
 BINANCE_TIME_SYNC_INTERVAL = int(os.getenv("BINANCE_TIME_SYNC_INTERVAL", "900"))
-BINANCE_MAX_TIME_RETRIES = int(os.getenv("BINANCE_MAX_TIME_RETRIES", "1"))
-BINANCE_RATE_LIMIT_RETRIES = int(os.getenv("BINANCE_RATE_LIMIT_RETRIES", "1"))
-POSITION_CACHE_TTL = float(os.getenv("POSITION_CACHE_TTL", "8"))
-POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "15"))
-TRAILING_LOOP_INTERVAL = float(os.getenv("TRAILING_LOOP_INTERVAL", "10"))
+BINANCE_MAX_TIME_RETRIES = int(os.getenv("BINANCE_MAX_TIME_RETRIES", os.getenv("MAX_TIME_RETRIES", "3")))
+BINANCE_RATE_LIMIT_RETRIES = int(os.getenv("BINANCE_RATE_LIMIT_RETRIES", os.getenv("RATE_LIMIT_RETRIES", "3")))
+POSITION_CACHE_TTL = float(os.getenv("POSITION_CACHE_TTL", "30"))
+POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "45"))
+TRAILING_LOOP_INTERVAL = float(os.getenv("TRAILING_LOOP_INTERVAL", "30"))
 POSITION_RATE_LIMIT_SLEEP = float(os.getenv("POSITION_RATE_LIMIT_SLEEP", "20"))
-MARKET_KLINES_CACHE_TTL_15M = float(os.getenv("MARKET_KLINES_CACHE_TTL_15M", "20"))
-MARKET_KLINES_CACHE_TTL_1H = float(os.getenv("MARKET_KLINES_CACHE_TTL_1H", "120"))
-MARKET_KLINES_CACHE_TTL_4H = float(os.getenv("MARKET_KLINES_CACHE_TTL_4H", "300"))
+MARKET_KLINES_CACHE_TTL_15M = float(os.getenv("MARKET_KLINES_CACHE_TTL_15M", "60"))
+MARKET_KLINES_CACHE_TTL_1H = float(os.getenv("MARKET_KLINES_CACHE_TTL_1H", "180"))
+MARKET_KLINES_CACHE_TTL_4H = float(os.getenv("MARKET_KLINES_CACHE_TTL_4H", "600"))
 WS_DEGRADED_MODE_ALLOW = os.getenv("WS_DEGRADED_MODE_ALLOW", "true").lower() == "true"
-WS_DEGRADED_GRACE_SECONDS = float(os.getenv("WS_DEGRADED_GRACE_SECONDS", "120"))
+WS_DEGRADED_GRACE_SECONDS = float(os.getenv("WS_DEGRADED_GRACE_SECONDS", "15"))
 WS_FULL_STALE_BLOCK_SECONDS = float(os.getenv("WS_FULL_STALE_BLOCK_SECONDS", "600"))
 MAX_TRADE_HISTORY = int(os.getenv("MAX_TRADE_HISTORY", "1000"))
-CLOSE_REALIZED_LOOKBACK_MINUTES = int(os.getenv("CLOSE_REALIZED_LOOKBACK_MINUTES", "180"))
+CLOSE_REALIZED_LOOKBACK_MINUTES = int(os.getenv("CLOSE_REALIZED_LOOKBACK_MINUTES", "720"))
 
 LAST_MAIN_POSITIONS = []
 LAST_MAIN_POSITIONS_TS = 0.0
@@ -252,6 +270,50 @@ LAST_WS_GOOD_TS = 0.0
 
 SIGNED_CALL_LOCK = threading.Lock()
 LAST_SIGNED_CALL_TS = 0.0
+
+
+def circuit_breaker_active():
+    return time.time() < CIRCUIT_BREAKER_UNTIL
+
+
+def circuit_breaker_remaining():
+    return max(0.0, CIRCUIT_BREAKER_UNTIL - time.time())
+
+
+def record_runtime_error(stage="runtime", error=None):
+    global CONSECUTIVE_ERRORS, CIRCUIT_BREAKER_UNTIL
+    CONSECUTIVE_ERRORS += 1
+    detail = {
+        "stage": stage,
+        "error": str(error) if error is not None else None,
+        "consecutive_errors": CONSECUTIVE_ERRORS,
+        "threshold": CIRCUIT_BREAKER_THRESHOLD,
+    }
+    if CONSECUTIVE_ERRORS >= CIRCUIT_BREAKER_THRESHOLD:
+        CIRCUIT_BREAKER_UNTIL = time.time() + CIRCUIT_BREAKER_PAUSE
+        detail["pause_seconds"] = CIRCUIT_BREAKER_PAUSE
+        try:
+            add_execution_decision("circuit_breaker", "_SYSTEM_", "BLOCK", detail)
+        except Exception:
+            pass
+        print(f"🧯 CIRCUIT BREAKER PAUSE {CIRCUIT_BREAKER_PAUSE}s after {CONSECUTIVE_ERRORS} errors")
+    return detail
+
+
+def reset_runtime_errors():
+    global CONSECUTIVE_ERRORS
+    if CONSECUTIVE_ERRORS:
+        CONSECUTIVE_ERRORS = 0
+
+
+def signed_backoff_sleep(attempt, rate_error=False, time_error=False):
+    base = 0.5 if time_error else 1.0
+    if rate_error:
+        base = 2.0
+    sleep_for = min(POSITION_RATE_LIMIT_SLEEP, base * (2 ** max(0, attempt - 1)))
+    sleep_for += min(0.25, 0.03 * attempt)
+    time.sleep(sleep_for)
+    return sleep_for
 
 
 def is_rate_limit_error(exc):
@@ -535,8 +597,12 @@ def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_ti
                     if elapsed < SIGNED_CALL_MIN_INTERVAL:
                         time.sleep(SIGNED_CALL_MIN_INTERVAL - elapsed)
                     LAST_SIGNED_CALL_TS = time.time()
-                    return fn(*args, **kwargs)
-            return fn(*args, **kwargs)
+                    result = fn(*args, **kwargs)
+                    reset_runtime_errors()
+                    return result
+            result = fn(*args, **kwargs)
+            reset_runtime_errors()
+            return result
         except Exception as e:
             last_error = e
             msg = str(e)
@@ -546,15 +612,16 @@ def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_ti
             if time_error and attempt < time_attempts:
                 print(f"⚠️ {label} signed_call time drift detected (attempt {attempt}/{time_attempts})")
                 sync_binance_time(client_obj, label=label, force=True)
-                time.sleep(0.25)
+                sleep_for = signed_backoff_sleep(attempt, time_error=True)
+                print(f"⏳ {label} time retry backoff {sleep_for:.2f}s")
                 continue
 
             if rate_error and attempt < rate_attempts:
-                sleep_for = min(POSITION_RATE_LIMIT_SLEEP, 8 + (attempt * 4))
+                sleep_for = signed_backoff_sleep(attempt, rate_error=True)
                 print(f"⚠️ {label} signed_call rate limited, retrying in {sleep_for:.1f}s")
-                time.sleep(sleep_for)
                 continue
 
+            record_runtime_error("signed_call", e)
             raise
 
     raise last_error
@@ -614,14 +681,20 @@ skip_reasons_live = []
 MAX_SKIP_REASONS = 300
 EXECUTION_DECISIONS = []
 MAX_EXECUTION_DECISIONS = 500
+APP_START_TS = time.time()
+EXECUTION_BOOT_GRACE_SECONDS = float(os.getenv("EXECUTION_BOOT_GRACE_SECONDS", "45"))
+LAST_SCAN_CYCLE_TS = 0.0
 LAST_FINAL_EXECUTION = {
-    "status": "IDLE",
+    "status": "STARTING",
     "symbol": None,
     "side": None,
-    "reason": "BOOT",
-    "time": None,
-    "stage": None,
-    "detail": {},
+    "reason": "WAITING_FOR_FIRST_SCAN",
+    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "ts": APP_START_TS,
+    "stage": "startup",
+    "detail": {
+        "boot_grace_seconds": EXECUTION_BOOT_GRACE_SECONDS,
+    },
 }
 
 # ===== AI MEMORY & FIREBASE =====
@@ -1109,11 +1182,24 @@ def add_skip_reason(symbol, reason, extra=None):
         skip_reasons_live = skip_reasons_live[-MAX_SKIP_REASONS:]
 
 
+def summarize_skip_reasons(rows=None, limit=8):
+    summary = {}
+    for row in rows or []:
+        reason = row.get("reason", "UNKNOWN")
+        summary[reason] = summary.get(reason, 0) + 1
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(summary.items(), key=lambda item: item[1], reverse=True)[:limit]
+    ]
+
+
 def add_execution_decision(stage, symbol, status, detail=None):
     global EXECUTION_DECISIONS
 
+    now = time.time()
     row = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": now,
         "stage": stage,
         "symbol": symbol,
         "status": status,
@@ -1129,6 +1215,7 @@ def add_execution_decision(stage, symbol, status, detail=None):
 
 def set_final_execution(status, symbol=None, side=None, reason=None, stage=None, detail=None):
     global LAST_FINAL_EXECUTION
+    now = time.time()
     LAST_FINAL_EXECUTION = {
         "status": status,
         "symbol": symbol,
@@ -1137,10 +1224,66 @@ def set_final_execution(status, symbol=None, side=None, reason=None, stage=None,
         "stage": stage,
         "detail": detail or {},
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": now,
     }
 
 
+def guard_execution_boot_state():
+    """Prevent STARTING/BOOT telemetry from staying visible forever."""
+    status = LAST_FINAL_EXECUTION.get("status")
+    reason = LAST_FINAL_EXECUTION.get("reason")
+    boot_elapsed = time.time() - APP_START_TS
+    if status in ("STARTING", "IDLE") and reason in ("BOOT", "WAITING_FOR_FIRST_SCAN") and boot_elapsed > EXECUTION_BOOT_GRACE_SECONDS:
+        set_final_execution(
+            "IDLE",
+            reason="WAITING_FOR_SCAN_TELEMETRY",
+            stage="execution_boot_guard",
+            detail={
+                "boot_elapsed_seconds": round(boot_elapsed, 2),
+                "boot_grace_seconds": EXECUTION_BOOT_GRACE_SECONDS,
+                "last_scan_cycle_ts": LAST_SCAN_CYCLE_TS or None,
+            },
+        )
+
+
+def _execution_age(ts):
+    try:
+        ts = float(ts or 0)
+    except Exception:
+        ts = 0.0
+    if ts <= 0:
+        return None
+    return round(max(0.0, time.time() - ts), 2)
+
+
+def mark_scan_cycle(status="SCANNING", reason="SCAN_CYCLE_STARTED", pairs=None, detail=None):
+    global LAST_SCAN_CYCLE_TS
+    LAST_SCAN_CYCLE_TS = time.time()
+    payload = {
+        "pairs_due": len(pairs or []),
+        "scan_interval_top": SCAN_INTERVAL_TOP,
+        "scan_interval_mid": SCAN_INTERVAL_MID,
+    }
+    if detail:
+        payload.update(detail)
+    set_final_execution(status, reason=reason, stage="scan_cycle", detail=payload)
+
+
+def set_idle_after_scan(reason, pairs=None, detail=None):
+    payload = {
+        "pairs_scanned": len(pairs or []),
+        "candidate_count": len(candidate_list_live),
+        "selected_count": len(selected_rows_live),
+        "skip_count": len(skip_reasons_live),
+        "last_scan_age": round(time.time() - LAST_SCAN_CYCLE_TS, 2) if LAST_SCAN_CYCLE_TS else None,
+    }
+    if detail:
+        payload.update(detail)
+    set_final_execution("IDLE", reason=reason, stage="scan_cycle_done", detail=payload)
+
+
 def build_final_execution_summary(candidate_rows=None, live_rows=None):
+    guard_execution_boot_state()
     candidate_rows = candidate_rows or []
     live_rows = live_rows or []
 
@@ -1208,9 +1351,34 @@ def build_final_execution_summary(candidate_rows=None, live_rows=None):
         reason = "NO_FINAL_ORDER_DECISION_YET"
         protection = "NONE"
     else:
-        status = LAST_FINAL_EXECUTION.get("status", "IDLE")
-        reason = LAST_FINAL_EXECUTION.get("reason", "NO_SIGNAL")
         protection = "NONE"
+        boot_elapsed = time.time() - APP_START_TS
+        last_status = LAST_FINAL_EXECUTION.get("status", "IDLE")
+        last_reason = LAST_FINAL_EXECUTION.get("reason", "NO_SIGNAL")
+
+        if KILL_SWITCH:
+            status = "KILL_SWITCH_ON"
+            reason = "KILL_SWITCH_TRUE"
+        elif not AUTO_MODE:
+            status = "AUTO_MODE_OFF"
+            reason = "AUTO_MODE_FALSE"
+        elif not AUTO_TRADING:
+            status = "AUTO_TRADING_OFF"
+            reason = "AUTO_TRADING_FALSE"
+        elif circuit_breaker_active():
+            status = "CIRCUIT_BREAKER_PAUSED"
+            reason = f"CIRCUIT_BREAKER_{int(circuit_breaker_remaining())}s"
+        elif last_status in ("STARTING", "IDLE") and last_reason in ("BOOT", "WAITING_FOR_FIRST_SCAN") and boot_elapsed > EXECUTION_BOOT_GRACE_SECONDS:
+            status = "IDLE"
+            reason = "WAITING_FOR_SCAN_TELEMETRY"
+        else:
+            status = last_status
+            reason = last_reason or "NO_SIGNAL"
+
+    status_source = last_for_symbol if last_for_symbol else LAST_FINAL_EXECUTION
+    since_ts = status_source.get("ts") if isinstance(status_source, dict) else None
+    since = status_source.get("time") if isinstance(status_source, dict) else None
+    last_scan_age = _execution_age(LAST_SCAN_CYCLE_TS) if LAST_SCAN_CYCLE_TS else None
 
     return {
         "status": status,
@@ -1225,6 +1393,13 @@ def build_final_execution_summary(candidate_rows=None, live_rows=None):
         "last_status": last_for_symbol.get("status") if last_for_symbol else LAST_FINAL_EXECUTION.get("status"),
         "last_detail": last_for_symbol.get("detail") if last_for_symbol else LAST_FINAL_EXECUTION.get("detail", {}),
         "recent_decisions": recent[-5:],
+        "since": since,
+        "since_ts": since_ts,
+        "age_seconds": _execution_age(since_ts),
+        "app_uptime_seconds": round(time.time() - APP_START_TS, 2),
+        "boot_grace_seconds": EXECUTION_BOOT_GRACE_SECONDS,
+        "last_scan_since": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(LAST_SCAN_CYCLE_TS)) if LAST_SCAN_CYCLE_TS else None,
+        "last_scan_age_seconds": last_scan_age,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1493,7 +1668,6 @@ def evaluate_signal_execution_quality(signal, reference_price=None):
         "raw_rr": round(raw_rr, 4),
         "effective_rr": round(effective_rr, 4),
         "spread_pct": spread_pct,
-        "max_spread_pct": MAX_SPREAD_PCT,
     })
 
     if stop_pct < MIN_STOP_DISTANCE_PCT:
@@ -1504,9 +1678,6 @@ def evaluate_signal_execution_quality(signal, reference_price=None):
 
     if effective_rr < active_rr_min():
         return False, "EFFECTIVE_RR_TOO_LOW", detail
-
-    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
-        return False, "SPREAD_TOO_WIDE", detail
 
     return True, "OK", detail
 
@@ -2280,6 +2451,44 @@ def get_ohlcv_cached(symbol, interval="15m"):
         return live
     return None
 
+WS_FALLBACK_PRICE_CACHE = {}
+WS_FALLBACK_PRICE_TS = {}
+
+
+def get_live_or_fallback_price(symbol, ohlcv_last=None):
+    """Prefer WS mark/candle. If WS is stale, poll REST ticker with per-symbol TTL."""
+    symbol = str(symbol or "").upper()
+    mark = get_live_mark(symbol)
+    if mark and get_live_age(symbol) < WS_MAX_AGE:
+        return float(mark.get("price")), "ws_mark"
+
+    live = get_live_candle(symbol)
+    if live and get_live_age(symbol) < WS_MAX_AGE:
+        return float(live.get("close")), "ws_candle"
+
+    now = time.time()
+    last_ts = WS_FALLBACK_PRICE_TS.get(symbol, 0.0)
+    if symbol in WS_FALLBACK_PRICE_CACHE and (now - last_ts) < WS_FALLBACK_POLL_INTERVAL:
+        return float(WS_FALLBACK_PRICE_CACHE[symbol]), "rest_fallback_cache"
+
+    if binance is not None:
+        try:
+            price = float(binance.futures_symbol_ticker(symbol=symbol)["price"])
+            WS_FALLBACK_PRICE_CACHE[symbol] = price
+            WS_FALLBACK_PRICE_TS[symbol] = now
+            add_execution_decision("ws_fallback_price", symbol, "WARN", {
+                "price": price,
+                "interval": WS_FALLBACK_POLL_INTERVAL,
+                "ws_age": round(get_live_age(symbol), 2),
+            })
+            return price, "rest_fallback"
+        except Exception as exc:
+            record_runtime_error("ws_fallback_price", exc)
+
+    if ohlcv_last is not None:
+        return float(ohlcv_last[4]), "ohlcv_close"
+    return 0.0, "unavailable"
+
 def ws_health_snapshot():
     global LAST_WS_GOOD_TS
 
@@ -2597,6 +2806,17 @@ def get_open_positions():
         return []
 
 # ⭐ NEW: centralized decision
+def pre_entry_spread_gate(symbol):
+    tier = get_pair_tier(symbol)
+    ok, reason, detail = check_spread_gate(binance, symbol, tier)
+    if reason == "SPREAD_WARN":
+        add_execution_decision("spread_gate", symbol, "WARN", detail)
+        print(f"⚠️ SPREAD WARN {symbol}: {detail.get('spread_pct'):.6f} threshold={detail.get('threshold_pct')}")
+        return True, reason, detail
+    add_execution_decision("spread_gate", symbol, "PASS" if ok else "BLOCK", detail)
+    return ok, reason, detail
+
+
 def should_execute_trade(signal):
     score = float(signal.get("score", 0) or 0)
     symbol = signal.get("symbol")
@@ -2611,6 +2831,9 @@ def should_execute_trade(signal):
 
     if KILL_SWITCH:
         return False, "KILL_SWITCH"
+
+    if circuit_breaker_active():
+        return False, f"CIRCUIT_BREAKER_{int(circuit_breaker_remaining())}s"
 
     if not AUTO_TRADING:
         return False, "AUTO_OFF"
@@ -2644,6 +2867,11 @@ def should_execute_trade(signal):
     signal["execution_quality"] = quality_detail
     if not quality_ok:
         return False, quality_reason
+
+    spread_ok, spread_reason, spread_detail = pre_entry_spread_gate(symbol)
+    signal["spread_gate"] = spread_detail
+    if not spread_ok:
+        return False, spread_reason
 
     if active_require_sweep():
         if side == "BUY" and not sweep_low:
@@ -3417,6 +3645,35 @@ def debug_execution_summary():
     return build_final_execution_summary(candidate_rows, live_rows)
 
 
+@app.get("/debug/spread")
+def debug_spread_all(force: bool = Query(default=False)):
+    rows = []
+    for sym in PAIRS:
+        tier = get_pair_tier(sym)
+        if force:
+            rows.append(get_live_spread(binance, sym, tier, force=True))
+        else:
+            cached = get_spread_cache_snapshot().get(sym)
+            rows.append(cached if cached else get_live_spread(binance, sym, tier, force=False))
+    return {
+        "count": len(rows),
+        "rows": rows,
+        "thresholds": {
+            "TOP": SPREAD_THRESHOLD_TOP,
+            "MID": SPREAD_THRESHOLD_MID,
+            "warn_multiplier": SPREAD_WARN_MULTIPLIER,
+            "cache_ttl": SPREAD_CACHE_TTL,
+        }
+    }
+
+
+@app.get("/debug/spread/{symbol}")
+def debug_spread_symbol(symbol: str, force: bool = Query(default=True)):
+    sym = str(symbol or "").upper()
+    tier = get_pair_tier(sym)
+    return get_live_spread(binance, sym, tier, force=force)
+
+
 @app.get("/debug/decision-board")
 def debug_decision_board():
     candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
@@ -3520,6 +3777,20 @@ def debug_decision_board():
         },
 
         "final_execution": build_final_execution_summary(candidate_rows, live_rows),
+
+        "circuit_breaker": {
+            "active": circuit_breaker_active(),
+            "remaining": round(circuit_breaker_remaining(), 2),
+            "consecutive_errors": CONSECUTIVE_ERRORS,
+            "threshold": CIRCUIT_BREAKER_THRESHOLD,
+            "pause": CIRCUIT_BREAKER_PAUSE,
+        },
+
+        "spread": {
+            "threshold_top": SPREAD_THRESHOLD_TOP,
+            "threshold_mid": SPREAD_THRESHOLD_MID,
+            "cache_ttl": SPREAD_CACHE_TTL,
+        },
 
         "analytics": {
             "total_trades": len(trade_history),
@@ -3722,8 +3993,44 @@ def kill_switch(payload: dict = Body(...)):
     return {"kill_switch": KILL_SWITCH}
 
 @app.get("/ai-memory")
-def get_ai_memory():
-    return ai_memory
+def get_ai_memory(active_only: bool = Query(default=False), include_meta: bool = Query(default=False)):
+    active_symbols = set(PAIRS)
+
+    if active_only:
+        data = {sym: ai_memory.get(sym) for sym in PAIRS if sym in ai_memory}
+    else:
+        data = ai_memory
+
+    if not include_meta:
+        return data
+
+    stale_symbols = sorted([sym for sym in ai_memory.keys() if sym not in active_symbols])
+    return {
+        "data": data,
+        "active_symbols": PAIRS,
+        "stale_symbols": stale_symbols,
+        "stale_count": len(stale_symbols),
+    }
+
+
+@app.get("/debug/cooldowns")
+def debug_cooldowns():
+    now = time.time()
+    rows = []
+    for sym, ts in sorted(SYMBOL_COOLDOWN.items()):
+        left = max(0, int(COOLDOWN_SECONDS - (now - float(ts))))
+        rows.append({
+            "symbol": sym,
+            "left_seconds": left,
+            "started_at": float(ts),
+            "active": left > 0,
+        })
+    return {
+        "scope": "per_symbol",
+        "cooldown_seconds": COOLDOWN_SECONDS,
+        "count": len(rows),
+        "rows": rows,
+    }
 
 # ⭐ NEW: signal receiver endpoint
 @app.post("/signal")
@@ -3841,6 +4148,21 @@ def smart_trailing():
             else:
                 time.sleep(TRAILING_LOOP_INTERVAL)
 
+LAST_SCAN_BY_TIER = {"TOP": 0.0, "MID": 0.0}
+
+
+def get_due_scan_pairs():
+    now = time.time()
+    due = []
+    if now - LAST_SCAN_BY_TIER.get("TOP", 0.0) >= SCAN_INTERVAL_TOP:
+        due.extend([p for p in TOP_PAIRS if p in PAIRS])
+        LAST_SCAN_BY_TIER["TOP"] = now
+    if now - LAST_SCAN_BY_TIER.get("MID", 0.0) >= SCAN_INTERVAL_MID:
+        due.extend([p for p in MID_PAIRS if p in PAIRS])
+        LAST_SCAN_BY_TIER["MID"] = now
+    return list(dict.fromkeys(due))
+
+
 def apply_news_bias(signal_type, news_reverse):
     if news_reverse:
         return "SELL" if signal_type == "BUY" else "BUY"
@@ -3853,17 +4175,28 @@ def auto_trader():
             check_telegram_commands()
 
             if KILL_SWITCH:
+                set_final_execution("KILL_SWITCH_ON", reason="KILL_SWITCH_TRUE", stage="safety_gate")
                 print("🛑 KILL SWITCH ACTIVE")
                 time.sleep(5)
                 continue
 
             if not AUTO_MODE:
+                set_final_execution("AUTO_MODE_OFF", reason="AUTO_MODE_FALSE", stage="mode_gate")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
             if not AUTO_TRADING:
+                set_final_execution("AUTO_TRADING_OFF", reason="AUTO_TRADING_FALSE", stage="mode_gate")
                 print("⏸️ AUTO TRADING DISABLED")
                 time.sleep(SCAN_INTERVAL)
+                continue
+
+            if circuit_breaker_active():
+                remaining = circuit_breaker_remaining()
+                detail = {"remaining": round(remaining, 2), "consecutive_errors": CONSECUTIVE_ERRORS}
+                add_execution_decision("circuit_breaker", "_SYSTEM_", "BLOCK", detail)
+                set_final_execution("CIRCUIT_BREAKER_PAUSED", reason=f"CIRCUIT_BREAKER_{int(remaining)}s", stage="circuit_breaker", detail=detail)
+                time.sleep(min(remaining, 5) or 1)
                 continue
 
             ws_auto_heal()
@@ -3880,13 +4213,16 @@ def auto_trader():
                     "detail": ws_gate,
                 }]
                 add_execution_decision("ws_gate", "_SYSTEM_", "BLOCK", ws_gate)
+                set_final_execution("BLOCKED", reason="WS_DATA_NOT_HEALTHY", stage="ws_gate", detail=ws_gate)
                 print(f"⏸️ Skip trade: WS data not healthy ({ws_gate['reason']})")
                 time.sleep(5)
                 continue
             if not safety_check():
+                set_final_execution("BLOCKED", reason="SAFETY_CHECK_FAILED", stage="safety_gate")
                 time.sleep(10)
                 continue
             if daily_loss >= MAX_DAILY_LOSS:
+                set_final_execution("BLOCKED", reason="DAILY_LOSS_LIMIT", stage="risk_gate", detail={"daily_loss": daily_loss, "max_daily_loss": MAX_DAILY_LOSS})
                 print("🚫 Skip trade: daily loss limit")
                 time.sleep(SCAN_INTERVAL)
                 continue
@@ -3915,6 +4251,7 @@ def auto_trader():
 
             if news_impact == "HIGH":
                 if active_news_block():
+                    set_final_execution("BLOCKED", reason="HIGH_IMPACT_NEWS", stage="news_gate", detail={"news_impact": news_impact})
                     print("📰 HIGH IMPACT NEWS → BLOCK")
                     time.sleep(SCAN_INTERVAL)
                     continue
@@ -3924,17 +4261,20 @@ def auto_trader():
                     print("📰 HIGH IMPACT NEWS → score penalty only")
 
             if vol < active_vol_min():
+                set_final_execution("IDLE", reason="LOW_VOLATILITY", stage="market_gate", detail={"vol": round(vol, 6), "min_vol": active_vol_min()})
                 print(f"⏸️ Skip: low volatility ({vol:.4f})")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
             if vol > active_vol_max():
+                set_final_execution("IDLE", reason="HIGH_VOLATILITY", stage="market_gate", detail={"vol": round(vol, 6), "max_vol": active_vol_max()})
                 print(f"⚠️ Skip: high volatility ({vol:.4f})")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
             session = get_session_utc()
             if not session_allowed(session):
+                set_final_execution("IDLE", reason="OFF_SESSION", stage="session_gate", detail={"session": session})
                 print(f"⏸️ Skip: off session ({session})")
                 time.sleep(SCAN_INTERVAL)
                 continue
@@ -3944,9 +4284,19 @@ def auto_trader():
             selected_rows_live = []
             skip_reasons_live = []
 
-            pairs = PAIRS.copy()
+            pairs = get_due_scan_pairs()
+            if not pairs:
+                set_final_execution("IDLE", reason="WAITING_FOR_TIER_SCAN_INTERVAL", stage="scan_scheduler", detail={
+                    "scan_interval_top": SCAN_INTERVAL_TOP,
+                    "scan_interval_mid": SCAN_INTERVAL_MID,
+                    "last_top_scan_age": round(time.time() - LAST_SCAN_BY_TIER.get("TOP", 0.0), 2) if LAST_SCAN_BY_TIER.get("TOP") else None,
+                    "last_mid_scan_age": round(time.time() - LAST_SCAN_BY_TIER.get("MID", 0.0), 2) if LAST_SCAN_BY_TIER.get("MID") else None,
+                })
+                time.sleep(1)
+                continue
 
-            pairs = PAIRS.copy()
+            mark_scan_cycle("SCANNING", "SCAN_CYCLE_STARTED", pairs=pairs, detail={"pairs": pairs})
+
             scores_map = {}
             candidate_map = {"TOP": [], "MID": [], "LOW": []}
 
@@ -3967,11 +4317,10 @@ def auto_trader():
 
                     ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
                     
-                    live = get_live_candle(symbol)
-                    if live and get_live_age(symbol) < 10:
-                        last_price = live["close"]
-                    else:
-                        last_price = float(ohlcv[-1][4])
+                    last_price, price_source = get_live_or_fallback_price(symbol, ohlcv[-1])
+                    if last_price <= 0:
+                        add_skip_reason(symbol, "PRICE_UNAVAILABLE")
+                        continue
 
                     # === STRUCTURE LOGIC V2 ===
                     highs = [float(c[2]) for c in ohlcv]
@@ -4127,6 +4476,11 @@ def auto_trader():
                 except Exception as e:
                     print(f"Scoring error {symbol}: {e}")
 
+            if not candidate_list_live:
+                set_idle_after_scan("NO_CANDIDATE_AFTER_SCAN", pairs=pairs, detail={
+                    "skip_summary": summarize_skip_reasons(skip_reasons_live),
+                })
+
             # --- Eksekusi trade dengan decision engine ---
             selected_symbols = set()
             candidate_symbols = set()
@@ -4161,6 +4515,17 @@ def auto_trader():
                 reverse=True,
             )
 
+            if candidate_list_live and not selected_rows_live:
+                set_idle_after_scan("NO_SELECTED_AFTER_TIER_LIMITS", pairs=pairs, detail={
+                    "candidate_count": len(candidate_list_live),
+                    "tier_limits": tier_limits(),
+                })
+            elif selected_rows_live:
+                set_final_execution("CANDIDATE_WAITING", symbol=selected_rows_live[0].get("symbol"), side=selected_rows_live[0].get("type"), reason="SELECTED_FOR_EXECUTION_CHECKS", stage="shortlist", detail={
+                    "selected_count": len(selected_rows_live),
+                    "top_selected": selected_rows_live[0],
+                })
+
             if VALIDATION_MODE:
                 print("🎯 SELECTED SYMBOLS:", selected_symbols_live)
 
@@ -4171,6 +4536,8 @@ def auto_trader():
                     "tier": get_pair_tier(sym),
                 })
             
+            order_attempted_this_cycle = False
+
             for symbol in pairs:
                 try:
                     if symbol not in selected_symbols:
@@ -4194,11 +4561,10 @@ def auto_trader():
 
                     ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
                     
-                    live = get_live_candle(symbol)
-                    if live and get_live_age(symbol) < 10:
-                        last_price = live["close"]
-                    else:
-                        last_price = float(ohlcv[-1][4])
+                    last_price, price_source = get_live_or_fallback_price(symbol, ohlcv[-1])
+                    if last_price <= 0:
+                        add_skip_reason(symbol, "PRICE_UNAVAILABLE")
+                        continue
 
                     # === STRUCTURE LOGIC V2 ===
                     highs = [float(c[2]) for c in ohlcv]
@@ -4420,6 +4786,7 @@ def auto_trader():
                         "sweep_low": sweep_low,
                     })
 
+                    order_attempted_this_cycle = True
                     add_execution_decision("order_attempt", symbol, "PASS", {
                         "side": signal["type"],
                         "score": round(float(signal["score"]), 2),
@@ -4467,7 +4834,17 @@ Score: {signal['score']:.1f} | Weight: {w:.2f}
                 except Exception as e:
                     print("Pair error:", symbol, e)
 
+            if selected_rows_live and not order_attempted_this_cycle and LAST_FINAL_EXECUTION.get("status") == "CANDIDATE_WAITING":
+                set_final_execution("BLOCKED", symbol=selected_rows_live[0].get("symbol"), side=selected_rows_live[0].get("type"), reason="SELECTED_BLOCKED_AFTER_EXEC_CHECKS", stage="scan_cycle_done", detail={
+                    "selected_count": len(selected_rows_live),
+                    "recent_decisions": EXECUTION_DECISIONS[-5:],
+                    "skip_summary": summarize_skip_reasons(skip_reasons_live),
+                })
+            elif not selected_rows_live and candidate_list_live:
+                set_idle_after_scan("NO_SELECTED_AFTER_TIER_LIMITS", pairs=pairs, detail={"candidate_count": len(candidate_list_live)})
+
         except Exception as e:
+            set_final_execution("ERROR", reason="AUTO_LOOP_ERROR", stage="auto_loop", detail={"error": str(e)})
             print("AUTO LOOP ERROR:", e)
 
         time.sleep(SCAN_INTERVAL)
@@ -4497,6 +4874,7 @@ def start_background_tasks():
     clamp_runtime_state()
 
     if MONTRA_MODE == "api_only":
+        set_final_execution("API_ONLY", reason="MONTRA_MODE_API_ONLY", stage="startup")
         print("⚠️ API ONLY mode → no WS, no bot, no trader")
         return
 
@@ -4518,6 +4896,7 @@ def start_background_tasks():
         print("recover open positions error:", e)
 
     if not AUTO_MODE:
+        set_final_execution("AUTO_MODE_OFF", reason="AUTO_MODE_FALSE", stage="startup")
         print("⚠️ AUTO_MODE OFF → WS on, trader not started")
         return
 

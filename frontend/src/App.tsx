@@ -144,6 +144,8 @@ type DecisionBoard = {
     rows: ExecutionDecisionRow[];
   };
   final_execution?: ExecutionSummary;
+  circuit_breaker?: { active: boolean; remaining: number; consecutive_errors: number; threshold: number; pause: number };
+  spread?: { threshold_top: number; threshold_mid: number; cache_ttl: number };
   analytics: {
     total_trades: number;
     open_snapshots: number;
@@ -457,7 +459,7 @@ export default function App() {
           axios.get(`${API_URL}/health/pairs`),
           axios.get(`${API_URL}/debug/decision-board`),
           axios.get(`${API_URL}/positions`),
-          axios.get(`${API_URL}/ai-memory`),
+          axios.get(`${API_URL}/ai-memory?active_only=true`),
         ]);
 
         if (cancelled) return;
@@ -471,7 +473,8 @@ export default function App() {
         setPairHealth(nextPairs);
         setDecisionBoard(nextBoard);
         setPositions(nextPositions);
-        setAiMemory(memoryRes.data || {});
+        const memoryPayload = memoryRes.data?.data || memoryRes.data || {};
+        setAiMemory(memoryPayload);
         setApiError("");
 
         const backendSignal = nextBoard.selected?.rows?.[0] || nextBoard.candidates?.rows?.[0] || null;
@@ -542,11 +545,13 @@ export default function App() {
   const activeSignal = inspectedSignal || selectedSignal || livePositionSignal || topCandidate || null;
 
   const sortedAiMemory = useMemo(() => {
+    const activeSymbols = new Set(pairHealth?.scan_pairs || []);
     return Object.entries(aiMemory)
+      .filter(([symbol]) => activeSymbols.size === 0 || activeSymbols.has(symbol))
       .map(([symbol, value]: [string, any]) => ({ symbol, score: Number(value?.score ?? value ?? 0) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 10);
-  }, [aiMemory]);
+  }, [aiMemory, pairHealth]);
 
   const symbolOptions = useMemo(() => {
     const set = new Set<string>();
@@ -649,7 +654,7 @@ export default function App() {
               </div>
             </Section>
 
-            <Section title="AI memory top 10">
+            <Section title="AI memory active top 10">
               <div style={{ display: "grid", gap: 8 }}>
                 {sortedAiMemory.length === 0 ? (
                   <div style={{ color: "#6f819f", fontSize: 12 }}>Belum ada data AI memory.</div>
@@ -724,6 +729,9 @@ export default function App() {
                   <KeyValue label="Open snapshots" value={decisionBoard?.analytics?.open_snapshots ?? 0} />
                   <KeyValue label="Locked symbols" value={decisionBoard?.locks?.symbol_lock_count ?? 0} />
                   <KeyValue label="WS restart count" value={decisionBoard?.ws?.restart_count ?? 0} />
+                  <KeyValue label="Circuit breaker" value={decisionBoard?.circuit_breaker?.active ? `PAUSE ${formatNum(decisionBoard?.circuit_breaker?.remaining, 0)}s` : "OK"} accent={decisionBoard?.circuit_breaker?.active ? "#ff7272" : "#00ffaa"} />
+                  <KeyValue label="Errors" value={`${decisionBoard?.circuit_breaker?.consecutive_errors ?? 0} / ${decisionBoard?.circuit_breaker?.threshold ?? "-"}`} />
+                  <KeyValue label="Spread TOP/MID" value={`${formatNum(decisionBoard?.spread?.threshold_top ? Number(decisionBoard.spread.threshold_top) * 100 : undefined, 3)}% / ${formatNum(decisionBoard?.spread?.threshold_mid ? Number(decisionBoard.spread.threshold_mid) * 100 : undefined, 3)}%`} />
                 </div>
               </div>
             </Section>
@@ -786,6 +794,17 @@ export default function App() {
             </Section>
 
             <ExecutionSummarySection summary={finalExecution} />
+
+            <Section title="Spread gate monitor">
+              <div style={{ display: "grid", gap: 8 }}>
+                <KeyValue label="TOP threshold" value={`${formatNum(decisionBoard?.spread?.threshold_top ? Number(decisionBoard.spread.threshold_top) * 100 : undefined, 3)}%`} />
+                <KeyValue label="MID threshold" value={`${formatNum(decisionBoard?.spread?.threshold_mid ? Number(decisionBoard.spread.threshold_mid) * 100 : undefined, 3)}%`} />
+                <KeyValue label="Cache TTL" value={`${formatNum(decisionBoard?.spread?.cache_ttl, 0)}s`} />
+                <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45 }}>
+                  Live spread detail: <code>/debug/spread/{chartSymbol}</code>. Orderbook spread hanya dipanggil di pre-entry gate atau endpoint debug ini.
+                </div>
+              </div>
+            </Section>
 
             <Section title="Execution decisions">
               <div style={{ display: "grid", gap: 8, maxHeight: 240, overflowY: "auto", paddingRight: 4 }}>
