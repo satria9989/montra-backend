@@ -65,6 +65,22 @@ type ExecutionDecisionRow = {
   detail?: Record<string, any>;
 };
 
+type ExecutionSummary = {
+  status: string;
+  reason?: string;
+  symbol?: string | null;
+  side?: "BUY" | "SELL" | string | null;
+  source?: string;
+  candidate?: boolean;
+  live_position?: boolean;
+  protection?: string;
+  last_stage?: string | null;
+  last_status?: string | null;
+  last_detail?: Record<string, any>;
+  recent_decisions?: ExecutionDecisionRow[];
+  updated_at?: string;
+};
+
 type DecisionBoard = {
   mode: string;
   validation_mode: boolean;
@@ -74,8 +90,14 @@ type DecisionBoard = {
   ws: {
     running: boolean;
     thread_alive: boolean;
+    app_alive?: boolean;
     restart_count: number;
     last_error: string | null;
+    message_count?: number;
+    last_message_age?: number;
+    last_stream?: string | null;
+    last_event?: string | null;
+    subscribed_count?: number;
     sample_age: Record<string, number>;
     healthy?: boolean;
     degraded?: boolean;
@@ -121,6 +143,7 @@ type DecisionBoard = {
     count: number;
     rows: ExecutionDecisionRow[];
   };
+  final_execution?: ExecutionSummary;
   analytics: {
     total_trades: number;
     open_snapshots: number;
@@ -322,6 +345,43 @@ function SignalCard({
   );
 }
 
+function shortDetail(detail?: Record<string, any>) {
+  if (!detail || Object.keys(detail).length === 0) return "-";
+  const text = JSON.stringify(detail);
+  return text.length > 140 ? `${text.slice(0, 140)}...` : text;
+}
+
+function ExecutionSummarySection({ summary }: { summary?: ExecutionSummary | null }) {
+  if (!summary) {
+    return (
+      <Section title="Execution summary">
+        <div style={{ color: "#6f819f", fontSize: 12 }}>Belum ada ringkasan eksekusi.</div>
+      </Section>
+    );
+  }
+
+  const isGood = ["LIVE_PROTECTED", "ORDER_OK_PROTECTED"].includes(summary.status);
+  const isWarn = ["CANDIDATE_WAITING", "ORDER_SENT_WAITING_POSITION", "CANDIDATE_AUTO_TRADING_OFF", "AUTO_MODE_OFF"].includes(summary.status);
+  const accent = isGood ? "#00ffaa" : isWarn ? "#ffb000" : "#ff7272";
+
+  return (
+    <Section title="Execution summary">
+      <div style={{ display: "grid", gap: 8 }}>
+        <KeyValue label="Status" value={summary.status || "-"} accent={accent} />
+        <KeyValue label="Symbol" value={summary.symbol || "-"} />
+        <KeyValue label="Side" value={summary.side || "-"} accent={summary.side === "BUY" ? "#00ffaa" : summary.side === "SELL" ? "#ff7272" : undefined} />
+        <KeyValue label="Reason" value={summary.reason || "-"} accent={accent} />
+        <KeyValue label="Protection" value={summary.protection || "-"} accent={summary.protection === "RESOLVED" ? "#00ffaa" : summary.protection === "PENDING" ? "#ffb000" : undefined} />
+        <KeyValue label="Last stage" value={summary.last_stage || "-"} />
+        <KeyValue label="Last status" value={summary.last_status || "-"} accent={summary.last_status === "PASS" || summary.last_status === "OK" ? "#00ffaa" : summary.last_status === "BLOCK" ? "#ffb000" : undefined} />
+        <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45, wordBreak: "break-word" }}>
+          Detail: {shortDetail(summary.last_detail)}
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 function LivePositionsSection({
   positions,
   activeSignal,
@@ -500,11 +560,14 @@ export default function App() {
   const chartSymbol = activeSignal?.symbol || manualSymbol;
   const wsHealthy = Boolean(
     decisionBoard?.ws?.healthy === true &&
-    decisionBoard?.ws?.block !== true &&
-    decisionBoard?.ws?.running &&
-    decisionBoard?.ws?.thread_alive &&
-    !decisionBoard?.ws?.last_error
+    decisionBoard?.ws?.block === false &&
+    decisionBoard?.ws?.reason === "OK"
   );
+  const maxSampleAge = Math.max(
+    0,
+    ...Object.values(decisionBoard?.ws?.sample_age || {}).map((v) => Number(v) || 0)
+  );
+  const finalExecution = decisionBoard?.final_execution || null;
   const scanUniverse = pairHealth?.scan_pairs?.length || 0;
 
   return (
@@ -541,6 +604,11 @@ export default function App() {
               <KeyValue label="Accounts" value={healthReady?.accounts ?? "-"} />
               <KeyValue label="Universe scan" value={scanUniverse} />
               <KeyValue label="TOP / MID / LOW" value={`${pairHealth?.top_pairs?.length || 0} / ${pairHealth?.mid_pairs?.length || 0} / ${pairHealth?.low_pairs?.length || 0}`} />
+              <KeyValue label="WS reason" value={decisionBoard?.ws?.reason || "-"} accent={wsHealthy ? "#00ffaa" : "#ffb000"} />
+              <KeyValue label="WS msg age" value={`${formatNum(decisionBoard?.ws?.last_message_age, 2)}s`} accent={wsHealthy ? "#00ffaa" : "#ffb000"} />
+              <KeyValue label="WS max age" value={`${formatNum(maxSampleAge, 2)}s`} accent={maxSampleAge < 20 ? "#00ffaa" : "#ffb000"} />
+              <KeyValue label="WS messages" value={formatNum(decisionBoard?.ws?.message_count, 0)} />
+              <KeyValue label="WS restarts" value={decisionBoard?.ws?.restart_count ?? "-"} />
             </Section>
 
             <SignalCard
@@ -716,6 +784,8 @@ export default function App() {
                 )}
               </div>
             </Section>
+
+            <ExecutionSummarySection summary={finalExecution} />
 
             <Section title="Execution decisions">
               <div style={{ display: "grid", gap: 8, maxHeight: 240, overflowY: "auto", paddingRight: 4 }}>

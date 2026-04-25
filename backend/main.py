@@ -86,6 +86,16 @@ LIVE_REQUIRE_SWEEP = os.getenv("LIVE_REQUIRE_SWEEP", "true").lower() == "true"
 LIVE_REQUIRE_PAIR_REGIME_MATCH = os.getenv("LIVE_REQUIRE_PAIR_REGIME_MATCH", "true").lower() == "true"
 LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY", "false").lower() == "true"
 
+# ===== EXECUTION QUALITY / ORDER HARDENING =====
+# Guardrail live agar RR tidak "valid di angka" tetapi terlalu mepet untuk fee/spread/wick.
+MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0015"))  # 0.15%
+MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0030"))      # 0.30%
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.0008"))                # 0.08%; aktif jika signal membawa spread_pct
+FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))                    # haircut RR untuk fee/slippage/noise
+STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
+ORDER_ID_PREFIX = (os.getenv("ORDER_ID_PREFIX", "M") or "M").strip()[:8]
+SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.12"))
+
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
 STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
@@ -239,6 +249,9 @@ ACCOUNTS_CACHE_LOCK = threading.Lock()
 MARKET_KLINES_CACHE = {}
 MARKET_KLINES_CACHE_LOCK = threading.Lock()
 LAST_WS_GOOD_TS = 0.0
+
+SIGNED_CALL_LOCK = threading.Lock()
+LAST_SIGNED_CALL_TS = 0.0
 
 
 def is_rate_limit_error(exc):
@@ -496,6 +509,7 @@ def sync_binance_time(client_obj, label=None, force=False):
         return False
 
 def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_time_error=True, **kwargs):
+    global LAST_SIGNED_CALL_TS
     if client_obj is None:
         raise RuntimeError("binance client not ready")
 
@@ -515,6 +529,13 @@ def signed_call(client_obj, fn, *args, label=None, recv_window=None, retry_on_ti
 
     for attempt in range(1, total_attempts + 1):
         try:
+            if SIGNED_CALL_MIN_INTERVAL > 0:
+                with SIGNED_CALL_LOCK:
+                    elapsed = time.time() - LAST_SIGNED_CALL_TS
+                    if elapsed < SIGNED_CALL_MIN_INTERVAL:
+                        time.sleep(SIGNED_CALL_MIN_INTERVAL - elapsed)
+                    LAST_SIGNED_CALL_TS = time.time()
+                    return fn(*args, **kwargs)
             return fn(*args, **kwargs)
         except Exception as e:
             last_error = e
@@ -593,6 +614,15 @@ skip_reasons_live = []
 MAX_SKIP_REASONS = 300
 EXECUTION_DECISIONS = []
 MAX_EXECUTION_DECISIONS = 500
+LAST_FINAL_EXECUTION = {
+    "status": "IDLE",
+    "symbol": None,
+    "side": None,
+    "reason": "BOOT",
+    "time": None,
+    "stage": None,
+    "detail": {},
+}
 
 # ===== AI MEMORY & FIREBASE =====
 
@@ -1097,6 +1127,108 @@ def add_execution_decision(stage, symbol, status, detail=None):
     if len(EXECUTION_DECISIONS) > MAX_EXECUTION_DECISIONS:
         EXECUTION_DECISIONS = EXECUTION_DECISIONS[-MAX_EXECUTION_DECISIONS:]
 
+def set_final_execution(status, symbol=None, side=None, reason=None, stage=None, detail=None):
+    global LAST_FINAL_EXECUTION
+    LAST_FINAL_EXECUTION = {
+        "status": status,
+        "symbol": symbol,
+        "side": side,
+        "reason": reason,
+        "stage": stage,
+        "detail": detail or {},
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def build_final_execution_summary(candidate_rows=None, live_rows=None):
+    candidate_rows = candidate_rows or []
+    live_rows = live_rows or []
+
+    primary = None
+    source = "none"
+    if live_rows:
+        primary = live_rows[0]
+        source = "live_position"
+    elif selected_rows_live:
+        primary = selected_rows_live[0]
+        source = "selected"
+    elif candidate_rows:
+        primary = candidate_rows[0]
+        source = "candidate"
+
+    last_decision = EXECUTION_DECISIONS[-1] if EXECUTION_DECISIONS else None
+    symbol = None
+    side = None
+
+    if primary:
+        symbol = primary.get("symbol")
+        side = primary.get("type")
+    elif last_decision:
+        symbol = last_decision.get("symbol")
+    elif LAST_FINAL_EXECUTION.get("symbol"):
+        symbol = LAST_FINAL_EXECUTION.get("symbol")
+        side = LAST_FINAL_EXECUTION.get("side")
+
+    recent = []
+    if symbol:
+        recent = [r for r in EXECUTION_DECISIONS if r.get("symbol") == symbol][-8:]
+    elif EXECUTION_DECISIONS:
+        recent = EXECUTION_DECISIONS[-8:]
+
+    last_for_symbol = recent[-1] if recent else last_decision
+    live = next((row for row in live_rows if row.get("symbol") == symbol), None) if symbol else None
+
+    if live:
+        if live.get("protective_resolved"):
+            status = "LIVE_PROTECTED"
+            reason = "SL_TP_RESOLVED"
+            protection = "RESOLVED"
+        else:
+            status = "LIVE_UNPROTECTED"
+            reason = "SL_TP_PENDING"
+            protection = "PENDING"
+    elif not AUTO_TRADING and primary:
+        status = "CANDIDATE_AUTO_TRADING_OFF"
+        reason = "AUTO_TRADING_FALSE"
+        protection = "NONE"
+    elif not AUTO_MODE:
+        status = "AUTO_MODE_OFF"
+        reason = "AUTO_MODE_FALSE"
+        protection = "NONE"
+    elif last_for_symbol and last_for_symbol.get("status") == "BLOCK":
+        status = "BLOCKED"
+        reason = last_for_symbol.get("stage")
+        protection = "NONE"
+    elif last_for_symbol and last_for_symbol.get("stage") == "order_result" and last_for_symbol.get("status") == "PASS":
+        status = "ORDER_SENT_WAITING_POSITION"
+        reason = "ORDER_RESULT_PASS_NO_LIVE_POSITION_YET"
+        protection = "VERIFYING"
+    elif primary:
+        status = "CANDIDATE_WAITING"
+        reason = "NO_FINAL_ORDER_DECISION_YET"
+        protection = "NONE"
+    else:
+        status = LAST_FINAL_EXECUTION.get("status", "IDLE")
+        reason = LAST_FINAL_EXECUTION.get("reason", "NO_SIGNAL")
+        protection = "NONE"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "symbol": symbol,
+        "side": side,
+        "source": source,
+        "candidate": bool(primary and source in ("candidate", "selected")),
+        "live_position": bool(live),
+        "protection": protection,
+        "last_stage": last_for_symbol.get("stage") if last_for_symbol else LAST_FINAL_EXECUTION.get("stage"),
+        "last_status": last_for_symbol.get("status") if last_for_symbol else LAST_FINAL_EXECUTION.get("status"),
+        "last_detail": last_for_symbol.get("detail") if last_for_symbol else LAST_FINAL_EXECUTION.get("detail", {}),
+        "recent_decisions": recent[-5:],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 ai_memory = {}  # simpan skor tiap simbol
 trade_history = []  # journal semua trade
 TRADE_SNAPSHOTS = {}
@@ -1297,6 +1429,298 @@ def get_min_trade_notional(symbol):
         return LOW_MIN_TRADE_NOTIONAL
     return DEFAULT_MIN_TRADE_NOTIONAL
 
+def _safe_float(value, default=0.0):
+    try:
+        num = float(value)
+        if num == num and abs(num) != float("inf"):
+            return num
+    except Exception:
+        pass
+    return default
+
+
+def build_order_client_id(symbol, side, purpose):
+    prefix = ORDER_ID_PREFIX or "M"
+    clean_symbol = str(symbol or "NA").upper().replace("/", "")[:12]
+    side_code = "B" if str(side).upper() == "BUY" else "S"
+    purpose_code = str(purpose or "O").upper()[:3]
+    millis = int(time.time() * 1000) % 10_000_000_000
+    return f"{prefix}_{clean_symbol}_{side_code}_{purpose_code}_{millis}"[:36]
+
+
+def evaluate_signal_execution_quality(signal, reference_price=None):
+    symbol = signal.get("symbol")
+    side = str(signal.get("type") or "").upper()
+    entry = _safe_float(signal.get("entry"), 0.0)
+    if entry <= 0 and reference_price:
+        entry = _safe_float(reference_price, 0.0)
+    sl = _safe_float(signal.get("sl"), 0.0)
+    tp = _safe_float(signal.get("tp"), 0.0)
+
+    detail = {
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
+        "min_tp_distance_pct": MIN_TP_DISTANCE_PCT,
+        "fee_buffer_rr": FEE_BUFFER_RR,
+    }
+
+    if not symbol or side not in ("BUY", "SELL") or entry <= 0 or sl <= 0 or tp <= 0:
+        detail["reason"] = "missing_symbol_side_or_prices"
+        return False, "INVALID_EXECUTION_PRICES", detail
+
+    if side == "BUY":
+        if not (sl < entry < tp):
+            detail["reason"] = "buy_direction_invalid"
+            return False, "INVALID_BUY_PRICE_ORDER", detail
+    else:
+        if not (tp < entry < sl):
+            detail["reason"] = "sell_direction_invalid"
+            return False, "INVALID_SELL_PRICE_ORDER", detail
+
+    stop_pct = abs(entry - sl) / max(entry, 1e-12)
+    tp_pct = abs(tp - entry) / max(entry, 1e-12)
+    raw_rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
+    effective_rr = raw_rr - FEE_BUFFER_RR
+
+    spread_pct = signal.get("spread_pct")
+    if spread_pct is not None:
+        spread_pct = _safe_float(spread_pct, 0.0)
+    detail.update({
+        "stop_distance_pct": round(stop_pct, 6),
+        "tp_distance_pct": round(tp_pct, 6),
+        "raw_rr": round(raw_rr, 4),
+        "effective_rr": round(effective_rr, 4),
+        "spread_pct": spread_pct,
+        "max_spread_pct": MAX_SPREAD_PCT,
+    })
+
+    if stop_pct < MIN_STOP_DISTANCE_PCT:
+        return False, "STOP_DISTANCE_TOO_TIGHT", detail
+
+    if tp_pct < MIN_TP_DISTANCE_PCT:
+        return False, "TP_DISTANCE_TOO_TIGHT", detail
+
+    if effective_rr < active_rr_min():
+        return False, "EFFECTIVE_RR_TOO_LOW", detail
+
+    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+        return False, "SPREAD_TOO_WIDE", detail
+
+    return True, "OK", detail
+
+
+def cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True):
+    if client_obj is None:
+        return False
+    try:
+        orders = signed_call(client_obj, client_obj.futures_get_open_orders, symbol=symbol, label=label)
+        for o in orders or []:
+            otype = o.get("type")
+            should_cancel = (cancel_sl and otype == "STOP_MARKET") or (cancel_tp and otype == "TAKE_PROFIT_MARKET")
+            if not should_cancel:
+                continue
+            try:
+                signed_call(client_obj, client_obj.futures_cancel_order, symbol=symbol, orderId=o["orderId"], label=label)
+            except Exception as exc:
+                print(f"Cancel protective order error {label} {symbol}:", exc)
+        if client_obj is binance:
+            invalidate_main_open_orders_cache()
+        return True
+    except Exception as exc:
+        print(f"Cancel protective orders error {label} {symbol}:", exc)
+        return False
+
+
+def verify_protective_orders_for_client(client_obj, label, symbol):
+    try:
+        orders = signed_call(client_obj, client_obj.futures_get_open_orders, symbol=symbol, label=label)
+        exits = build_exit_lookup(orders).get(symbol, {})
+        sl_ok = _safe_float(exits.get("sl"), 0.0) > 0
+        tp_ok = _safe_float(exits.get("tp"), 0.0) > 0
+        return {
+            "ok": bool(sl_ok and tp_ok),
+            "sl_resolved": bool(sl_ok),
+            "tp_resolved": bool(tp_ok),
+            "sl": exits.get("sl"),
+            "tp": exits.get("tp"),
+        }
+    except Exception as exc:
+        return {"ok": False, "sl_resolved": False, "tp_resolved": False, "error": str(exc)}
+
+
+def emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_failed"):
+    try:
+        close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+        close_qty = floor_to_step(abs(float(qty)), EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+        if close_qty <= 0:
+            return {"status": "rejected", "reason": "close_qty_zero"}
+        order = signed_call(
+            client_obj,
+            client_obj.futures_create_order,
+            label=label,
+            symbol=symbol,
+            side=close_side,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=close_qty,
+            reduceOnly=True,
+            newClientOrderId=build_order_client_id(symbol, side, "CLS"),
+        )
+        add_order_audit("EMERGENCY_CLOSE_SENT", symbol, {"account": label, "qty": close_qty, "reason": reason})
+        return {"status": "OK", "order": order}
+    except Exception as exc:
+        add_order_audit("EMERGENCY_CLOSE_ERROR", symbol, {"account": label, "error": str(exc), "reason": reason})
+        return {"status": "error", "error": str(exc)}
+
+
+def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
+    if client_obj is None:
+        return {"account": label, "error": "binance client not ready"}
+
+    symbol = str(symbol or "").upper().strip()
+    side = str(side or "").upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"account": label, "error": "invalid_side"}
+
+    qty = abs(float(qty or 0))
+    if qty <= 0:
+        return {"account": label, "error": "qty_zero"}
+
+    sl_price = normalize_price(symbol, float(sl))
+    tp_price = normalize_price(symbol, float(tp))
+    close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+
+    if not cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True):
+        return {"account": label, "error": "cancel_protective_failed"}
+
+    entry_order = None
+    sl_order = None
+    tp_order = None
+    try:
+        entry_order = signed_call(
+            client_obj,
+            client_obj.futures_create_order,
+            label=label,
+            symbol=symbol,
+            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=qty,
+            newClientOrderId=build_order_client_id(symbol, side, "ENT"),
+        )
+
+        time.sleep(0.25)
+
+        sl_order = signed_call(
+            client_obj,
+            client_obj.futures_create_order,
+            label=label,
+            symbol=symbol,
+            side=close_side,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=sl_price,
+            closePosition=True,
+            workingType="MARK_PRICE",
+            newClientOrderId=build_order_client_id(symbol, side, "SL"),
+        )
+
+        tp_order = signed_call(
+            client_obj,
+            client_obj.futures_create_order,
+            label=label,
+            symbol=symbol,
+            side=close_side,
+            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=tp_price,
+            closePosition=True,
+            workingType="MARK_PRICE",
+            newClientOrderId=build_order_client_id(symbol, side, "TP"),
+        )
+
+        verify = verify_protective_orders_for_client(client_obj, label, symbol)
+        if client_obj is binance:
+            invalidate_main_positions_cache()
+            invalidate_main_open_orders_cache()
+
+        if not verify.get("ok"):
+            detail = {
+                "account": label,
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "sl": sl_price,
+                "tp": tp_price,
+                "verify": verify,
+            }
+            add_order_audit("PROTECTION_VERIFY_FAILED", symbol, detail)
+            if STRICT_PROTECTION:
+                close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_verify_failed")
+                cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
+                return {
+                    "account": label,
+                    "status": "CLOSED_UNPROTECTED",
+                    "error": "protection_verify_failed",
+                    "qty": qty,
+                    "sl": sl_price,
+                    "tp": tp_price,
+                    "verify": verify,
+                    "close_result": close_result,
+                    "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                }
+
+            return {
+                "account": label,
+                "status": "UNPROTECTED",
+                "error": "protection_verify_failed",
+                "qty": qty,
+                "sl": sl_price,
+                "tp": tp_price,
+                "verify": verify,
+                "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+            }
+
+        add_order_audit("PROTECTION_RESOLVED", symbol, {
+            "account": label,
+            "side": side,
+            "qty": qty,
+            "sl": sl_price,
+            "tp": tp_price,
+            "verify": verify,
+        })
+
+        return {
+            "account": label,
+            "status": "OK",
+            "qty": qty,
+            "sl": sl_price,
+            "tp": tp_price,
+            "protective_resolved": True,
+            "verify": verify,
+            "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+            "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+            "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+        }
+
+    except Exception as exc:
+        err = str(exc)
+        add_order_audit("ORDER_PROTECTION_ERROR", symbol, {
+            "account": label,
+            "error": err,
+            "entry_order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+        })
+        if entry_order and STRICT_PROTECTION:
+            close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_create_error")
+            cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
+            return {
+                "account": label,
+                "status": "CLOSED_AFTER_ERROR",
+                "error": err,
+                "close_result": close_result,
+                "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+            }
+        return {"account": label, "error": err, "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None}
+
+
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -1329,41 +1753,11 @@ def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = Tru
         return False
     
 def place_futures_order(symbol, side, quantity, sl, tp):
-    if binance is None:
-        return {"error": "binance client not ready"}
-    try:
-        sl = normalize_price(symbol, sl)
-        tp = normalize_price(symbol, tp)
-        cancel_existing_orders(symbol)
-        time.sleep(1.0)
-        order = signed_call(binance, binance.futures_create_order, label="MAIN",
-            symbol=symbol,
-            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=quantity
-        )
-        time.sleep(0.3)
-        signed_call(binance, binance.futures_create_order, label="MAIN",
-            symbol=symbol,
-            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=sl,
-            closePosition=True,
-            workingType="MARK_PRICE"
-        )
-        signed_call(binance, binance.futures_create_order, label="MAIN",
-            symbol=symbol,
-            side=SIDE_SELL if side == "BUY" else SIDE_BUY,
-            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-            stopPrice=tp,
-            closePosition=True,
-            workingType="MARK_PRICE"
-        )
-        invalidate_main_positions_cache()
-        invalidate_main_open_orders_cache()
-        return {"status": "FILLED", "order": order}
-    except Exception as e:
-        return {"error": str(e)}
+    result = place_order_for_client(binance, "MAIN", symbol, side, quantity, sl, tp)
+    if result.get("status") == "OK":
+        return {"status": "FILLED", "order": result}
+    return {"error": result.get("error") or result.get("status") or "order_failed", "detail": result}
+
 
 def update_account_profit(client, name):
     try:
@@ -1393,33 +1787,55 @@ Withdraw: {amount:.2f}
 def place_order_multi(symbol, side, sl, tp):
     results = []
     for acc in CLIENTS:
+        label = acc["name"]
         try:
             c = acc["client"]
             base_risk = acc["risk"]
-            profit = ACCOUNT_PROFIT.get(acc["name"], 0)
+            profit = ACCOUNT_PROFIT.get(label, 0)
             if acc.get("compound") and profit > 0:
                 risk_pct = base_risk + (profit / 1000)
             else:
                 risk_pct = base_risk
-            balance_info = signed_call(c, c.futures_account_balance, label=acc["name"])
+
+            balance_info = signed_call(c, c.futures_account_balance, label=label)
             usdt = next((b for b in balance_info if b["asset"] == "USDT"), None)
             balance = float(usdt["balance"]) if usdt else 0
             alloc = min(portfolio_alloc.get(symbol, 0.25), 0.12)
-            risk_amount = balance * risk_pct * alloc
+
             price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
-            stop_distance = abs(price - sl)
-            if stop_distance == 0:
-                results.append({"account": acc["name"], "error": "stop_distance_zero"})
+            quality_ok, quality_reason, quality_detail = evaluate_signal_execution_quality({
+                "symbol": symbol,
+                "type": side,
+                "entry": price,
+                "sl": sl,
+                "tp": tp,
+                "rr": abs(float(tp) - price) / max(abs(price - float(sl)), 1e-12),
+            })
+            if not quality_ok:
+                results.append({
+                    "account": label,
+                    "error": quality_reason,
+                    "quality": quality_detail,
+                })
                 continue
+
+            risk_amount = balance * risk_pct * alloc
+            stop_distance = abs(price - float(sl))
+            if stop_distance <= 0:
+                results.append({"account": label, "error": "stop_distance_zero"})
+                continue
+
             qty = risk_amount / stop_distance
             min_notional = get_min_trade_notional(symbol)
             if qty * price < min_notional:
                 qty = ceil_to_step(min_notional / price, EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+
             qty, price = adjust_precision(symbol, qty, price)
+
             if qty * price < min_notional:
                 print(f"❌ SKIP NOTIONAL < {min_notional}", symbol)
                 results.append({
-                    "account": acc["name"],
+                    "account": label,
                     "error": "notional_below_min",
                     "qty": qty,
                     "price": price,
@@ -1427,55 +1843,31 @@ def place_order_multi(symbol, side, sl, tp):
                 })
                 continue
 
-            sl_price = normalize_price(symbol, sl)
-            tp_price = normalize_price(symbol, tp)
-            order = signed_call(c, c.futures_create_order, label=acc["name"],
-                symbol=symbol,
-                side=SIDE_BUY if side == "BUY" else SIDE_SELL,
-                type=FUTURE_ORDER_TYPE_MARKET,
-                quantity=qty
-            )
+            result = place_order_for_client(c, label, symbol, side, qty, sl, tp)
+            result["entry_price"] = price
+            result["min_notional"] = min_notional
+            result["quality"] = quality_detail
+            results.append(result)
 
-            close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
-            signed_call(c, c.futures_create_order, label=acc["name"],
-                symbol=symbol,
-                side=close_side,
-                type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                stopPrice=sl_price,
-                closePosition=True,
-                workingType="MARK_PRICE"
-            )
-            signed_call(c, c.futures_create_order, label=acc["name"],
-                symbol=symbol,
-                side=close_side,
-                type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                stopPrice=tp_price,
-                closePosition=True,
-                workingType="MARK_PRICE"
-            )
+            if result.get("status") == "OK":
+                update_account_profit(c, label)
+                check_withdraw(acc, c)
 
-            results.append({
-                "account": acc["name"],
-                "status": "OK",
-                "qty": qty,
-                "entry_price": price,
-                "sl": sl_price,
-                "tp": tp_price,
-                "order_id": order.get("orderId") if isinstance(order, dict) else None,
-            })
-            update_account_profit(c, acc["name"])
-            check_withdraw(acc, c)
         except Exception as e:
-            results.append({"account": acc["name"], "error": str(e)})
+            results.append({"account": label, "error": str(e)})
+
     success = any(r.get("status") == "OK" for r in results if isinstance(r, dict))
     if not success:
+        set_final_execution("ORDER_FAILED", symbol=symbol, side=side, reason="NO_ACCOUNT_FILLED", stage="order_result", detail={"results": results})
         add_order_audit("ORDER_MULTI_FAILED", symbol, {"results": results})
         TRADE_SNAPSHOTS.pop(symbol, None)
         set_symbol_cooldown(symbol, reason="multi_order_failed")
     else:
+        set_final_execution("ORDER_OK_PROTECTED", symbol=symbol, side=side, reason="PROTECTED_ORDER_OK", stage="order_result", detail={"results": results})
         add_order_audit("ORDER_MULTI_OK", symbol, {"results": results})
 
     return results
+
 
 def place_split_tp(symbol, side, quantity, tp1, tp2, tp3):
     side_close = SIDE_SELL if side == "BUY" else SIDE_BUY
@@ -2248,6 +2640,11 @@ def should_execute_trade(signal):
     if rr and rr < active_rr_min():
         return False, f"LOW_RR_{active_rr_min()}"
 
+    quality_ok, quality_reason, quality_detail = evaluate_signal_execution_quality(signal)
+    signal["execution_quality"] = quality_detail
+    if not quality_ok:
+        return False, quality_reason
+
     if active_require_sweep():
         if side == "BUY" and not sweep_low:
             return False, "NO_SWEEP_LOW"
@@ -3009,6 +3406,17 @@ def debug_execution_decisions(limit: int = Query(default=100, ge=1, le=500)):
         "rows": rows,
     }
 
+@app.get("/debug/execution-summary")
+def debug_execution_summary():
+    try:
+        candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+        live_rows = build_live_position_rows()
+    except Exception:
+        candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+        live_rows = []
+    return build_final_execution_summary(candidate_rows, live_rows)
+
+
 @app.get("/debug/decision-board")
 def debug_decision_board():
     candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
@@ -3047,10 +3455,16 @@ def debug_decision_board():
         "auto_trading": AUTO_TRADING,
 
         "ws": {
-            "running": ws_status["running"],
-            "thread_alive": ws_status["thread_alive"],
-            "restart_count": ws_status["restart_count"],
-            "last_error": ws_status["last_error"],
+            "running": ws_status.get("running"),
+            "thread_alive": ws_status.get("thread_alive"),
+            "app_alive": ws_status.get("app_alive"),
+            "restart_count": ws_status.get("restart_count"),
+            "last_error": ws_status.get("last_error"),
+            "message_count": ws_status.get("message_count"),
+            "last_message_age": ws_status.get("last_message_age"),
+            "last_stream": ws_status.get("last_stream"),
+            "last_event": ws_status.get("last_event"),
+            "subscribed_count": ws_status.get("subscribed_count"),
             "sample_age": ws_gate["sample_age"],
             "healthy": ws_gate["healthy"],
             "degraded": ws_gate["degraded"],
@@ -3104,6 +3518,8 @@ def debug_decision_board():
             "count": len(EXECUTION_DECISIONS),
             "rows": EXECUTION_DECISIONS[-20:],
         },
+
+        "final_execution": build_final_execution_summary(candidate_rows, live_rows),
 
         "analytics": {
             "total_trades": len(trade_history),
@@ -3896,6 +4312,7 @@ def auto_trader():
                         "score": round(float(signal["score"]), 2),
                         "rr": round(rr, 2),
                         "weight": round(float(w), 6),
+                        "quality": signal.get("execution_quality"),
                     })
                     if not ok:
                         add_skip_reason(symbol, reason, {
@@ -4010,6 +4427,13 @@ def auto_trader():
                         "entry": round(float(signal["entry"]), 8),
                         "sl": round(float(signal["sl"]), 8),
                         "tp": round(float(signal["tp"]), 8),
+                        "quality": signal.get("execution_quality"),
+                    })
+                    set_final_execution("ORDER_ATTEMPT", symbol=symbol, side=signal["type"], reason="SENDING_ORDER", stage="order_attempt", detail={
+                        "score": round(float(signal["score"]), 2),
+                        "entry": round(float(signal["entry"]), 8),
+                        "sl": round(float(signal["sl"]), 8),
+                        "tp": round(float(signal["tp"]), 8),
                     })
 
                     result = place_order_multi(
@@ -4019,9 +4443,11 @@ def auto_trader():
                         tp=signal["tp"]
                     )
 
-                    add_execution_decision("order_result", symbol, "PASS" if not any(isinstance(r, dict) and r.get("error") for r in (result or [])) else "BLOCK", {
+                    order_ok = any(isinstance(r, dict) and r.get("status") == "OK" for r in (result or []))
+                    add_execution_decision("order_result", symbol, "PASS" if order_ok else "BLOCK", {
                         "result": result,
                     })
+                    set_final_execution("ORDER_OK_PROTECTED" if order_ok else "ORDER_FAILED", symbol=symbol, side=signal["type"], reason="ORDER_RESULT_PASS" if order_ok else "ORDER_RESULT_BLOCK", stage="order_result", detail={"result": result})
                     
                     GLOBAL_SYMBOL_LOCK.add(symbol)
 

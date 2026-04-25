@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -25,6 +26,11 @@ WS_LOCK = threading.RLock()
 
 RECONNECT_SLEEP_SECONDS = 10
 
+BINANCE_FSTREAM_WS_URL = os.getenv(
+    "BINANCE_FSTREAM_WS_URL",
+    "wss://fstream.binance.com/market/stream"
+).rstrip("/")
+
 
 def _clean_symbol(symbol: Any) -> str:
     return str(symbol or "").strip().upper()
@@ -41,7 +47,7 @@ def build_stream_url(symbols: Iterable[str], interval: str = "15m") -> str:
     streams: List[str] = ["!markPrice@arr@1s"]
     for sym in clean_symbols:
         streams.append(f"{sym.lower()}@kline_{interval}")
-    return "wss://fstream.binance.com/market/stream?streams=" + "/".join(streams)
+    return f"{BINANCE_FSTREAM_WS_URL}?streams=" + "/".join(streams)
 
 
 def _touch_message(stream: Optional[str], event: Optional[str]) -> None:
