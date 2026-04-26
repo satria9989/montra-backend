@@ -123,6 +123,13 @@ TELEGRAM_BLOCKED_ALERT_MINUTES = float(os.getenv("TELEGRAM_BLOCKED_ALERT_MINUTES
 TELEGRAM_SCAN_STALE_ALERT_SECONDS = float(os.getenv("TELEGRAM_SCAN_STALE_ALERT_SECONDS", "90"))
 TELEGRAM_WS_BLOCK_ALERT_SECONDS = float(os.getenv("TELEGRAM_WS_BLOCK_ALERT_SECONDS", "60"))
 TELEGRAM_UNPROTECTED_ALERT_SECONDS = float(os.getenv("TELEGRAM_UNPROTECTED_ALERT_SECONDS", "45"))
+# Prevent false WS-stale Telegram alerts during boot while the websocket has
+# connected but has not received its first market payload yet.
+TELEGRAM_WS_STARTUP_GRACE_SECONDS = float(os.getenv("TELEGRAM_WS_STARTUP_GRACE_SECONDS", "120"))
+# If true, WS alerts are sent only when the backend WS health gate is actually
+# blocking, not merely when last_message_age is temporarily high.
+TELEGRAM_REQUIRE_WS_BLOCK = os.getenv("TELEGRAM_REQUIRE_WS_BLOCK", "true").lower() == "true"
+TELEGRAM_SEND_RECOVERY_ALERT = os.getenv("TELEGRAM_SEND_RECOVERY_ALERT", "true").lower() == "true"
 
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
@@ -715,6 +722,8 @@ LAST_FINAL_EXECUTION = {
 TELEGRAM_ALERT_STATE = {
     "last_sent_by_key": {},
     "last_alerts": [],
+    "ws_block_active": False,
+    "ws_block_reason": None,
 }
 
 # ===== AI MEMORY & FIREBASE =====
@@ -2029,6 +2038,12 @@ def build_telegram_alert_status():
         "scan_stale_alert_seconds": TELEGRAM_SCAN_STALE_ALERT_SECONDS,
         "ws_block_alert_seconds": TELEGRAM_WS_BLOCK_ALERT_SECONDS,
         "unprotected_alert_seconds": TELEGRAM_UNPROTECTED_ALERT_SECONDS,
+        "ws_startup_grace_seconds": TELEGRAM_WS_STARTUP_GRACE_SECONDS,
+        "require_ws_block": TELEGRAM_REQUIRE_WS_BLOCK,
+        "send_recovery_alert": TELEGRAM_SEND_RECOVERY_ALERT,
+        "ws_block_active": bool(TELEGRAM_ALERT_STATE.get("ws_block_active", False)),
+        "ws_block_reason": TELEGRAM_ALERT_STATE.get("ws_block_reason"),
+        "app_uptime_seconds": round(now - APP_START_TS, 2),
         "last_sent_ago_by_key": {k: round(now - float(v), 2) for k, v in last_sent.items()},
         "last_alerts": TELEGRAM_ALERT_STATE.get("last_alerts", [])[-10:],
     }
@@ -2072,12 +2087,33 @@ def check_runtime_telegram_alerts():
             )
 
     ws_status = get_ws_status()
+    ws_gate = ws_health_snapshot()
     ws_age = float(ws_status.get("last_message_age") or 9999)
-    if ws_age >= TELEGRAM_WS_BLOCK_ALERT_SECONDS:
-        send_telegram_alert(
-            "ws_stale",
-            f"⚠️ MONTRA WS stale\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
-        )
+    uptime = now - APP_START_TS
+    ws_block_reason = str(ws_gate.get("reason") or "UNKNOWN")
+    ws_gate_blocking = bool(ws_gate.get("block")) and ws_block_reason in ("STALE_BLOCK", "SOCKET_DOWN", "THREAD_DEAD")
+    ws_age_stale = ws_age >= TELEGRAM_WS_BLOCK_ALERT_SECONDS
+
+    # Boot guard: ignore default 9999 last_message_age during the startup window.
+    # This prevents false Telegram stale alerts before the first websocket payload arrives.
+    if uptime >= TELEGRAM_WS_STARTUP_GRACE_SECONDS:
+        should_alert_ws = ws_gate_blocking if TELEGRAM_REQUIRE_WS_BLOCK else (ws_gate_blocking or ws_age_stale)
+        if should_alert_ws:
+            TELEGRAM_ALERT_STATE["ws_block_active"] = True
+            TELEGRAM_ALERT_STATE["ws_block_reason"] = ws_block_reason
+            send_telegram_alert(
+                "ws_stale",
+                f"⚠️ MONTRA WS stale/blocking\nReason: {ws_block_reason}\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
+            )
+        elif TELEGRAM_SEND_RECOVERY_ALERT and TELEGRAM_ALERT_STATE.get("ws_block_active"):
+            TELEGRAM_ALERT_STATE["ws_block_active"] = False
+            prev_reason = TELEGRAM_ALERT_STATE.get("ws_block_reason") or "UNKNOWN"
+            TELEGRAM_ALERT_STATE["ws_block_reason"] = None
+            send_telegram_alert(
+                "ws_recovered",
+                f"✅ MONTRA WS recovered\nPrevious reason: {prev_reason}\nCurrent reason: {ws_block_reason}\nLast message age: {ws_age:.2f}s\nRestart count: {ws_status.get('restart_count')}",
+                force=True,
+            )
 
     if circuit_breaker_active():
         send_telegram_alert(

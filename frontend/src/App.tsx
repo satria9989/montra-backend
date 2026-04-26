@@ -157,6 +157,12 @@ type DecisionBoard = {
     scan_stale_alert_seconds: number;
     ws_block_alert_seconds: number;
     unprotected_alert_seconds: number;
+    ws_startup_grace_seconds?: number;
+    require_ws_block?: boolean;
+    send_recovery_alert?: boolean;
+    ws_block_active?: boolean;
+    ws_block_reason?: string | null;
+    app_uptime_seconds?: number;
     last_sent_ago_by_key?: Record<string, number>;
     last_alerts?: { key: string; time: string; sent: boolean; message: string }[];
   };
@@ -830,6 +836,10 @@ export default function App() {
                 <KeyValue label="Telegram alerts" value={decisionBoard?.telegram_alerts?.enabled ? (decisionBoard?.telegram_alerts?.available ? "ON" : "TOKEN MISSING") : "OFF"} accent={decisionBoard?.telegram_alerts?.enabled && decisionBoard?.telegram_alerts?.available ? "#00ffaa" : "#ffb000"} />
                 <KeyValue label="Blocked alert" value={`${formatNum(decisionBoard?.telegram_alerts?.blocked_alert_minutes, 0)}m`} />
                 <KeyValue label="Scan stale alert" value={`${formatNum(decisionBoard?.telegram_alerts?.scan_stale_alert_seconds, 0)}s`} />
+                <KeyValue label="WS startup grace" value={`${formatNum(decisionBoard?.telegram_alerts?.ws_startup_grace_seconds, 0)}s`} />
+                <KeyValue label="WS alert mode" value={decisionBoard?.telegram_alerts?.require_ws_block ? "BLOCK only" : "AGE or BLOCK"} accent={decisionBoard?.telegram_alerts?.require_ws_block ? "#00ffaa" : "#ffb000"} />
+                <KeyValue label="WS block active" value={decisionBoard?.telegram_alerts?.ws_block_active ? (decisionBoard?.telegram_alerts?.ws_block_reason || "YES") : "NO"} accent={decisionBoard?.telegram_alerts?.ws_block_active ? "#ff7272" : "#00ffaa"} />
+                <KeyValue label="Recovery alert" value={decisionBoard?.telegram_alerts?.send_recovery_alert ? "ON" : "OFF"} />
                 <KeyValue label="Last alerts" value={decisionBoard?.telegram_alerts?.last_alerts?.length ?? 0} />
                 <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45 }}>
                   Debug: <code>/debug/sweep-memory/{chartSymbol}</code> dan <code>/debug/telegram-alerts</code>.
