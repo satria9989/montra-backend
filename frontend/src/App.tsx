@@ -78,6 +78,9 @@ type ExecutionSummary = {
   last_status?: string | null;
   last_detail?: Record<string, any>;
   recent_decisions?: ExecutionDecisionRow[];
+  since?: string | null;
+  age_seconds?: number | null;
+  last_scan_age_seconds?: number | null;
   updated_at?: string;
 };
 
@@ -146,6 +149,18 @@ type DecisionBoard = {
   final_execution?: ExecutionSummary;
   circuit_breaker?: { active: boolean; remaining: number; consecutive_errors: number; threshold: number; pause: number };
   spread?: { threshold_top: number; threshold_mid: number; cache_ttl: number };
+  telegram_alerts?: {
+    enabled: boolean;
+    available: boolean;
+    cooldown_seconds: number;
+    blocked_alert_minutes: number;
+    scan_stale_alert_seconds: number;
+    ws_block_alert_seconds: number;
+    unprotected_alert_seconds: number;
+    last_sent_ago_by_key?: Record<string, number>;
+    last_alerts?: { key: string; time: string; sent: boolean; message: string }[];
+  };
+  sweep_memory?: { lookback: number; window: number; require_reclaim: boolean };
   analytics: {
     total_trades: number;
     open_snapshots: number;
@@ -370,6 +385,8 @@ function ExecutionSummarySection({ summary }: { summary?: ExecutionSummary | nul
     <Section title="Execution summary">
       <div style={{ display: "grid", gap: 8 }}>
         <KeyValue label="Status" value={summary.status || "-"} accent={accent} />
+        <KeyValue label="Age" value={summary.age_seconds == null ? "-" : `${formatNum(summary.age_seconds, 0)}s`} accent={Number(summary.age_seconds || 0) > 300 ? "#ffb000" : undefined} />
+        <KeyValue label="Last scan age" value={summary.last_scan_age_seconds == null ? "-" : `${formatNum(summary.last_scan_age_seconds, 0)}s`} />
         <KeyValue label="Symbol" value={summary.symbol || "-"} />
         <KeyValue label="Side" value={summary.side || "-"} accent={summary.side === "BUY" ? "#00ffaa" : summary.side === "SELL" ? "#ff7272" : undefined} />
         <KeyValue label="Reason" value={summary.reason || "-"} accent={accent} />
@@ -802,6 +819,20 @@ export default function App() {
                 <KeyValue label="Cache TTL" value={`${formatNum(decisionBoard?.spread?.cache_ttl, 0)}s`} />
                 <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45 }}>
                   Live spread detail: <code>/debug/spread/{chartSymbol}</code>. Orderbook spread hanya dipanggil di pre-entry gate atau endpoint debug ini.
+                </div>
+              </div>
+            </Section>
+
+            <Section title="Sweep + Telegram monitor">
+              <div style={{ display: "grid", gap: 8 }}>
+                <KeyValue label="Sweep memory" value={`${decisionBoard?.sweep_memory?.window ?? "-"} candles / lookback ${decisionBoard?.sweep_memory?.lookback ?? "-"}`} />
+                <KeyValue label="Require reclaim" value={decisionBoard?.sweep_memory?.require_reclaim ? "YES" : "NO"} accent={decisionBoard?.sweep_memory?.require_reclaim ? "#00ffaa" : "#ffb000"} />
+                <KeyValue label="Telegram alerts" value={decisionBoard?.telegram_alerts?.enabled ? (decisionBoard?.telegram_alerts?.available ? "ON" : "TOKEN MISSING") : "OFF"} accent={decisionBoard?.telegram_alerts?.enabled && decisionBoard?.telegram_alerts?.available ? "#00ffaa" : "#ffb000"} />
+                <KeyValue label="Blocked alert" value={`${formatNum(decisionBoard?.telegram_alerts?.blocked_alert_minutes, 0)}m`} />
+                <KeyValue label="Scan stale alert" value={`${formatNum(decisionBoard?.telegram_alerts?.scan_stale_alert_seconds, 0)}s`} />
+                <KeyValue label="Last alerts" value={decisionBoard?.telegram_alerts?.last_alerts?.length ?? 0} />
+                <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45 }}>
+                  Debug: <code>/debug/sweep-memory/{chartSymbol}</code> dan <code>/debug/telegram-alerts</code>.
                 </div>
               </div>
             </Section>

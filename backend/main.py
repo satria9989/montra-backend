@@ -109,6 +109,21 @@ SPREAD_WARN_MULTIPLIER = float(os.getenv("SPREAD_WARN_MULTIPLIER", "0.8"))
 SPREAD_CACHE_TTL = float(os.getenv("SPREAD_CACHE_TTL", "5"))
 SPREAD_ORDER_BOOK_LIMIT = int(os.getenv("SPREAD_ORDER_BOOK_LIMIT", "5"))
 
+# ===== SWEEP MEMORY / ALERTING =====
+# Sweep memory keeps a confirmed liquidity sweep valid for a few candles instead
+# of requiring the current candle only. Reclaim=true avoids treating clean breakouts
+# as reversal sweeps.
+SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "10"))
+SWEEP_MEMORY_WINDOW = int(os.getenv("SWEEP_MEMORY_WINDOW", "5"))
+SWEEP_REQUIRE_RECLAIM = os.getenv("SWEEP_REQUIRE_RECLAIM", "true").lower() == "true"
+
+TELEGRAM_ALERTS_ENABLED = os.getenv("TELEGRAM_ALERTS_ENABLED", "true").lower() == "true"
+TELEGRAM_ALERT_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_ALERT_COOLDOWN_SECONDS", "300"))
+TELEGRAM_BLOCKED_ALERT_MINUTES = float(os.getenv("TELEGRAM_BLOCKED_ALERT_MINUTES", "5"))
+TELEGRAM_SCAN_STALE_ALERT_SECONDS = float(os.getenv("TELEGRAM_SCAN_STALE_ALERT_SECONDS", "90"))
+TELEGRAM_WS_BLOCK_ALERT_SECONDS = float(os.getenv("TELEGRAM_WS_BLOCK_ALERT_SECONDS", "60"))
+TELEGRAM_UNPROTECTED_ALERT_SECONDS = float(os.getenv("TELEGRAM_UNPROTECTED_ALERT_SECONDS", "45"))
+
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
 STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
@@ -128,8 +143,8 @@ DEFAULT_MIN_TRADE_NOTIONAL = float(os.getenv("DEFAULT_MIN_TRADE_NOTIONAL", "120"
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
-TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
-MID_PAIRS = globals().get("MID_PAIRS", ["ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "BCHUSDT", "DOGEUSDT", "TRXUSDT", "ATOMUSDT", "TONUSDT"])
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["HYPEUSDT", "SUIUSDT", "LINKUSDT", "AVAXUSDT", "WIFUSDT", "NEARUSDT", "ARBUSDT", "AAVEUSDT", "1000PEPEUSDT", "ADAUSDT", "LTCUSDT", "TRXUSDT", "TONUSDT", "WLDUSDT"])
 VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
 REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
 
@@ -697,6 +712,11 @@ LAST_FINAL_EXECUTION = {
     },
 }
 
+TELEGRAM_ALERT_STATE = {
+    "last_sent_by_key": {},
+    "last_alerts": [],
+}
+
 # ===== AI MEMORY & FIREBASE =====
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
@@ -1191,6 +1211,69 @@ def summarize_skip_reasons(rows=None, limit=8):
         {"reason": reason, "count": count}
         for reason, count in sorted(summary.items(), key=lambda item: item[1], reverse=True)[:limit]
     ]
+
+
+def detect_sweep_memory(ohlcv, lookback=None, memory_window=None, require_reclaim=None):
+    """Detect confirmed liquidity sweep within the last N candles."""
+    lookback = int(lookback or SWEEP_LOOKBACK)
+    memory_window = max(1, int(memory_window or SWEEP_MEMORY_WINDOW))
+    require_reclaim = SWEEP_REQUIRE_RECLAIM if require_reclaim is None else bool(require_reclaim)
+    out = {
+        "sweep_high": False,
+        "sweep_low": False,
+        "raw_sweep_high": False,
+        "raw_sweep_low": False,
+        "high": None,
+        "low": None,
+        "lookback": lookback,
+        "memory_window": memory_window,
+        "require_reclaim": require_reclaim,
+    }
+    if not ohlcv or len(ohlcv) < lookback + 1:
+        return out
+    n = len(ohlcv)
+    start = max(lookback, n - memory_window)
+    for idx in range(start, n):
+        prev = ohlcv[max(0, idx - lookback):idx]
+        if len(prev) < max(3, min(lookback, 3)):
+            continue
+        prev_high = max(float(c[2]) for c in prev)
+        prev_low = min(float(c[3]) for c in prev)
+        candle = ohlcv[idx]
+        high = float(candle[2])
+        low = float(candle[3])
+        close = float(candle[4])
+        ts = int(float(candle[0])) if len(candle) > 0 else None
+        age = n - 1 - idx
+        raw_high = high > prev_high
+        raw_low = low < prev_low
+        reclaim_high = close < prev_high
+        reclaim_low = close > prev_low
+        if raw_high:
+            out["raw_sweep_high"] = True
+        if raw_low:
+            out["raw_sweep_low"] = True
+        if raw_high and (not require_reclaim or reclaim_high):
+            out["sweep_high"] = True
+            out["high"] = {
+                "age_candles": age,
+                "level": round(prev_high, 8),
+                "wick_price": round(high, 8),
+                "close": round(close, 8),
+                "reclaimed": reclaim_high,
+                "time": ts,
+            }
+        if raw_low and (not require_reclaim or reclaim_low):
+            out["sweep_low"] = True
+            out["low"] = {
+                "age_candles": age,
+                "level": round(prev_low, 8),
+                "wick_price": round(low, 8),
+                "close": round(close, 8),
+                "reclaimed": reclaim_low,
+                "time": ts,
+            }
+    return out
 
 
 def add_execution_decision(stage, symbol, status, detail=None):
@@ -1895,8 +1978,113 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": msg})
+    try:
+        resp = requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=8)
+        return bool(resp.ok)
+    except Exception as exc:
+        print("telegram send error:", exc)
+        return False
+
+
+def telegram_available():
+    return bool(os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def _telegram_record_alert(key, msg, sent):
+    now = time.time()
+    TELEGRAM_ALERT_STATE["last_sent_by_key"][key] = now
+    TELEGRAM_ALERT_STATE["last_alerts"].append({
+        "key": key,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": now,
+        "sent": bool(sent),
+        "message": msg[:500],
+    })
+    TELEGRAM_ALERT_STATE["last_alerts"] = TELEGRAM_ALERT_STATE["last_alerts"][-25:]
+
+
+def send_telegram_alert(key, msg, force=False):
+    if not TELEGRAM_ALERTS_ENABLED or not telegram_available():
+        return False
+    now = time.time()
+    last = float(TELEGRAM_ALERT_STATE["last_sent_by_key"].get(key, 0) or 0)
+    if not force and last and (now - last) < TELEGRAM_ALERT_COOLDOWN_SECONDS:
+        return False
+    sent = send_telegram(msg)
+    _telegram_record_alert(key, msg, sent)
+    return sent
+
+
+def build_telegram_alert_status():
+    now = time.time()
+    last_sent = TELEGRAM_ALERT_STATE.get("last_sent_by_key", {})
+    return {
+        "enabled": TELEGRAM_ALERTS_ENABLED,
+        "available": telegram_available(),
+        "cooldown_seconds": TELEGRAM_ALERT_COOLDOWN_SECONDS,
+        "blocked_alert_minutes": TELEGRAM_BLOCKED_ALERT_MINUTES,
+        "scan_stale_alert_seconds": TELEGRAM_SCAN_STALE_ALERT_SECONDS,
+        "ws_block_alert_seconds": TELEGRAM_WS_BLOCK_ALERT_SECONDS,
+        "unprotected_alert_seconds": TELEGRAM_UNPROTECTED_ALERT_SECONDS,
+        "last_sent_ago_by_key": {k: round(now - float(v), 2) for k, v in last_sent.items()},
+        "last_alerts": TELEGRAM_ALERT_STATE.get("last_alerts", [])[-10:],
+    }
+
+
+def check_runtime_telegram_alerts():
+    if not TELEGRAM_ALERTS_ENABLED or not AUTO_MODE:
+        return
+    now = time.time()
+    summary = build_final_execution_summary(sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True), [])
+    status = summary.get("status")
+    reason = summary.get("reason") or "UNKNOWN"
+    age = float(summary.get("age_seconds") or 0)
+    symbol = summary.get("symbol") or "_SYSTEM_"
+
+    if status == "BLOCKED" and age >= TELEGRAM_BLOCKED_ALERT_MINUTES * 60:
+        send_telegram_alert(
+            f"blocked:{symbol}:{reason}",
+            f"⚠️ MONTRA BLOCKED > {TELEGRAM_BLOCKED_ALERT_MINUTES:.0f}m\nSymbol: {symbol}\nReason: {reason}\nAge: {age:.0f}s\nStage: {summary.get('last_stage') or '-'}"
+        )
+
+    if status == "LIVE_UNPROTECTED" and age >= TELEGRAM_UNPROTECTED_ALERT_SECONDS:
+        send_telegram_alert(
+            f"unprotected:{symbol}",
+            f"🚨 MONTRA LIVE POSITION UNPROTECTED\nSymbol: {symbol}\nAge: {age:.0f}s\nAction: verify SL/TP immediately."
+        )
+
+    if AUTO_TRADING and LAST_SCAN_CYCLE_TS <= 0 and (now - APP_START_TS) > (EXECUTION_BOOT_GRACE_SECONDS + TELEGRAM_SCAN_STALE_ALERT_SECONDS):
+        send_telegram_alert(
+            "scan_never_started",
+            f"⚠️ MONTRA scan telemetry belum mulai\nUptime: {now - APP_START_TS:.0f}s\nBoot grace: {EXECUTION_BOOT_GRACE_SECONDS:.0f}s"
+        )
+
+    if AUTO_TRADING and LAST_SCAN_CYCLE_TS > 0:
+        scan_age = now - LAST_SCAN_CYCLE_TS
+        stale_limit = max(TELEGRAM_SCAN_STALE_ALERT_SECONDS, SCAN_INTERVAL_MID * 2)
+        if scan_age > stale_limit:
+            send_telegram_alert(
+                "scan_stale",
+                f"⚠️ MONTRA scan stale\nLast scan age: {scan_age:.0f}s\nLimit: {stale_limit:.0f}s"
+            )
+
+    ws_status = get_ws_status()
+    ws_age = float(ws_status.get("last_message_age") or 9999)
+    if ws_age >= TELEGRAM_WS_BLOCK_ALERT_SECONDS:
+        send_telegram_alert(
+            "ws_stale",
+            f"⚠️ MONTRA WS stale\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
+        )
+
+    if circuit_breaker_active():
+        send_telegram_alert(
+            "circuit_breaker",
+            f"🧯 MONTRA circuit breaker active\nRemaining: {circuit_breaker_remaining():.0f}s\nErrors: {CONSECUTIVE_ERRORS}/{CIRCUIT_BREAKER_THRESHOLD}"
+        )
+
 
 def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = True):
     if binance is None:
@@ -3645,6 +3833,24 @@ def debug_execution_summary():
     return build_final_execution_summary(candidate_rows, live_rows)
 
 
+@app.get("/debug/sweep-memory/{symbol}")
+def debug_sweep_memory(symbol: str, timeframe: str = Query(default="15m"), limit: int = Query(default=80, ge=20, le=300)):
+    try:
+        data = fetch_futures_klines_cached(symbol.upper(), interval=timeframe, limit=limit)
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "sweep": detect_sweep_memory(data),
+        }
+    except Exception as e:
+        return {"symbol": symbol.upper(), "error": str(e)}
+
+
+@app.get("/debug/telegram-alerts")
+def debug_telegram_alerts():
+    return build_telegram_alert_status()
+
+
 @app.get("/debug/spread")
 def debug_spread_all(force: bool = Query(default=False)):
     rows = []
@@ -3790,6 +3996,14 @@ def debug_decision_board():
             "threshold_top": SPREAD_THRESHOLD_TOP,
             "threshold_mid": SPREAD_THRESHOLD_MID,
             "cache_ttl": SPREAD_CACHE_TTL,
+        },
+
+        "telegram_alerts": build_telegram_alert_status(),
+
+        "sweep_memory": {
+            "lookback": SWEEP_LOOKBACK,
+            "window": SWEEP_MEMORY_WINDOW,
+            "require_reclaim": SWEEP_REQUIRE_RECLAIM,
         },
 
         "analytics": {
@@ -4173,6 +4387,11 @@ def auto_trader():
     while True:
         try:
             check_telegram_commands()
+            # Alert monitor is throttled internally; safe to call each loop.
+            try:
+                check_runtime_telegram_alerts()
+            except Exception as alert_error:
+                print("telegram alert monitor error:", alert_error)
 
             if KILL_SWITCH:
                 set_final_execution("KILL_SWITCH_ON", reason="KILL_SWITCH_TRUE", stage="safety_gate")
@@ -4350,19 +4569,17 @@ def auto_trader():
                         add_skip_reason(symbol, "FAKE_MOVE_WICK_DOWN")
                         continue
 
-                    # === LIQUIDITY SWEEP CHECK ===
-                    recent_high = max(highs[-11:-1])
-                    recent_low = min(lows[-11:-1])
-
-                    sweep_high = highs[-1] > recent_high
-                    sweep_low = lows[-1] < recent_low
+                    # === LIQUIDITY SWEEP CHECK WITH MEMORY ===
+                    sweep_ctx = detect_sweep_memory(ohlcv)
+                    sweep_high = bool(sweep_ctx.get("sweep_high"))
+                    sweep_low = bool(sweep_ctx.get("sweep_low"))
 
                     if active_require_sweep():
                         if signal_type == "BUY" and not sweep_low:
-                            add_skip_reason(symbol, "NO_SWEEP_LOW")
+                            add_skip_reason(symbol, "NO_SWEEP_LOW", {"sweep_memory": sweep_ctx})
                             continue
                         if signal_type == "SELL" and not sweep_high:
-                            add_skip_reason(symbol, "NO_SWEEP_HIGH")
+                            add_skip_reason(symbol, "NO_SWEEP_HIGH", {"sweep_memory": sweep_ctx})
                             continue
 
                     # === BUY RUMOR / SELL NEWS ===
@@ -4413,6 +4630,9 @@ def auto_trader():
                         "sl": sl,
                         "tp": tp,
                         "score": 85 if structure_grade == "STRONG" else 72,
+                        "sweep_high": sweep_high,
+                        "sweep_low": sweep_low,
+                        "sweep_memory": sweep_ctx,
                         "structure_grade": structure_grade,
                     }
 
@@ -4594,19 +4814,17 @@ def auto_trader():
                         add_skip_reason(symbol, "FAKE_MOVE_WICK_DOWN")
                         continue
 
-                    # === LIQUIDITY SWEEP CHECK ===
-                    recent_high = max(highs[-11:-1])
-                    recent_low = min(lows[-11:-1])
-
-                    sweep_high = highs[-1] > recent_high
-                    sweep_low = lows[-1] < recent_low
+                    # === LIQUIDITY SWEEP CHECK WITH MEMORY ===
+                    sweep_ctx = detect_sweep_memory(ohlcv)
+                    sweep_high = bool(sweep_ctx.get("sweep_high"))
+                    sweep_low = bool(sweep_ctx.get("sweep_low"))
 
                     if active_require_sweep():
                         if signal_type == "BUY" and not sweep_low:
-                            add_skip_reason(symbol, "NO_SWEEP_LOW")
+                            add_skip_reason(symbol, "NO_SWEEP_LOW", {"sweep_memory": sweep_ctx})
                             continue
                         if signal_type == "SELL" and not sweep_high:
-                            add_skip_reason(symbol, "NO_SWEEP_HIGH")
+                            add_skip_reason(symbol, "NO_SWEEP_HIGH", {"sweep_memory": sweep_ctx})
                             continue
 
                     # === BUY RUMOR / SELL NEWS ===
@@ -4650,6 +4868,7 @@ def auto_trader():
                         "pair_regime": pair_regime,
                         "sweep_high": sweep_high,
                         "sweep_low": sweep_low,
+                        "sweep_memory": sweep_ctx,
                         "rr": round(rr, 2),
                         "structure_grade": structure_grade,
                     }
@@ -4784,6 +5003,7 @@ def auto_trader():
                         "fvg_down": fvg_down,
                         "sweep_high": sweep_high,
                         "sweep_low": sweep_low,
+                        "sweep_memory": sweep_ctx,
                     })
 
                     order_attempted_this_cycle = True
@@ -4846,6 +5066,11 @@ Score: {signal['score']:.1f} | Weight: {w:.2f}
         except Exception as e:
             set_final_execution("ERROR", reason="AUTO_LOOP_ERROR", stage="auto_loop", detail={"error": str(e)})
             print("AUTO LOOP ERROR:", e)
+
+        try:
+            check_runtime_telegram_alerts()
+        except Exception as alert_error:
+            print("telegram alert monitor error:", alert_error)
 
         time.sleep(SCAN_INTERVAL)
 
