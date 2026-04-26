@@ -96,6 +96,9 @@ FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))                    # h
 STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
 ORDER_ID_PREFIX = (os.getenv("ORDER_ID_PREFIX", "M") or "M").strip()[:8]
 SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.15"))
+PROTECTION_PLACEMENT_GAP_SECONDS = float(os.getenv("PROTECTION_PLACEMENT_GAP_SECONDS", "0.35"))
+PROTECTION_VERIFY_RETRIES = int(os.getenv("PROTECTION_VERIFY_RETRIES", "4"))
+PROTECTION_VERIFY_DELAY = float(os.getenv("PROTECTION_VERIFY_DELAY", "0.50"))
 
 # ===== CIRCUIT BREAKER / SPREAD GATE =====
 CONSECUTIVE_ERRORS = 0
@@ -1649,6 +1652,26 @@ def normalize_price(symbol, price):
     tick = f["tickSize"]
     return floor_to_step(price, tick)
 
+
+def normalize_protective_price(symbol, price, side, leg):
+    """Round SL/TP to Binance tickSize before sending protective orders.
+
+    Directional rounding is deliberately conservative:
+    - BUY SL floors lower, BUY TP floors closer.
+    - SELL SL ceils higher, SELL TP floors lower.
+    This keeps stopPrice valid and avoids accidentally moving SELL SL closer.
+    """
+    f = EXCHANGE_CACHE.get(symbol) or {}
+    tick = float(f.get("tickSize") or 0)
+    raw = float(price or 0)
+    if raw <= 0 or tick <= 0:
+        return raw
+    side = str(side or "").upper()
+    leg = str(leg or "").upper()
+    if side == "SELL" and leg == "SL":
+        return ceil_to_step(raw, tick)
+    return floor_to_step(raw, tick)
+
 def load_exchange_cache():
     global EXCHANGE_CACHE
     if binance is None:
@@ -1818,9 +1841,29 @@ def verify_protective_orders_for_client(client_obj, label, symbol):
             "tp_resolved": bool(tp_ok),
             "sl": exits.get("sl"),
             "tp": exits.get("tp"),
+            "open_order_count": len(orders or []),
         }
     except Exception as exc:
         return {"ok": False, "sl_resolved": False, "tp_resolved": False, "error": str(exc)}
+
+
+def verify_protective_orders_with_retry(client_obj, label, symbol, attempts=None, delay=None):
+    attempts = max(1, int(attempts if attempts is not None else PROTECTION_VERIFY_RETRIES))
+    delay = float(delay if delay is not None else PROTECTION_VERIFY_DELAY)
+    last = None
+    for attempt in range(1, attempts + 1):
+        result = verify_protective_orders_for_client(client_obj, label, symbol)
+        result["attempt"] = attempt
+        result["attempts"] = attempts
+        last = result
+        if result.get("ok"):
+            add_order_audit("PROTECTION_VERIFY_OK", symbol, {"account": label, "attempt": attempt, "verify": result})
+            return result
+        if attempt < attempts:
+            add_order_audit("PROTECTION_VERIFY_RETRY", symbol, {"account": label, "attempt": attempt, "verify": result, "sleep": delay})
+            time.sleep(delay)
+    add_order_audit("PROTECTION_VERIFY_FINAL_FAILED", symbol, {"account": label, "verify": last})
+    return last or {"ok": False, "sl_resolved": False, "tp_resolved": False, "attempts": attempts}
 
 
 def emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_failed"):
@@ -1860,17 +1903,34 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     if qty <= 0:
         return {"account": label, "error": "qty_zero"}
 
-    sl_price = normalize_price(symbol, float(sl))
-    tp_price = normalize_price(symbol, float(tp))
+    raw_sl = float(sl)
+    raw_tp = float(tp)
+    sl_price = normalize_protective_price(symbol, raw_sl, side, "SL")
+    tp_price = normalize_protective_price(symbol, raw_tp, side, "TP")
     close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
 
+    add_order_audit("PROTECTION_PRICE_NORMALIZED", symbol, {
+        "account": label,
+        "side": side,
+        "raw_sl": raw_sl,
+        "raw_tp": raw_tp,
+        "sl": sl_price,
+        "tp": tp_price,
+        "tickSize": (EXCHANGE_CACHE.get(symbol) or {}).get("tickSize"),
+    })
+
     if not cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True):
+        add_order_audit("CANCEL_PROTECTIVE_FAILED", symbol, {"account": label})
         return {"account": label, "error": "cancel_protective_failed"}
 
     entry_order = None
     sl_order = None
     tp_order = None
     try:
+        entry_client_id = build_order_client_id(symbol, side, "ENT")
+        add_order_audit("ENTRY_PLACE_ATTEMPT", symbol, {
+            "account": label, "side": side, "qty": qty, "clientOrderId": entry_client_id
+        })
         entry_order = signed_call(
             client_obj,
             client_obj.futures_create_order,
@@ -1879,38 +1939,80 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             side=SIDE_BUY if side == "BUY" else SIDE_SELL,
             type=FUTURE_ORDER_TYPE_MARKET,
             quantity=qty,
-            newClientOrderId=build_order_client_id(symbol, side, "ENT"),
+            newClientOrderId=entry_client_id,
         )
+        add_order_audit("ENTRY_PLACE_OK", symbol, {
+            "account": label,
+            "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+            "clientOrderId": entry_client_id,
+            "status": entry_order.get("status") if isinstance(entry_order, dict) else None,
+        })
 
-        time.sleep(0.25)
+        time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
 
-        sl_order = signed_call(
-            client_obj,
-            client_obj.futures_create_order,
-            label=label,
-            symbol=symbol,
-            side=close_side,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=sl_price,
-            closePosition=True,
-            workingType="MARK_PRICE",
-            newClientOrderId=build_order_client_id(symbol, side, "SL"),
-        )
+        sl_client_id = build_order_client_id(symbol, side, "SL")
+        add_order_audit("PLACE_SL_ATTEMPT", symbol, {
+            "account": label, "side": close_side, "stopPrice": sl_price, "workingType": "MARK_PRICE",
+            "closePosition": True, "clientOrderId": sl_client_id
+        })
+        try:
+            sl_order = signed_call(
+                client_obj,
+                client_obj.futures_create_order,
+                label=label,
+                symbol=symbol,
+                side=close_side,
+                type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice=sl_price,
+                closePosition=True,
+                workingType="MARK_PRICE",
+                newClientOrderId=sl_client_id,
+            )
+            add_order_audit("PLACE_SL_OK", symbol, {
+                "account": label,
+                "order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                "clientOrderId": sl_client_id,
+                "stopPrice": sl_price,
+                "status": sl_order.get("status") if isinstance(sl_order, dict) else None,
+            })
+        except Exception as sl_exc:
+            add_order_audit("PLACE_SL_FAILED", symbol, {
+                "account": label, "error": str(sl_exc), "stopPrice": sl_price, "clientOrderId": sl_client_id
+            })
+            raise
 
-        tp_order = signed_call(
-            client_obj,
-            client_obj.futures_create_order,
-            label=label,
-            symbol=symbol,
-            side=close_side,
-            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-            stopPrice=tp_price,
-            closePosition=True,
-            workingType="MARK_PRICE",
-            newClientOrderId=build_order_client_id(symbol, side, "TP"),
-        )
+        tp_client_id = build_order_client_id(symbol, side, "TP")
+        add_order_audit("PLACE_TP_ATTEMPT", symbol, {
+            "account": label, "side": close_side, "stopPrice": tp_price, "workingType": "MARK_PRICE",
+            "closePosition": True, "clientOrderId": tp_client_id
+        })
+        try:
+            tp_order = signed_call(
+                client_obj,
+                client_obj.futures_create_order,
+                label=label,
+                symbol=symbol,
+                side=close_side,
+                type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                stopPrice=tp_price,
+                closePosition=True,
+                workingType="MARK_PRICE",
+                newClientOrderId=tp_client_id,
+            )
+            add_order_audit("PLACE_TP_OK", symbol, {
+                "account": label,
+                "order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+                "clientOrderId": tp_client_id,
+                "stopPrice": tp_price,
+                "status": tp_order.get("status") if isinstance(tp_order, dict) else None,
+            })
+        except Exception as tp_exc:
+            add_order_audit("PLACE_TP_FAILED", symbol, {
+                "account": label, "error": str(tp_exc), "stopPrice": tp_price, "clientOrderId": tp_client_id
+            })
+            raise
 
-        verify = verify_protective_orders_for_client(client_obj, label, symbol)
+        verify = verify_protective_orders_with_retry(client_obj, label, symbol)
         if client_obj is binance:
             invalidate_main_positions_cache()
             invalidate_main_open_orders_cache()
@@ -1924,6 +2026,9 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "sl": sl_price,
                 "tp": tp_price,
                 "verify": verify,
+                "entry_order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
             }
             add_order_audit("PROTECTION_VERIFY_FAILED", symbol, detail)
             if STRICT_PROTECTION:
@@ -1980,6 +2085,10 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             "account": label,
             "error": err,
             "entry_order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+            "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+            "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+            "sl": sl_price,
+            "tp": tp_price,
         })
         if entry_order and STRICT_PROTECTION:
             close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_create_error")
