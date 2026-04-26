@@ -130,6 +130,9 @@ TELEGRAM_WS_STARTUP_GRACE_SECONDS = float(os.getenv("TELEGRAM_WS_STARTUP_GRACE_S
 # blocking, not merely when last_message_age is temporarily high.
 TELEGRAM_REQUIRE_WS_BLOCK = os.getenv("TELEGRAM_REQUIRE_WS_BLOCK", "true").lower() == "true"
 TELEGRAM_SEND_RECOVERY_ALERT = os.getenv("TELEGRAM_SEND_RECOVERY_ALERT", "true").lower() == "true"
+# Telegram alerts must be based on current WS/execution state, not old audit rows.
+TELEGRAM_ALERT_CURRENT_ONLY = os.getenv("TELEGRAM_ALERT_CURRENT_ONLY", "true").lower() == "true"
+TELEGRAM_CLEAR_RESOLVED_KEYS = os.getenv("TELEGRAM_CLEAR_RESOLVED_KEYS", "true").lower() == "true"
 
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
@@ -724,6 +727,12 @@ TELEGRAM_ALERT_STATE = {
     "last_alerts": [],
     "ws_block_active": False,
     "ws_block_reason": None,
+    "suppressed_by_key": {},
+    "current_state": {
+        "ws": "UNKNOWN",
+        "scan": "UNKNOWN",
+        "execution": "UNKNOWN",
+    },
 }
 
 # ===== AI MEMORY & FIREBASE =====
@@ -1391,7 +1400,8 @@ def build_final_execution_summary(candidate_rows=None, live_rows=None):
         primary = candidate_rows[0]
         source = "candidate"
 
-    last_decision = EXECUTION_DECISIONS[-1] if EXECUTION_DECISIONS else None
+    active_decisions = _decision_rows_current_only(EXECUTION_DECISIONS)
+    last_decision = active_decisions[-1] if active_decisions else None
     symbol = None
     side = None
 
@@ -1406,9 +1416,9 @@ def build_final_execution_summary(candidate_rows=None, live_rows=None):
 
     recent = []
     if symbol:
-        recent = [r for r in EXECUTION_DECISIONS if r.get("symbol") == symbol][-8:]
-    elif EXECUTION_DECISIONS:
-        recent = EXECUTION_DECISIONS[-8:]
+        recent = [r for r in active_decisions if r.get("symbol") == symbol][-8:]
+    elif active_decisions:
+        recent = active_decisions[-8:]
 
     last_for_symbol = recent[-1] if recent else last_decision
     live = next((row for row in live_rows if row.get("symbol") == symbol), None) if symbol else None
@@ -1984,6 +1994,60 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
         return {"account": label, "error": err, "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None}
 
 
+def _telegram_clear_alert_key(key: str) -> None:
+    if not TELEGRAM_CLEAR_RESOLVED_KEYS:
+        return
+    try:
+        TELEGRAM_ALERT_STATE.get("last_sent_by_key", {}).pop(key, None)
+    except Exception:
+        pass
+
+
+def _telegram_clear_alert_prefix(prefix: str) -> None:
+    if not TELEGRAM_CLEAR_RESOLVED_KEYS:
+        return
+    try:
+        last_sent = TELEGRAM_ALERT_STATE.get("last_sent_by_key", {})
+        for key in list(last_sent.keys()):
+            if str(key).startswith(prefix):
+                last_sent.pop(key, None)
+    except Exception:
+        pass
+
+
+def _telegram_mark_suppressed(key: str, reason: str, detail=None) -> None:
+    TELEGRAM_ALERT_STATE.setdefault("suppressed_by_key", {})[key] = {
+        "reason": reason,
+        "detail": detail or {},
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": time.time(),
+    }
+
+
+def _decision_rows_current_only(rows=None):
+    """Return execution decisions from the current scan/execution era only."""
+    rows = rows if rows is not None else EXECUTION_DECISIONS
+    if not rows:
+        return []
+    if not TELEGRAM_ALERT_CURRENT_ONLY:
+        return list(rows)
+    try:
+        cutoff = max(float(LAST_SCAN_CYCLE_TS or 0), float((LAST_FINAL_EXECUTION or {}).get("ts") or 0) - 1.0)
+    except Exception:
+        cutoff = float(LAST_SCAN_CYCLE_TS or 0)
+    if cutoff <= 0:
+        return []
+    current = []
+    for row in rows:
+        try:
+            ts = float(row.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        if ts >= cutoff:
+            current.append(row)
+    return current
+
+
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -2041,50 +2105,102 @@ def build_telegram_alert_status():
         "ws_startup_grace_seconds": TELEGRAM_WS_STARTUP_GRACE_SECONDS,
         "require_ws_block": TELEGRAM_REQUIRE_WS_BLOCK,
         "send_recovery_alert": TELEGRAM_SEND_RECOVERY_ALERT,
+        "current_only": TELEGRAM_ALERT_CURRENT_ONLY,
+        "clear_resolved_keys": TELEGRAM_CLEAR_RESOLVED_KEYS,
         "ws_block_active": bool(TELEGRAM_ALERT_STATE.get("ws_block_active", False)),
         "ws_block_reason": TELEGRAM_ALERT_STATE.get("ws_block_reason"),
         "app_uptime_seconds": round(now - APP_START_TS, 2),
+        "current_state": TELEGRAM_ALERT_STATE.get("current_state", {}),
+        "suppressed_by_key": TELEGRAM_ALERT_STATE.get("suppressed_by_key", {}),
         "last_sent_ago_by_key": {k: round(now - float(v), 2) for k, v in last_sent.items()},
         "last_alerts": TELEGRAM_ALERT_STATE.get("last_alerts", [])[-10:],
     }
 
 
 def check_runtime_telegram_alerts():
+    """Telegram alerts bound to current source-of-truth only.
+
+    Important: never alert from stale EXECUTION_DECISIONS rows. A resolved/fresh
+    scan must suppress old scan_stale/ws_stale/blocked:* alert keys.
+    """
     if not TELEGRAM_ALERTS_ENABLED or not AUTO_MODE:
         return
+
     now = time.time()
-    summary = build_final_execution_summary(sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True), [])
-    status = summary.get("status")
-    reason = summary.get("reason") or "UNKNOWN"
+    try:
+        live_rows = build_live_position_rows()[:10]
+    except Exception:
+        live_rows = []
+
+    candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+    summary = build_final_execution_summary(candidate_rows, live_rows)
+    status = str(summary.get("status") or "UNKNOWN")
+    reason = str(summary.get("reason") or "UNKNOWN")
     age = float(summary.get("age_seconds") or 0)
     symbol = summary.get("symbol") or "_SYSTEM_"
+    last_stage = summary.get("last_stage") or "-"
+    last_scan_age = summary.get("last_scan_age_seconds")
 
-    if status == "BLOCKED" and age >= TELEGRAM_BLOCKED_ALERT_MINUTES * 60:
+    TELEGRAM_ALERT_STATE.setdefault("current_state", {})["execution"] = status
+
+    current_final_status = str((LAST_FINAL_EXECUTION or {}).get("status") or "")
+    current_final_ts = float((LAST_FINAL_EXECUTION or {}).get("ts") or 0)
+    current_summary_ts = float(summary.get("since_ts") or 0)
+    is_current_block = (
+        status == "BLOCKED"
+        and current_final_status == "BLOCKED"
+        and current_summary_ts >= max(0.0, current_final_ts - 1.0)
+    )
+
+    if is_current_block and age >= TELEGRAM_BLOCKED_ALERT_MINUTES * 60:
         send_telegram_alert(
             f"blocked:{symbol}:{reason}",
-            f"⚠️ MONTRA BLOCKED > {TELEGRAM_BLOCKED_ALERT_MINUTES:.0f}m\nSymbol: {symbol}\nReason: {reason}\nAge: {age:.0f}s\nStage: {summary.get('last_stage') or '-'}"
+            f"⚠️ MONTRA BLOCKED > {TELEGRAM_BLOCKED_ALERT_MINUTES:.0f}m\nSymbol: {symbol}\nReason: {reason}\nAge: {age:.0f}s\nStage: {last_stage}"
         )
+    else:
+        _telegram_clear_alert_prefix("blocked:")
+        if status == "BLOCKED" and not is_current_block:
+            _telegram_mark_suppressed("blocked", "stale_or_resolved_block", {
+                "status": status,
+                "reason": reason,
+                "current_final_status": current_final_status,
+                "summary_ts": current_summary_ts,
+                "final_ts": current_final_ts,
+            })
 
     if status == "LIVE_UNPROTECTED" and age >= TELEGRAM_UNPROTECTED_ALERT_SECONDS:
         send_telegram_alert(
             f"unprotected:{symbol}",
             f"🚨 MONTRA LIVE POSITION UNPROTECTED\nSymbol: {symbol}\nAge: {age:.0f}s\nAction: verify SL/TP immediately."
         )
+    elif status != "LIVE_UNPROTECTED":
+        _telegram_clear_alert_prefix("unprotected:")
 
-    if AUTO_TRADING and LAST_SCAN_CYCLE_TS <= 0 and (now - APP_START_TS) > (EXECUTION_BOOT_GRACE_SECONDS + TELEGRAM_SCAN_STALE_ALERT_SECONDS):
-        send_telegram_alert(
-            "scan_never_started",
-            f"⚠️ MONTRA scan telemetry belum mulai\nUptime: {now - APP_START_TS:.0f}s\nBoot grace: {EXECUTION_BOOT_GRACE_SECONDS:.0f}s"
-        )
-
-    if AUTO_TRADING and LAST_SCAN_CYCLE_TS > 0:
-        scan_age = now - LAST_SCAN_CYCLE_TS
+    if AUTO_TRADING and LAST_SCAN_CYCLE_TS <= 0:
+        boot_age = now - APP_START_TS
+        if boot_age > (EXECUTION_BOOT_GRACE_SECONDS + TELEGRAM_SCAN_STALE_ALERT_SECONDS):
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "NEVER_STARTED"
+            send_telegram_alert(
+                "scan_never_started",
+                f"⚠️ MONTRA scan telemetry belum mulai\nUptime: {boot_age:.0f}s\nBoot grace: {EXECUTION_BOOT_GRACE_SECONDS:.0f}s"
+            )
+        else:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "BOOT_GRACE"
+            _telegram_clear_alert_key("scan_never_started")
+            _telegram_clear_alert_key("scan_stale")
+    elif AUTO_TRADING and LAST_SCAN_CYCLE_TS > 0:
+        scan_age = float(last_scan_age if last_scan_age is not None else (now - LAST_SCAN_CYCLE_TS))
         stale_limit = max(TELEGRAM_SCAN_STALE_ALERT_SECONDS, SCAN_INTERVAL_MID * 2)
         if scan_age > stale_limit:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "STALE"
             send_telegram_alert(
                 "scan_stale",
                 f"⚠️ MONTRA scan stale\nLast scan age: {scan_age:.0f}s\nLimit: {stale_limit:.0f}s"
             )
+        else:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "OK"
+            _telegram_clear_alert_key("scan_never_started")
+            _telegram_clear_alert_key("scan_stale")
 
     ws_status = get_ws_status()
     ws_gate = ws_health_snapshot()
@@ -2092,20 +2208,22 @@ def check_runtime_telegram_alerts():
     uptime = now - APP_START_TS
     ws_block_reason = str(ws_gate.get("reason") or "UNKNOWN")
     ws_gate_blocking = bool(ws_gate.get("block")) and ws_block_reason in ("STALE_BLOCK", "SOCKET_DOWN", "THREAD_DEAD")
-    ws_age_stale = ws_age >= TELEGRAM_WS_BLOCK_ALERT_SECONDS
 
-    # Boot guard: ignore default 9999 last_message_age during the startup window.
-    # This prevents false Telegram stale alerts before the first websocket payload arrives.
-    if uptime >= TELEGRAM_WS_STARTUP_GRACE_SECONDS:
-        should_alert_ws = ws_gate_blocking if TELEGRAM_REQUIRE_WS_BLOCK else (ws_gate_blocking or ws_age_stale)
-        if should_alert_ws:
-            TELEGRAM_ALERT_STATE["ws_block_active"] = True
-            TELEGRAM_ALERT_STATE["ws_block_reason"] = ws_block_reason
-            send_telegram_alert(
-                "ws_stale",
-                f"⚠️ MONTRA WS stale/blocking\nReason: {ws_block_reason}\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
-            )
-        elif TELEGRAM_SEND_RECOVERY_ALERT and TELEGRAM_ALERT_STATE.get("ws_block_active"):
+    if uptime < TELEGRAM_WS_STARTUP_GRACE_SECONDS:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "STARTUP_GRACE"
+        _telegram_mark_suppressed("ws_stale", "startup_grace", {"uptime": round(uptime, 2), "age": ws_age})
+    elif ws_gate_blocking:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "BLOCKING"
+        TELEGRAM_ALERT_STATE["ws_block_active"] = True
+        TELEGRAM_ALERT_STATE["ws_block_reason"] = ws_block_reason
+        send_telegram_alert(
+            "ws_stale",
+            f"⚠️ MONTRA WS stale/blocking\nReason: {ws_block_reason}\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
+        )
+    else:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "OK"
+        _telegram_clear_alert_key("ws_stale")
+        if TELEGRAM_SEND_RECOVERY_ALERT and TELEGRAM_ALERT_STATE.get("ws_block_active"):
             TELEGRAM_ALERT_STATE["ws_block_active"] = False
             prev_reason = TELEGRAM_ALERT_STATE.get("ws_block_reason") or "UNKNOWN"
             TELEGRAM_ALERT_STATE["ws_block_reason"] = None
@@ -2120,6 +2238,8 @@ def check_runtime_telegram_alerts():
             "circuit_breaker",
             f"🧯 MONTRA circuit breaker active\nRemaining: {circuit_breaker_remaining():.0f}s\nErrors: {CONSECUTIVE_ERRORS}/{CIRCUIT_BREAKER_THRESHOLD}"
         )
+    else:
+        _telegram_clear_alert_key("circuit_breaker")
 
 
 def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = True):
