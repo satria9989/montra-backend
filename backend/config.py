@@ -83,6 +83,7 @@ MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0015"))
 MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0030"))
 FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))
 STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
+PROTECTION_ORDER_MODE = (os.getenv("PROTECTION_ORDER_MODE", "REDUCE_ONLY") or "REDUCE_ONLY").strip().upper()
 ORDER_ID_PREFIX = os.getenv("ORDER_ID_PREFIX", "M")
 
 # Dynamic spread gate. Per-pair override format: SPREAD_THRESHOLD_BTCUSDT=0.0006

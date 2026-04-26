@@ -99,6 +99,8 @@ SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.15"))
 PROTECTION_PLACEMENT_GAP_SECONDS = float(os.getenv("PROTECTION_PLACEMENT_GAP_SECONDS", "0.35"))
 PROTECTION_VERIFY_RETRIES = int(os.getenv("PROTECTION_VERIFY_RETRIES", "4"))
 PROTECTION_VERIFY_DELAY = float(os.getenv("PROTECTION_VERIFY_DELAY", "0.50"))
+PROTECTION_ORDER_MODE = (os.getenv("PROTECTION_ORDER_MODE", "REDUCE_ONLY") or "REDUCE_ONLY").strip().upper()
+
 
 # ===== CIRCUIT BREAKER / SPREAD GATE =====
 CONSECUTIVE_ERRORS = 0
@@ -1638,12 +1640,35 @@ load_rl_weights()
 def floor_to_step(value, step):
     d = Decimal(str(value))
     s = Decimal(str(step))
+    if s <= 0:
+        return float(d)
     return float((d / s).to_integral_value(rounding=ROUND_DOWN) * s)
 
 def ceil_to_step(value, step):
     d = Decimal(str(value))
     s = Decimal(str(step))
+    if s <= 0:
+        return float(d)
     return float((d / s).to_integral_value(rounding=ROUND_UP) * s)
+
+def _round_decimal_to_step(value, step, rounding=ROUND_DOWN):
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return d
+    return (d / s).to_integral_value(rounding=rounding) * s
+
+def _format_decimal_to_step(value, step):
+    """Return Binance-safe decimal string using the exact step/tick precision.
+
+    Avoid passing raw Python floats like 98.74000000000002 as stopPrice.
+    """
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return format(d.normalize(), "f")
+    q = s.normalize()
+    return format(d.quantize(q), "f")
 
 def normalize_price(symbol, price):
     f = EXCHANGE_CACHE.get(symbol)
@@ -1653,24 +1678,51 @@ def normalize_price(symbol, price):
     return floor_to_step(price, tick)
 
 
-def normalize_protective_price(symbol, price, side, leg):
-    """Round SL/TP to Binance tickSize before sending protective orders.
+def normalize_protective_price_detail(symbol, price, side, leg):
+    """Round SL/TP using EXCHANGE_CACHE tickSize and return float + safe string.
 
-    Directional rounding is deliberately conservative:
-    - BUY SL floors lower, BUY TP floors closer.
-    - SELL SL ceils higher, SELL TP floors lower.
-    This keeps stopPrice valid and avoids accidentally moving SELL SL closer.
+    No extra Binance API call is made here. If tickSize is missing, the caller
+    gets tick_missing=True so entry can be blocked before creating an unprotected position.
     """
     f = EXCHANGE_CACHE.get(symbol) or {}
-    tick = float(f.get("tickSize") or 0)
-    raw = float(price or 0)
-    if raw <= 0 or tick <= 0:
-        return raw
+    tick = f.get("tickSize")
+    raw = Decimal(str(price or 0))
     side = str(side or "").upper()
     leg = str(leg or "").upper()
+    if raw <= 0:
+        return {"ok": False, "reason": "invalid_price", "raw": float(raw), "value": float(raw), "text": str(raw), "tickSize": tick}
+    if not tick or float(tick) <= 0:
+        return {"ok": False, "reason": "missing_tick_size", "raw": float(raw), "value": float(raw), "text": format(raw, "f"), "tickSize": tick}
+
+    rounding = ROUND_DOWN
     if side == "SELL" and leg == "SL":
-        return ceil_to_step(raw, tick)
-    return floor_to_step(raw, tick)
+        rounding = ROUND_UP
+
+    rounded = _round_decimal_to_step(raw, tick, rounding=rounding)
+    return {
+        "ok": True,
+        "reason": "OK",
+        "raw": float(raw),
+        "value": float(rounded),
+        "text": _format_decimal_to_step(rounded, tick),
+        "tickSize": float(tick),
+        "rounding": "UP" if rounding == ROUND_UP else "DOWN",
+        "leg": leg,
+    }
+
+def normalize_protective_price(symbol, price, side, leg):
+    return normalize_protective_price_detail(symbol, price, side, leg).get("value", float(price or 0))
+
+def normalize_quantity_detail(symbol, qty):
+    f = EXCHANGE_CACHE.get(symbol) or {}
+    step = f.get("stepSize")
+    raw = Decimal(str(qty or 0))
+    if raw <= 0:
+        return {"ok": False, "reason": "invalid_qty", "raw": float(raw), "value": float(raw), "text": str(raw), "stepSize": step}
+    if not step or float(step) <= 0:
+        return {"ok": False, "reason": "missing_step_size", "raw": float(raw), "value": float(raw), "text": format(raw, "f"), "stepSize": step}
+    rounded = _round_decimal_to_step(raw, step, rounding=ROUND_DOWN)
+    return {"ok": True, "reason": "OK", "raw": float(raw), "value": float(rounded), "text": _format_decimal_to_step(rounded, step), "stepSize": float(step)}
 
 def load_exchange_cache():
     global EXCHANGE_CACHE
@@ -1899,24 +1951,49 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     if side not in ("BUY", "SELL"):
         return {"account": label, "error": "invalid_side"}
 
-    qty = abs(float(qty or 0))
-    if qty <= 0:
-        return {"account": label, "error": "qty_zero"}
+    # Use EXCHANGE_CACHE precision only; no extra exchangeInfo/API call here.
+    qty_detail = normalize_quantity_detail(symbol, qty)
+    sl_detail = normalize_protective_price_detail(symbol, sl, side, "SL")
+    tp_detail = normalize_protective_price_detail(symbol, tp, side, "TP")
 
-    raw_sl = float(sl)
-    raw_tp = float(tp)
-    sl_price = normalize_protective_price(symbol, raw_sl, side, "SL")
-    tp_price = normalize_protective_price(symbol, raw_tp, side, "TP")
+    precision_detail = {
+        "account": label,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty_detail,
+        "sl": sl_detail,
+        "tp": tp_detail,
+        "exchange_cache": EXCHANGE_CACHE.get(symbol),
+        "protection_order_mode": PROTECTION_ORDER_MODE,
+    }
+
+    if not qty_detail.get("ok") or not sl_detail.get("ok") or not tp_detail.get("ok"):
+        add_order_audit("PROTECTION_PRECISION_INVALID", symbol, precision_detail)
+        return {"account": label, "error": "precision_invalid", "precision": precision_detail}
+
+    qty = qty_detail["value"]
+    qty_text = qty_detail["text"]
+    sl_price = sl_detail["value"]
+    tp_price = tp_detail["value"]
+    sl_text = sl_detail["text"]
+    tp_text = tp_detail["text"]
     close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
 
     add_order_audit("PROTECTION_PRICE_NORMALIZED", symbol, {
         "account": label,
         "side": side,
-        "raw_sl": raw_sl,
-        "raw_tp": raw_tp,
+        "raw_sl": float(sl),
+        "raw_tp": float(tp),
         "sl": sl_price,
         "tp": tp_price,
-        "tickSize": (EXCHANGE_CACHE.get(symbol) or {}).get("tickSize"),
+        "sl_text": sl_text,
+        "tp_text": tp_text,
+        "qty": qty,
+        "qty_text": qty_text,
+        "tickSize": sl_detail.get("tickSize"),
+        "stepSize": qty_detail.get("stepSize"),
+        "rounding": {"sl": sl_detail.get("rounding"), "tp": tp_detail.get("rounding")},
+        "protection_order_mode": PROTECTION_ORDER_MODE,
     })
 
     if not cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True):
@@ -1926,10 +2003,29 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     entry_order = None
     sl_order = None
     tp_order = None
+
+    def _protective_order_kwargs(order_type, stop_price_text, client_order_id):
+        base = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": order_type,
+            "stopPrice": stop_price_text,
+            "workingType": "MARK_PRICE",
+            "newClientOrderId": client_order_id,
+        }
+        # REDUCE_ONLY is the default because it is explicit and easier to verify
+        # than closePosition=True. CLOSE_POSITION remains available by env fallback.
+        if PROTECTION_ORDER_MODE == "CLOSE_POSITION":
+            base["closePosition"] = True
+        else:
+            base["quantity"] = qty_text
+            base["reduceOnly"] = True
+        return base
+
     try:
         entry_client_id = build_order_client_id(symbol, side, "ENT")
         add_order_audit("ENTRY_PLACE_ATTEMPT", symbol, {
-            "account": label, "side": side, "qty": qty, "clientOrderId": entry_client_id
+            "account": label, "side": side, "qty": qty, "qty_text": qty_text, "clientOrderId": entry_client_id
         })
         entry_order = signed_call(
             client_obj,
@@ -1938,7 +2034,7 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             symbol=symbol,
             side=SIDE_BUY if side == "BUY" else SIDE_SELL,
             type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=qty,
+            quantity=qty_text,
             newClientOrderId=entry_client_id,
         )
         add_order_audit("ENTRY_PLACE_OK", symbol, {
@@ -1951,64 +2047,64 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
         time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
 
         sl_client_id = build_order_client_id(symbol, side, "SL")
+        sl_kwargs = _protective_order_kwargs(FUTURE_ORDER_TYPE_STOP_MARKET, sl_text, sl_client_id)
         add_order_audit("PLACE_SL_ATTEMPT", symbol, {
-            "account": label, "side": close_side, "stopPrice": sl_price, "workingType": "MARK_PRICE",
-            "closePosition": True, "clientOrderId": sl_client_id
+            "account": label,
+            "params": {k: v for k, v in sl_kwargs.items() if k != "newClientOrderId"},
+            "clientOrderId": sl_client_id,
         })
         try:
             sl_order = signed_call(
                 client_obj,
                 client_obj.futures_create_order,
                 label=label,
-                symbol=symbol,
-                side=close_side,
-                type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                stopPrice=sl_price,
-                closePosition=True,
-                workingType="MARK_PRICE",
-                newClientOrderId=sl_client_id,
+                **sl_kwargs,
             )
             add_order_audit("PLACE_SL_OK", symbol, {
                 "account": label,
                 "order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
                 "clientOrderId": sl_client_id,
-                "stopPrice": sl_price,
+                "stopPrice": sl_text,
                 "status": sl_order.get("status") if isinstance(sl_order, dict) else None,
+                "type": sl_order.get("type") if isinstance(sl_order, dict) else None,
+                "closePosition": sl_order.get("closePosition") if isinstance(sl_order, dict) else None,
+                "reduceOnly": sl_order.get("reduceOnly") if isinstance(sl_order, dict) else None,
             })
         except Exception as sl_exc:
             add_order_audit("PLACE_SL_FAILED", symbol, {
-                "account": label, "error": str(sl_exc), "stopPrice": sl_price, "clientOrderId": sl_client_id
+                "account": label, "error": str(sl_exc), "stopPrice": sl_text, "clientOrderId": sl_client_id,
+                "params": {k: v for k, v in sl_kwargs.items() if k != "newClientOrderId"},
             })
             raise
 
         tp_client_id = build_order_client_id(symbol, side, "TP")
+        tp_kwargs = _protective_order_kwargs(FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET, tp_text, tp_client_id)
         add_order_audit("PLACE_TP_ATTEMPT", symbol, {
-            "account": label, "side": close_side, "stopPrice": tp_price, "workingType": "MARK_PRICE",
-            "closePosition": True, "clientOrderId": tp_client_id
+            "account": label,
+            "params": {k: v for k, v in tp_kwargs.items() if k != "newClientOrderId"},
+            "clientOrderId": tp_client_id,
         })
         try:
             tp_order = signed_call(
                 client_obj,
                 client_obj.futures_create_order,
                 label=label,
-                symbol=symbol,
-                side=close_side,
-                type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                stopPrice=tp_price,
-                closePosition=True,
-                workingType="MARK_PRICE",
-                newClientOrderId=tp_client_id,
+                **tp_kwargs,
             )
             add_order_audit("PLACE_TP_OK", symbol, {
                 "account": label,
                 "order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
                 "clientOrderId": tp_client_id,
-                "stopPrice": tp_price,
+                "stopPrice": tp_text,
                 "status": tp_order.get("status") if isinstance(tp_order, dict) else None,
+                "type": tp_order.get("type") if isinstance(tp_order, dict) else None,
+                "closePosition": tp_order.get("closePosition") if isinstance(tp_order, dict) else None,
+                "reduceOnly": tp_order.get("reduceOnly") if isinstance(tp_order, dict) else None,
             })
         except Exception as tp_exc:
             add_order_audit("PLACE_TP_FAILED", symbol, {
-                "account": label, "error": str(tp_exc), "stopPrice": tp_price, "clientOrderId": tp_client_id
+                "account": label, "error": str(tp_exc), "stopPrice": tp_text, "clientOrderId": tp_client_id,
+                "params": {k: v for k, v in tp_kwargs.items() if k != "newClientOrderId"},
             })
             raise
 
@@ -2023,12 +2119,18 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "symbol": symbol,
                 "side": side,
                 "qty": qty,
+                "qty_text": qty_text,
                 "sl": sl_price,
                 "tp": tp_price,
+                "sl_text": sl_text,
+                "tp_text": tp_text,
                 "verify": verify,
                 "entry_order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
                 "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
                 "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+                "sl_order_status": sl_order.get("status") if isinstance(sl_order, dict) else None,
+                "tp_order_status": tp_order.get("status") if isinstance(tp_order, dict) else None,
+                "protection_order_mode": PROTECTION_ORDER_MODE,
             }
             add_order_audit("PROTECTION_VERIFY_FAILED", symbol, detail)
             if STRICT_PROTECTION:
@@ -2039,11 +2141,17 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                     "status": "CLOSED_UNPROTECTED",
                     "error": "protection_verify_failed",
                     "qty": qty,
+                    "qty_text": qty_text,
                     "sl": sl_price,
                     "tp": tp_price,
+                    "sl_text": sl_text,
+                    "tp_text": tp_text,
                     "verify": verify,
                     "close_result": close_result,
                     "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                    "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                    "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+                    "protection_order_mode": PROTECTION_ORDER_MODE,
                 }
 
             return {
@@ -2051,32 +2159,48 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "status": "UNPROTECTED",
                 "error": "protection_verify_failed",
                 "qty": qty,
+                "qty_text": qty_text,
                 "sl": sl_price,
                 "tp": tp_price,
+                "sl_text": sl_text,
+                "tp_text": tp_text,
                 "verify": verify,
                 "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+                "protection_order_mode": PROTECTION_ORDER_MODE,
             }
 
         add_order_audit("PROTECTION_RESOLVED", symbol, {
             "account": label,
             "side": side,
             "qty": qty,
+            "qty_text": qty_text,
             "sl": sl_price,
             "tp": tp_price,
+            "sl_text": sl_text,
+            "tp_text": tp_text,
             "verify": verify,
+            "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+            "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+            "protection_order_mode": PROTECTION_ORDER_MODE,
         })
 
         return {
             "account": label,
             "status": "OK",
             "qty": qty,
+            "qty_text": qty_text,
             "sl": sl_price,
             "tp": tp_price,
+            "sl_text": sl_text,
+            "tp_text": tp_text,
             "protective_resolved": True,
             "verify": verify,
             "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
             "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+            "protection_order_mode": PROTECTION_ORDER_MODE,
         }
 
     except Exception as exc:
@@ -2089,6 +2213,10 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
             "sl": sl_price,
             "tp": tp_price,
+            "sl_text": sl_text,
+            "tp_text": tp_text,
+            "qty_text": qty_text,
+            "protection_order_mode": PROTECTION_ORDER_MODE,
         })
         if entry_order and STRICT_PROTECTION:
             close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_create_error")
@@ -2099,6 +2227,9 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "error": err,
                 "close_result": close_result,
                 "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+                "protection_order_mode": PROTECTION_ORDER_MODE,
             }
         return {"account": label, "error": err, "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None}
 
@@ -4109,6 +4240,19 @@ def debug_sweep_memory(symbol: str, timeframe: str = Query(default="15m"), limit
         }
     except Exception as e:
         return {"symbol": symbol.upper(), "error": str(e)}
+
+
+@app.get("/debug/exchange-filter/{symbol}")
+def debug_exchange_filter(symbol: str):
+    sym = str(symbol or "").upper().strip()
+    row = EXCHANGE_CACHE.get(sym)
+    return {
+        "symbol": sym,
+        "found": bool(row),
+        "filter": row,
+        "source": "EXCHANGE_CACHE",
+        "note": "Used for qty stepSize and protective SL/TP tickSize; no extra Binance API call.",
+    }
 
 
 @app.get("/debug/telegram-alerts")
