@@ -10,9 +10,9 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", 5))  # USD
 MAX_CONSECUTIVE_LOSS = int(os.getenv("MAX_CONSECUTIVE_LOSS", 3))
-BASE_RISK = float(os.getenv("BASE_RISK", 1))  # % per trade
-MIN_RISK = 0.3
-MAX_RISK = 2
+BASE_RISK = float(os.getenv("BASE_RISK", "0.01"))  # decimal fraction, 0.01 = 1% per trade
+MIN_RISK = float(os.getenv("MIN_RISK", "0.003"))  # 0.3%
+MAX_RISK = float(os.getenv("MAX_RISK", "0.02"))   # 2.0%
 
 # =========================
 # MONTRA PAIR UNIVERSE V5.3 — 3 active groups
@@ -147,7 +147,7 @@ TELEGRAM_CLEAR_RESOLVED_KEYS = os.getenv("TELEGRAM_CLEAR_RESOLVED_KEYS", "true")
 
 # Controlled limit entry to avoid bad fills/slippage. SL/TP and emergency close stay market/conditional.
 ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()
-ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "15"))
+ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "30"))
 ENTRY_LIMIT_POLL_INTERVAL = float(os.getenv("ENTRY_LIMIT_POLL_INTERVAL", "0.50"))
 ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "2"))
 ENTRY_MARKET_FALLBACK = os.getenv("ENTRY_MARKET_FALLBACK", "false").lower() == "true"
@@ -175,3 +175,22 @@ CLOSE_AUDIT_LOOKBACK_MINUTES = int(os.getenv("CLOSE_AUDIT_LOOKBACK_MINUTES", "60
 CLOSE_AUDIT_FETCH_ORDERS = os.getenv("CLOSE_AUDIT_FETCH_ORDERS", "true").lower() == "true"
 CLOSE_AUDIT_TRADE_LIMIT = int(os.getenv("CLOSE_AUDIT_TRADE_LIMIT", "80"))
 CLOSE_AUDIT_ORDER_LIMIT = int(os.getenv("CLOSE_AUDIT_ORDER_LIMIT", "80"))
+
+# Precision execution engine.
+SMART_OB_LOOKBACK = int(os.getenv("SMART_OB_LOOKBACK", "14"))
+SMART_OB_EXCLUDE_RECENT_CANDLES = int(os.getenv("SMART_OB_EXCLUDE_RECENT_CANDLES", "1"))
+SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
+SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
+SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
+SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
+PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.45"))
+META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.35"))
+ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0.20"))
+
+# Profit management.
+PARTIAL_TP_ENABLED = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+PARTIAL_TP_R1_RATIO = float(os.getenv("PARTIAL_TP_R1_RATIO", "0.40"))
+SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.009"))
+SMART_TRAIL_ACTIVE_PCT = float(os.getenv("SMART_TRAIL_ACTIVE_PCT", "0.018"))
+SMART_TRAIL_LOCK_RATIO = float(os.getenv("SMART_TRAIL_LOCK_RATIO", "0.70"))
+STATE_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("STATE_SAVE_MIN_INTERVAL_SECONDS", "30"))

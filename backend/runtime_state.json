@@ -1,9 +1,9 @@
 {
-  "kill_switch": true,
+  "kill_switch": false,
   "start_equity": 57.13228443,
-  "daily_start_equity": 90.2491917,
-  "last_day": "2026-04-28",
-  "daily_loss": 1.23400999,
+  "daily_start_equity": 88.63411145,
+  "last_day": "2026-04-29",
+  "daily_loss": 0.0,
   "consecutive_loss": 3,
   "current_risk": 0.017787,
   "cooldowns": {},
@@ -3323,5 +3323,5 @@
     "WIFUSDT": 0.053549190535491904,
     "1000PEPEUSDT": 0.05977584059775841
   },
-  "updated_at": "2026-04-29 02:32:03"
+  "updated_at": "2026-04-29 05:33:37"
 }

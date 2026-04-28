@@ -121,7 +121,7 @@ EMERGENCY_CLOSE_VERIFY_DELAY = float(os.getenv("EMERGENCY_CLOSE_VERIFY_DELAY", "
 # Controlled entry guard. Use a marketable LIMIT with a small tier-based cap
 # to avoid bad fills/slippage. SL/TP and emergency close remain market/conditional.
 ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()
-ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "15"))
+ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "30"))
 ENTRY_LIMIT_POLL_INTERVAL = float(os.getenv("ENTRY_LIMIT_POLL_INTERVAL", "0.50"))
 ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "2"))
 ENTRY_MARKET_FALLBACK = os.getenv("ENTRY_MARKET_FALLBACK", "false").lower() == "true"
@@ -201,6 +201,25 @@ STRUCTURE_RECENT_WINDOW = int(os.getenv("STRUCTURE_RECENT_WINDOW", "3"))
 STRUCTURE_ZONE_TOLERANCE = float(os.getenv("STRUCTURE_ZONE_TOLERANCE", "0.0012"))
 STRUCTURE_STRONG_SCORE_BONUS = int(os.getenv("STRUCTURE_STRONG_SCORE_BONUS", "6"))
 STRUCTURE_MEDIUM_SCORE_PENALTY = int(os.getenv("STRUCTURE_MEDIUM_SCORE_PENALTY", "2"))
+
+# ===== PRECISION EXECUTION ENGINE =====
+SMART_OB_LOOKBACK = int(os.getenv("SMART_OB_LOOKBACK", "14"))
+SMART_OB_EXCLUDE_RECENT_CANDLES = int(os.getenv("SMART_OB_EXCLUDE_RECENT_CANDLES", "1"))
+SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
+SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
+SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
+SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
+PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.45"))
+META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.35"))
+ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0.20"))
+
+# ===== PROFIT MANAGEMENT =====
+PARTIAL_TP_ENABLED = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+PARTIAL_TP_R1_RATIO = float(os.getenv("PARTIAL_TP_R1_RATIO", "0.40"))
+SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.009"))
+SMART_TRAIL_ACTIVE_PCT = float(os.getenv("SMART_TRAIL_ACTIVE_PCT", "0.018"))
+SMART_TRAIL_LOCK_RATIO = float(os.getenv("SMART_TRAIL_LOCK_RATIO", "0.70"))
+STATE_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("STATE_SAVE_MIN_INTERVAL_SECONDS", "30"))
 
 # ===== EXECUTION / NOTIONAL QUALITY =====
 TOP_MIN_TRADE_NOTIONAL = float(os.getenv("TOP_MIN_TRADE_NOTIONAL", "100"))
@@ -853,9 +872,9 @@ LAST_DAY = None
 # ===== PERFORMANCE TRACKING =====
 daily_loss = 0
 consecutive_loss = 0
-current_risk = BASE_RISK
-MIN_RISK = 0.005
-MAX_RISK = 0.03
+current_risk = float(os.getenv("BASE_RISK", str(BASE_RISK)))
+MIN_RISK = float(os.getenv("MIN_RISK", str(globals().get("MIN_RISK", 0.003))))
+MAX_RISK = float(os.getenv("MAX_RISK", str(globals().get("MAX_RISK", 0.02))))
 
 # ✅ PAIR STATS & DISABLED PAIRS
 pair_stats = {}
@@ -928,6 +947,10 @@ position_entry_score = {}  # menyimpan score saat entry untuk RL update
 LAST_SIGNAL = None
 TELEGRAM_LAST_UPDATE_ID = None
 
+LAST_STATE_SAVE_TS = 0.0
+SAVE_RUNTIME_STATE_DIRTY = False
+STATE_SAVE_LOCK = threading.RLock()
+
 def add_order_audit(event_type, symbol, detail=None):
     global ORDER_AUDIT_LOG
 
@@ -951,7 +974,7 @@ def add_order_audit(event_type, symbol, detail=None):
 
 def save_trade_snapshot(symbol, snapshot):
     TRADE_SNAPSHOTS[symbol] = snapshot
-    save_runtime_state()
+    save_runtime_state(force=True)
 
 def move_snapshot_to_replay(symbol, close_info):
     snap = TRADE_SNAPSHOTS.pop(symbol, None)
@@ -971,7 +994,7 @@ def move_snapshot_to_replay(symbol, close_info):
     if len(TRADE_REPLAY_LOG) > MAX_REPLAY_LOG:
         del TRADE_REPLAY_LOG[:-MAX_REPLAY_LOG]
 
-    save_runtime_state()
+    save_runtime_state(force=True)
 
 def build_runtime_state():
     cooldowns = {}
@@ -1001,10 +1024,27 @@ def build_runtime_state():
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-def save_runtime_state():
+def save_runtime_state(force=False):
+    global LAST_STATE_SAVE_TS, SAVE_RUNTIME_STATE_DIRTY
+
+    now = time.time()
+    if (
+        not force
+        and STATE_SAVE_MIN_INTERVAL_SECONDS > 0
+        and LAST_STATE_SAVE_TS
+        and (now - LAST_STATE_SAVE_TS) < STATE_SAVE_MIN_INTERVAL_SECONDS
+    ):
+        SAVE_RUNTIME_STATE_DIRTY = True
+        return
+
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(build_runtime_state(), f, indent=2)
+        with STATE_SAVE_LOCK:
+            tmp_file = f"{STATE_FILE}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(build_runtime_state(), f, indent=2)
+            os.replace(tmp_file, STATE_FILE)
+            LAST_STATE_SAVE_TS = time.time()
+            SAVE_RUNTIME_STATE_DIRTY = False
     except Exception as e:
         print("save_runtime_state error:", e)
 
@@ -1410,6 +1450,269 @@ def structure_score_adjustment(structure):
         return -STRUCTURE_MEDIUM_SCORE_PENALTY
     return 0
 
+def _candle_open(candle):
+    return float(candle[1])
+
+def _candle_high(candle):
+    return float(candle[2])
+
+def _candle_low(candle):
+    return float(candle[3])
+
+def _candle_close(candle):
+    return float(candle[4])
+
+def calculate_atr(ohlcv, period=None):
+    period = max(2, int(period or SMART_SL_ATR_PERIOD))
+    if len(ohlcv) < 2:
+        return 0.0
+
+    start = max(1, len(ohlcv) - period)
+    true_ranges = []
+    for i in range(start, len(ohlcv)):
+        high = _candle_high(ohlcv[i])
+        low = _candle_low(ohlcv[i])
+        prev_close = _candle_close(ohlcv[i - 1])
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    if not true_ranges:
+        return 0.0
+    return sum(true_ranges) / len(true_ranges)
+
+def find_last_order_block(ohlcv, side, lookback=None):
+    side = str(side or "").upper().strip()
+    lookback = max(4, int(lookback or SMART_OB_LOOKBACK))
+    if len(ohlcv) < 5:
+        return None
+
+    exclude = max(1, int(SMART_OB_EXCLUDE_RECENT_CANDLES))
+    end = max(1, len(ohlcv) - 1 - exclude)
+    start = max(0, end - lookback)
+
+    for idx in range(end, start - 1, -1):
+        candle = ohlcv[idx]
+        opened = _candle_open(candle)
+        high = _candle_high(candle)
+        low = _candle_low(candle)
+        closed = _candle_close(candle)
+
+        if side == "BUY" and closed < opened:
+            return {
+                "index": idx,
+                "source": "last_bearish_before_break",
+                "open": opened,
+                "high": high,
+                "low": low,
+                "close": closed,
+                "top": opened,
+                "bottom": low,
+            }
+
+        if side == "SELL" and closed > opened:
+            return {
+                "index": idx,
+                "source": "last_bullish_before_break",
+                "open": opened,
+                "high": high,
+                "low": low,
+                "close": closed,
+                "top": high,
+                "bottom": opened,
+            }
+
+    fallback_idx = max(0, len(ohlcv) - 4)
+    candle = ohlcv[fallback_idx]
+    return {
+        "index": fallback_idx,
+        "source": "fallback_minus_4",
+        "open": _candle_open(candle),
+        "high": _candle_high(candle),
+        "low": _candle_low(candle),
+        "close": _candle_close(candle),
+        "top": _candle_high(candle),
+        "bottom": _candle_low(candle),
+    }
+
+def _directional_fvg_target(side, entry, structure):
+    if not structure:
+        return None
+
+    side = str(side or "").upper().strip()
+    zones = []
+    if structure.get("fvg_up_zone"):
+        zones.append(("fvg_up_zone", structure.get("fvg_up_zone")))
+    if structure.get("fvg_down_zone"):
+        zones.append(("fvg_down_zone", structure.get("fvg_down_zone")))
+
+    candidates = []
+    for name, zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        top = _safe_float(zone.get("top"), 0.0)
+        bottom = _safe_float(zone.get("bottom"), 0.0)
+        if top <= 0 or bottom <= 0:
+            continue
+
+        if side == "BUY":
+            price = max(top, bottom)
+            if price > entry:
+                candidates.append({"source": name, "price": price, "zone": zone})
+        elif side == "SELL":
+            price = min(top, bottom)
+            if price < entry:
+                candidates.append({"source": name, "price": price, "zone": zone})
+
+    if not candidates:
+        return None
+
+    if side == "BUY":
+        return min(candidates, key=lambda row: row["price"] - entry)
+    return min(candidates, key=lambda row: entry - row["price"])
+
+def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_target=None):
+    side = str(side or "").upper().strip()
+    entry = float(entry or 0.0)
+    rr_target = float(rr_target or active_target_rr())
+
+    if side not in ("BUY", "SELL") or entry <= 0 or len(ohlcv) < 5:
+        return {"ok": False, "reason": "INVALID_TRADE_PLAN_INPUT", "side": side, "entry": entry}
+
+    atr = calculate_atr(ohlcv, SMART_SL_ATR_PERIOD)
+    ob = find_last_order_block(ohlcv, side)
+    if not ob:
+        return {"ok": False, "reason": "ORDER_BLOCK_NOT_FOUND", "side": side, "entry": entry, "atr": atr}
+
+    sl_buffer = max(atr * SMART_SL_ATR_BUFFER_MULT, entry * 0.00005)
+    recent = ohlcv[-max(3, min(len(ohlcv), SMART_OB_LOOKBACK)):]
+    recent_low = min(_candle_low(c) for c in recent)
+    recent_high = max(_candle_high(c) for c in recent)
+
+    if side == "BUY":
+        sl = min(float(ob["low"]), recent_low) - sl_buffer
+        if sl >= entry:
+            sl = recent_low - sl_buffer
+        risk = entry - sl
+        tp_rr = entry + (risk * rr_target)
+    else:
+        sl = max(float(ob["high"]), recent_high) + sl_buffer
+        if sl <= entry:
+            sl = recent_high + sl_buffer
+        risk = sl - entry
+        tp_rr = entry - (risk * rr_target)
+
+    if risk <= 0:
+        return {"ok": False, "reason": "INVALID_RISK_DISTANCE", "side": side, "entry": entry, "sl": sl, "ob": ob, "atr": atr}
+
+    tp = tp_rr
+    tp_source = "rr_target"
+    fvg_target = _directional_fvg_target(side, entry, structure)
+    if SMART_TP_USE_FVG_MAGNET and fvg_target:
+        fvg_price = float(fvg_target["price"])
+        fvg_rr = abs(fvg_price - entry) / max(risk, 1e-12)
+        if fvg_rr >= active_rr_min() and fvg_rr <= max(rr_target * SMART_TP_FVG_MAX_RR_MULT, active_rr_min()):
+            tp = fvg_price
+            tp_source = fvg_target.get("source", "fvg_magnet")
+
+    rr = abs(tp - entry) / max(risk, 1e-12)
+    return {
+        "ok": True,
+        "reason": "OK",
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "atr": atr,
+        "sl_buffer": sl_buffer,
+        "ob": ob,
+        "tp_source": tp_source,
+        "fvg_target": fvg_target,
+        "rr_target": rr_target,
+    }
+
+def get_fng_context():
+    return {
+        "value": NEWS_CACHE.get("value"),
+        "classification": NEWS_CACHE.get("classification", "NEUTRAL"),
+        "impact": NEWS_CACHE.get("impact", "NORMAL"),
+        "source": NEWS_CACHE.get("source", "alternative_me_fng"),
+    }
+
+def get_fng_score_bias(side, fng_ctx=None):
+    side = str(side or "").upper().strip()
+    fng_ctx = fng_ctx or get_fng_context()
+    classification = str(fng_ctx.get("classification") or "").upper()
+
+    if classification == "EXTREME_FEAR":
+        return 8 if side == "BUY" else -5
+    if classification == "EXTREME_GREED":
+        return 8 if side == "SELL" else -5
+    return 0
+
+def composite_pre_score(symbol, side, entry, sl, tp, structure, pair_regime, vol, sweep_high=False, sweep_low=False, fng_ctx=None):
+    side = str(side or "").upper().strip()
+    structure = structure or {}
+    score = 58.0
+
+    grade = structure.get("grade")
+    if grade == "STRONG":
+        score += 16
+    elif grade == "MEDIUM":
+        score += 8
+
+    if side == "BUY":
+        if structure.get("swing_break_up"):
+            score += 5
+        if structure.get("reclaim_up") or structure.get("recent_reclaim_up"):
+            score += 5
+        if structure.get("displacement_up") or structure.get("directional_up"):
+            score += 4
+        if structure.get("fvg_up") or structure.get("near_fvg_up"):
+            score += 5
+        if sweep_low:
+            score += 6
+    elif side == "SELL":
+        if structure.get("swing_break_down"):
+            score += 5
+        if structure.get("reclaim_down") or structure.get("recent_reclaim_down"):
+            score += 5
+        if structure.get("displacement_down") or structure.get("directional_down"):
+            score += 4
+        if structure.get("fvg_down") or structure.get("near_fvg_down"):
+            score += 5
+        if sweep_high:
+            score += 6
+
+    rr = abs(float(tp) - float(entry)) / max(abs(float(entry) - float(sl)), 1e-12)
+    if rr >= active_target_rr():
+        score += 5
+    elif rr >= active_rr_min():
+        score += 2
+    else:
+        score -= 12
+
+    stop_ratio = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12)
+    if stop_ratio < MIN_STOP_DISTANCE_PCT * 1.15:
+        score -= 8
+    elif stop_ratio <= 0.02:
+        score += 4
+    else:
+        score -= 4
+
+    if pair_regime == "SIDEWAYS":
+        score -= 5
+    elif pair_regime == "BULL" and side == "BUY":
+        score += 5
+    elif pair_regime == "BEAR" and side == "SELL":
+        score += 5
+
+    if active_vol_min() <= float(vol or 0.0) <= active_vol_max():
+        score += 3
+
+    score += get_fng_score_bias(side, fng_ctx)
+    return max(0, min(100, round(score, 2)))
+
 def add_skip_reason(symbol, reason, extra=None):
     global skip_reasons_live
 
@@ -1768,36 +2071,47 @@ FALLBACK_MODE = os.getenv("FALLBACK_MODE", "true").lower() == "true"
 ML_MODEL = None
 
 # === NEWS ENGINE ===
-NEWS_CACHE = {"last_check": 0, "impact": "LOW"}
+NEWS_CACHE = {"last_check": 0, "impact": "NORMAL", "value": None, "classification": "NEUTRAL", "source": "alternative_me_fng"}
 
 def get_market_news():
     global NEWS_CACHE
 
-    # cache 5 menit
-    if time.time() - NEWS_CACHE["last_check"] < 300:
-        return NEWS_CACHE["impact"]
+    # FNG is sentiment context, not a hard news blocker.
+    if time.time() - NEWS_CACHE.get("last_check", 0) < 300:
+        return NEWS_CACHE.get("impact", "NORMAL")
 
     try:
-        # pakai free API (Forex Factory alternatif simple) - FNG API
-        res = requests.get("https://api.alternative.me/fng/").json()
+        res = requests.get("https://api.alternative.me/fng/", timeout=5).json()
         value = int(res["data"][0]["value"])
 
-        # fear = panic → biasanya reversal (atau extreme greed)
         if value < 25:
-            impact = "HIGH"
+            classification = "EXTREME_FEAR"
+            impact = "FNG_EXTREME_FEAR"
         elif value > 75:
-            impact = "HIGH"
+            classification = "EXTREME_GREED"
+            impact = "FNG_EXTREME_GREED"
         else:
+            classification = "NEUTRAL"
             impact = "NORMAL"
 
         NEWS_CACHE = {
             "last_check": time.time(),
-            "impact": impact
+            "impact": impact,
+            "value": value,
+            "classification": classification,
+            "source": "alternative_me_fng",
         }
 
         return impact
 
-    except:
+    except Exception as exc:
+        NEWS_CACHE = {
+            **NEWS_CACHE,
+            "last_check": time.time(),
+            "impact": "NORMAL",
+            "classification": "NEUTRAL",
+            "error": str(exc),
+        }
         return "NORMAL"
 
 def save_ai_memory():
@@ -2543,7 +2857,7 @@ def emergency_close_position_for_client(client_obj, label, symbol, side, qty, re
         return {"status": "error", "error": str(exc)}
 
 
-def place_protective_order_for_client(client_obj, label, symbol, leg, order_type, close_side, stop_price_text, qty_text, client_order_id):
+def place_protective_order_for_client(client_obj, label, symbol, leg, order_type, close_side, stop_price_text, qty_text, client_order_id, force_quantity=False):
     """Place one protective order and accept both standard orderId and Algo Service algoId responses."""
     leg = str(leg or "").upper()
     params = {
@@ -2554,7 +2868,7 @@ def place_protective_order_for_client(client_obj, label, symbol, leg, order_type
         "workingType": "MARK_PRICE",
         "newClientOrderId": client_order_id,
     }
-    if PROTECTION_ORDER_MODE == "CLOSE_POSITION":
+    if PROTECTION_ORDER_MODE == "CLOSE_POSITION" and not force_quantity:
         params["closePosition"] = True
     else:
         params["quantity"] = qty_text
@@ -2564,6 +2878,7 @@ def place_protective_order_for_client(client_obj, label, symbol, leg, order_type
         "account": label,
         "clientOrderId": client_order_id,
         "protection_order_mode": PROTECTION_ORDER_MODE,
+        "force_quantity": bool(force_quantity),
         "params": {k: v for k, v in params.items() if k != "newClientOrderId"},
     })
 
@@ -2594,6 +2909,7 @@ def place_protective_order_for_client(client_obj, label, symbol, leg, order_type
             "closePosition": order.get("closePosition") if isinstance(order, dict) else None,
             "reduceOnly": order.get("reduceOnly") if isinstance(order, dict) else None,
             "protection_order_mode": PROTECTION_ORDER_MODE,
+            "force_quantity": bool(force_quantity),
         })
         if client_obj is binance:
             invalidate_main_open_orders_cache()
@@ -2605,10 +2921,95 @@ def place_protective_order_for_client(client_obj, label, symbol, leg, order_type
             "stopPrice": stop_price_text,
             "clientOrderId": client_order_id,
             "protection_order_mode": PROTECTION_ORDER_MODE,
+            "force_quantity": bool(force_quantity),
             "params": {k: v for k, v in params.items() if k != "newClientOrderId"},
         })
         raise
 
+
+
+def build_partial_tp_plan(symbol, side, entry_price, sl_price, full_tp_price, qty):
+    if not PARTIAL_TP_ENABLED:
+        return {"enabled": False, "reason": "partial_tp_disabled"}
+
+    side = str(side or "").upper().strip()
+    entry_price = float(entry_price or 0.0)
+    sl_price = float(sl_price or 0.0)
+    full_tp_price = float(full_tp_price or 0.0)
+    qty = float(qty or 0.0)
+
+    if side not in ("BUY", "SELL") or entry_price <= 0 or sl_price <= 0 or full_tp_price <= 0 or qty <= 0:
+        return {"enabled": False, "reason": "partial_tp_invalid_input"}
+
+    risk = abs(entry_price - sl_price)
+    if risk <= 0:
+        return {"enabled": False, "reason": "partial_tp_zero_risk"}
+
+    tp1 = entry_price + risk if side == "BUY" else entry_price - risk
+    if side == "BUY" and not (entry_price < tp1 < full_tp_price):
+        return {"enabled": False, "reason": "partial_tp1_not_between_entry_and_tp"}
+    if side == "SELL" and not (full_tp_price < tp1 < entry_price):
+        return {"enabled": False, "reason": "partial_tp1_not_between_entry_and_tp"}
+
+    ratio = max(0.05, min(0.80, float(PARTIAL_TP_R1_RATIO)))
+    q1_detail = normalize_quantity_detail(symbol, qty * ratio)
+    if not q1_detail.get("ok") or q1_detail.get("value", 0) <= 0:
+        return {"enabled": False, "reason": "partial_tp_q1_invalid", "q1_detail": q1_detail}
+
+    q1 = float(q1_detail["value"])
+    q2_detail = normalize_quantity_detail(symbol, max(qty - q1, 0.0))
+    if not q2_detail.get("ok") or q2_detail.get("value", 0) <= 0:
+        return {"enabled": False, "reason": "partial_tp_q2_invalid", "q1_detail": q1_detail, "q2_detail": q2_detail}
+
+    tp1_detail = normalize_protective_price_detail(symbol, tp1, side, "TP1")
+    tp2_detail = normalize_protective_price_detail(symbol, full_tp_price, side, "TP2")
+    if not tp1_detail.get("ok") or not tp2_detail.get("ok"):
+        return {
+            "enabled": False,
+            "reason": "partial_tp_price_invalid",
+            "tp1_detail": tp1_detail,
+            "tp2_detail": tp2_detail,
+        }
+
+    return {
+        "enabled": True,
+        "ratio": ratio,
+        "tp1": tp1_detail,
+        "tp2": tp2_detail,
+        "q1": q1_detail,
+        "q2": q2_detail,
+    }
+
+def place_partial_tp_orders_for_client(client_obj, label, symbol, side, close_side, entry_price, sl_price, full_tp_price, qty):
+    plan = build_partial_tp_plan(symbol, side, entry_price, sl_price, full_tp_price, qty)
+    if not plan.get("enabled"):
+        add_order_audit("PARTIAL_TP_SKIPPED", symbol, {"account": label, "plan": plan})
+        return [], plan
+
+    orders = []
+    legs = [
+        ("TP1", plan["tp1"]["text"], plan["q1"]["text"]),
+        ("TP2", plan["tp2"]["text"], plan["q2"]["text"]),
+    ]
+    for leg, stop_price_text, qty_text in legs:
+        client_id = build_order_client_id(symbol, side, leg)
+        order = place_protective_order_for_client(
+            client_obj,
+            label,
+            symbol,
+            leg,
+            FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+            close_side,
+            stop_price_text,
+            qty_text,
+            client_id,
+            force_quantity=True,
+        )
+        orders.append(order)
+        time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
+
+    add_order_audit("PARTIAL_TP_PLACED", symbol, {"account": label, "plan": plan, "orders": orders})
+    return orders, plan
 
 
 def get_entry_limit_offset(symbol):
@@ -2888,7 +3289,7 @@ def place_controlled_entry_for_client(client_obj, label, symbol, side, qty_text)
 
     return None, {"ok": False, "reason": "entry_limit_not_filled", "detail": last_detail, "attempts": attempts}, {"entry_order_type": "LIMIT", "entry_limit_detail": last_detail}
 
-def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
+def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp, entry_price=None):
     if client_obj is None:
         return {"account": label, "error": "binance client not ready"}
 
@@ -2949,6 +3350,8 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     entry_order = None
     sl_order = None
     tp_order = None
+    tp_orders = []
+    partial_tp_plan = {"enabled": False, "reason": "not_attempted"}
     entry_fill = None
     entry_detail = None
     protect_qty = qty
@@ -3018,12 +3421,31 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
 
         time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
 
-        tp_client_id = build_order_client_id(symbol, side, "TP")
+        tp_entry_price = float(entry_price or entry_fill.get("entry_price") or entry_fill.get("avgPrice") or entry_fill.get("price") or 0.0)
+        if tp_entry_price <= 0:
+            tp_entry_price = float(entry_detail.get("entry_limit_plan", {}).get("limit_price") or entry_detail.get("entry_reference_price") or 0.0) if isinstance(entry_detail, dict) else 0.0
+        if tp_entry_price <= 0:
+            tp_entry_price = float((float(sl_price) + float(tp_price)) / 2.0)
+
         try:
-            tp_order = place_protective_order_for_client(
-                client_obj, label, symbol, "TP", FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                close_side, tp_text, protect_qty_text, tp_client_id
-            )
+            if PARTIAL_TP_ENABLED:
+                tp_orders, partial_tp_plan = place_partial_tp_orders_for_client(
+                    client_obj, label, symbol, side, close_side, tp_entry_price, sl_price, tp_price, protect_qty
+                )
+                if tp_orders:
+                    tp_order = {"partial": True, "orders": tp_orders, "plan": partial_tp_plan}
+                else:
+                    tp_client_id = build_order_client_id(symbol, side, "TP")
+                    tp_order = place_protective_order_for_client(
+                        client_obj, label, symbol, "TP", FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                        close_side, tp_text, protect_qty_text, tp_client_id
+                    )
+            else:
+                tp_client_id = build_order_client_id(symbol, side, "TP")
+                tp_order = place_protective_order_for_client(
+                    client_obj, label, symbol, "TP", FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                    close_side, tp_text, protect_qty_text, tp_client_id
+                )
         except Exception as tp_exc:
             close_result = emergency_close_position_for_client(client_obj, label, symbol, side, protect_qty, reason="place_tp_failed")
             cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
@@ -3043,6 +3465,7 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
                 "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
                 "tp_order_id": None,
+                "partial_tp_plan": partial_tp_plan,
                 "protection_order_mode": PROTECTION_ORDER_MODE,
             }
 
@@ -3125,6 +3548,8 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             "entry_fill": entry_fill,
             "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+            "tp_order_ids": [o.get("orderId") for o in tp_orders if isinstance(o, dict)],
+            "partial_tp_plan": partial_tp_plan,
             "protection_order_mode": PROTECTION_ORDER_MODE,
         })
 
@@ -3143,6 +3568,8 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
             "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
+            "tp_order_ids": [o.get("orderId") for o in tp_orders if isinstance(o, dict)],
+            "partial_tp_plan": partial_tp_plan,
             "protection_order_mode": PROTECTION_ORDER_MODE,
         }
 
@@ -3295,7 +3722,7 @@ def place_order_multi(symbol, side, sl, tp):
                 })
                 continue
 
-            result = place_order_for_client(c, label, symbol, side, qty, sl, tp)
+            result = place_order_for_client(c, label, symbol, side, qty, sl, tp, entry_price=price)
             result["entry_price"] = price
             result["leverage"] = leverage_result
             result["min_notional"] = min_notional
@@ -5987,20 +6414,30 @@ def smart_trailing():
                     continue
                 side = "BUY" if amt > 0 else "SELL"
                 current_sl = LAST_STOP_PRICE.get(symbol)
-                if current_sl is not None and abs(current_sl - entry) <= EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
+                tick = EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0)
+                favorable_move = (price - entry) if side == "BUY" else (entry - price)
+                if favorable_move <= 0:
                     continue
-                move = abs(price - entry)
-                if move > entry * 0.003:
+
+                move_pct = favorable_move / max(entry, 1e-12)
+                new_sl = None
+
+                if move_pct >= SMART_TRAIL_ACTIVE_PCT:
+                    locked_move = favorable_move * SMART_TRAIL_LOCK_RATIO
+                    new_sl = entry + locked_move if side == "BUY" else entry - locked_move
+                elif move_pct >= SMART_TRAIL_BE_TRIGGER_PCT:
                     new_sl = entry
-                    if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
-                        update_stop_loss(symbol, side, new_sl)
-                if move > entry * 0.006:
-                    if side == "BUY":
-                        new_sl = price - (move * 0.3)
-                    else:
-                        new_sl = price + (move * 0.3)
-                    if current_sl is None or abs(current_sl - new_sl) > EXCHANGE_CACHE.get(symbol, {}).get("tickSize", 0.0):
-                        update_stop_loss(symbol, side, new_sl)
+
+                if new_sl is None:
+                    continue
+
+                improves = (
+                    current_sl is None
+                    or (side == "BUY" and new_sl > current_sl + max(tick, 1e-12))
+                    or (side == "SELL" and new_sl < current_sl - max(tick, 1e-12))
+                )
+                if improves:
+                    update_stop_loss(symbol, side, new_sl)
             time.sleep(TRAILING_LOOP_INTERVAL)
         except Exception as e:
             print("Trailing error:", e)
@@ -6237,10 +6674,8 @@ def auto_trader():
                     # news impact dipakai lewat apply_news_bias() saja
 
                     # === ENTRY, SL, TP ===
-                    ob_candle = ohlcv[-4]
-
                     final_side = apply_news_bias(signal_type, news_reverse)
-                    
+
                     pair_regime = get_multi_tf_regime(symbol)
 
                     if not active_require_pair_regime_match():
@@ -6256,64 +6691,73 @@ def auto_trader():
                         if pair_regime == "BEAR" and final_side != "SELL":
                             add_skip_reason(symbol, "PAIR_REGIME_BEAR_MISMATCH")
                             continue
-                    
+
                     rr_target = active_target_rr()
-                    if final_side == "BUY":
-                        sl = float(ob_candle[3])  # low OB
-                        tp = last_price + (last_price - sl) * rr_target
-                    else:
-                        sl = float(ob_candle[2])  # high OB
-                        tp = last_price - (sl - last_price) * rr_target
-                        
-                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
+                    trade_plan = build_precision_trade_plan(symbol, final_side, last_price, ohlcv, structure, rr_target=rr_target)
+                    if not trade_plan.get("ok"):
+                        add_skip_reason(symbol, trade_plan.get("reason", "INVALID_TRADE_PLAN"), trade_plan)
+                        continue
+
+                    sl = float(trade_plan["sl"])
+                    tp = float(trade_plan["tp"])
+                    rr = float(trade_plan["rr"])
                     if rr < active_rr_min():
                         add_skip_reason(symbol, "LOW_RR", {
                             "rr": round(rr, 2),
-                            "min_rr": active_rr_min()
+                            "min_rr": active_rr_min(),
+                            "trade_plan": trade_plan,
                         })
                         continue
-                    
+
+                    fng_ctx = get_fng_context()
+                    pre_score = composite_pre_score(
+                        symbol, final_side, last_price, sl, tp, structure, pair_regime, vol,
+                        sweep_high=sweep_high, sweep_low=sweep_low, fng_ctx=fng_ctx
+                    )
                     signal = apply_clean_prices_to_signal({
                         "symbol": symbol,
                         "type": final_side,
                         "entry": last_price,
                         "sl": sl,
                         "tp": tp,
-                        "score": 85 if structure_grade == "STRONG" else 72,
+                        "score": pre_score,
                         "sweep_high": sweep_high,
                         "sweep_low": sweep_low,
                         "sweep_memory": sweep_ctx,
                         "structure_grade": structure_grade,
+                        "pre_score": pre_score,
+                        "fng_value": fng_ctx.get("value"),
+                        "fng_classification": fng_ctx.get("classification"),
+                        "fng_bias": get_fng_score_bias(final_side, fng_ctx),
+                        "sl_source": (trade_plan.get("ob") or {}).get("source"),
+                        "sl_buffer": round(float(trade_plan.get("sl_buffer", 0.0)), 8),
+                        "atr": round(float(trade_plan.get("atr", 0.0)), 8),
+                        "tp_source": trade_plan.get("tp_source"),
                     })
                     last_price = float(signal.get("entry", last_price))
                     sl = float(signal.get("sl", sl))
                     tp = float(signal.get("tp", tp))
                     rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
 
-                    score = meta_score(symbol, signal, regime, vol)
-                    
+                    meta = meta_score(symbol, signal, regime, vol)
+
                     ml_prob = ml_predict(build_ml_features(
                         symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
                     ))
-                    score = round((score * 0.8) + (ml_prob * 100 * 0.2))
+                    score = round((pre_score * PRE_SCORE_WEIGHT) + (meta * META_SCORE_WEIGHT) + (ml_prob * 100 * ML_SCORE_WEIGHT))
                     score += structure_score_adjustment(structure)
-                                                          
-                    if news_impact == "HIGH":
-                        score -= 2 if VALIDATION_MODE else 6
 
                     # === SMC BOOST ===
                     if fvg_up or fvg_down:
-                        score += 5
-                    if sweep_high or sweep_low:
-                        score += 5
-                    if structure.get("reclaim_up") or structure.get("reclaim_down"):
                         score += 3
+                    if sweep_high or sweep_low:
+                        score += 3
+                    if structure.get("reclaim_up") or structure.get("reclaim_down"):
+                        score += 2
 
-                    # === NEWS FACTOR ===
-                    if news_impact == "HIGH":
-                        score -= 4 if VALIDATION_MODE else 10
-                    elif news_impact == "NORMAL":
-                        score += 6 if VALIDATION_MODE else 8
+                    # FNG sudah masuk pre-score sebagai bias arah, bukan blocker.
+                    if news_impact == "NORMAL":
+                        score += 4 if VALIDATION_MODE else 5
 
                     score += tier_score_bonus(symbol)
 
@@ -6342,6 +6786,14 @@ def auto_trader():
                         "news_impact": news_impact,
                         "session": session,
                         "structure_grade": structure_grade,
+                        "pre_score": pre_score,
+                        "fng_value": fng_ctx.get("value"),
+                        "fng_classification": fng_ctx.get("classification"),
+                        "fng_bias": get_fng_score_bias(final_side, fng_ctx),
+                        "sl_source": (trade_plan.get("ob") or {}).get("source"),
+                        "sl_buffer": round(float(trade_plan.get("sl_buffer", 0.0)), 8),
+                        "atr": round(float(trade_plan.get("atr", 0.0)), 8),
+                        "tp_source": trade_plan.get("tp_source"),
                     }
 
                     row = clean_signal_row_for_output(row)
@@ -6490,32 +6942,39 @@ def auto_trader():
                     # news impact dipakai lewat apply_news_bias() saja, jangan reversal dua kali
 
                     # === ENTRY, SL, TP ===
-                    ob_candle = ohlcv[-4]
-
                     final_side = apply_news_bias(signal_type, news_reverse)
-                    
+
                     pair_regime = get_multi_tf_regime(symbol)
 
                     if active_require_pair_regime_match():
                         if pair_regime == "SIDEWAYS":
+                            add_skip_reason(symbol, "PAIR_REGIME_SIDEWAYS_EXEC")
                             continue
                         if pair_regime == "BULL" and final_side != "BUY":
+                            add_skip_reason(symbol, "PAIR_REGIME_BULL_MISMATCH_EXEC")
                             continue
                         if pair_regime == "BEAR" and final_side != "SELL":
+                            add_skip_reason(symbol, "PAIR_REGIME_BEAR_MISMATCH_EXEC")
                             continue
-                    
+
                     rr_target = active_target_rr()
-                    if final_side == "BUY":
-                        sl = float(ob_candle[3])  # low OB
-                        tp = last_price + (last_price - sl) * rr_target
-                    else:
-                        sl = float(ob_candle[2])  # high OB
-                        tp = last_price - (sl - last_price) * rr_target
-                        
-                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
-                    if rr < active_rr_min():
+                    trade_plan = build_precision_trade_plan(symbol, final_side, last_price, ohlcv, structure, rr_target=rr_target)
+                    if not trade_plan.get("ok"):
+                        add_skip_reason(symbol, trade_plan.get("reason", "INVALID_TRADE_PLAN_EXEC"), trade_plan)
                         continue
-                    
+
+                    sl = float(trade_plan["sl"])
+                    tp = float(trade_plan["tp"])
+                    rr = float(trade_plan["rr"])
+                    if rr < active_rr_min():
+                        add_skip_reason(symbol, "LOW_RR_EXEC", {"rr": round(rr, 2), "min_rr": active_rr_min(), "trade_plan": trade_plan})
+                        continue
+
+                    fng_ctx = get_fng_context()
+                    pre_score = composite_pre_score(
+                        symbol, final_side, last_price, sl, tp, structure, pair_regime, vol,
+                        sweep_high=sweep_high, sweep_low=sweep_low, fng_ctx=fng_ctx
+                    )
                     signal = apply_clean_prices_to_signal({
                         "symbol": symbol,
                         "type": final_side,
@@ -6529,6 +6988,14 @@ def auto_trader():
                         "sweep_memory": sweep_ctx,
                         "rr": round(rr, 2),
                         "structure_grade": structure_grade,
+                        "pre_score": pre_score,
+                        "fng_value": fng_ctx.get("value"),
+                        "fng_classification": fng_ctx.get("classification"),
+                        "fng_bias": get_fng_score_bias(final_side, fng_ctx),
+                        "sl_source": (trade_plan.get("ob") or {}).get("source"),
+                        "sl_buffer": round(float(trade_plan.get("sl_buffer", 0.0)), 8),
+                        "atr": round(float(trade_plan.get("atr", 0.0)), 8),
+                        "tp_source": trade_plan.get("tp_source"),
                     })
                     last_price = float(signal.get("entry", last_price))
                     sl = float(signal.get("sl", sl))
@@ -6547,10 +7014,7 @@ def auto_trader():
                         })
                         continue
 
-                    ml_prob = ml_predict(build_ml_features(
-                        symbol, final_side, regime, vol, news_reverse, fvg_up, fvg_down, sweep_high, sweep_low
-                    ))
-                    score = round((scores_map.get(symbol, 0) * 0.8) + (ml_prob * 100 * 0.2))
+                    score = max(0, min(100, float(scores_map.get(symbol, signal.get("score", 0)))))
                     signal["score"] = score
                     
                     ok, reason = should_execute_trade(signal)
