@@ -88,6 +88,7 @@ type DecisionBoard = {
   mode: string;
   validation_mode: boolean;
   kill_switch: boolean;
+  kill_switch_default?: boolean;
   auto_mode: boolean;
   auto_trading: boolean;
   ws: {
@@ -471,6 +472,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [manualSymbol, setManualSymbol] = useState<string>("BTCUSDT");
   const [inspectedSignal, setInspectedSignal] = useState<BackendSignal | null>(null);
+  const [controlLoading, setControlLoading] = useState(false);
+  const [controlMessage, setControlMessage] = useState<string>("");
 
   useEffect(() => {
     let cancelled = false;
@@ -562,6 +565,38 @@ export default function App() {
     };
   }, []);
 
+  const toggleKillSwitch = async (state: boolean) => {
+    setControlLoading(true);
+    setControlMessage("");
+    try {
+      const res = await axios.post(`${API_URL}/kill-switch`, {
+        state,
+        source: "dashboard",
+        note: state ? "manual_block_from_dashboard" : "manual_arm_from_dashboard",
+      });
+
+      setDecisionBoard((prev) =>
+        prev
+          ? {
+              ...prev,
+              kill_switch: Boolean(res.data?.kill_switch),
+              kill_switch_default: Boolean(res.data?.kill_switch_default),
+            }
+          : prev
+      );
+
+      const boardRes = await axios.get(`${API_URL}/debug/decision-board`);
+      setDecisionBoard(boardRes.data as DecisionBoard);
+      setControlMessage(state ? "Kill switch ON: entry baru diblokir." : "Kill switch OFF: bot armed jika AUTO MODE dan AUTO TRADING ON.");
+      setApiError("");
+    } catch (error: any) {
+      const msg = error?.response?.data?.detail || error?.message || "Gagal mengubah kill switch.";
+      setControlMessage(String(msg));
+    } finally {
+      setControlLoading(false);
+    }
+  };
+
   const selectedSignal = decisionBoard?.selected?.rows?.[0] || null;
   const livePosition = positions?.[0] || decisionBoard?.live_positions?.rows?.[0] || null;
   const livePositionSignal = positionToSignal(livePosition);
@@ -638,6 +673,59 @@ export default function App() {
               <KeyValue label="WS max age" value={`${formatNum(maxSampleAge, 2)}s`} accent={maxSampleAge < 20 ? "#00ffaa" : "#ffb000"} />
               <KeyValue label="WS messages" value={formatNum(decisionBoard?.ws?.message_count, 0)} />
               <KeyValue label="WS restarts" value={decisionBoard?.ws?.restart_count ?? "-"} />
+            </Section>
+
+            <Section title="Manual control">
+              <div style={{ display: "grid", gap: 10 }}>
+                <KeyValue
+                  label="Kill switch"
+                  value={decisionBoard?.kill_switch ? "ON / BLOCK ENTRY" : "OFF / ARMED"}
+                  accent={decisionBoard?.kill_switch ? "#ff7272" : "#00ffaa"}
+                />
+                <KeyValue
+                  label="ENV default"
+                  value={decisionBoard?.kill_switch_default ? "ON" : "OFF"}
+                  accent={decisionBoard?.kill_switch_default ? "#ffb000" : "#8fd3ff"}
+                />
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <button
+                    onClick={() => toggleKillSwitch(true)}
+                    disabled={controlLoading || decisionBoard?.kill_switch === true}
+                    style={{
+                      border: "1px solid #ff7272",
+                      background: decisionBoard?.kill_switch ? "rgba(255,114,114,0.16)" : "#23101a",
+                      color: "#fff",
+                      borderRadius: 10,
+                      padding: "10px 8px",
+                      cursor: controlLoading || decisionBoard?.kill_switch ? "not-allowed" : "pointer",
+                      fontWeight: 900,
+                      opacity: controlLoading || decisionBoard?.kill_switch ? 0.62 : 1,
+                    }}
+                  >
+                    KILL ON
+                  </button>
+                  <button
+                    onClick={() => toggleKillSwitch(false)}
+                    disabled={controlLoading || decisionBoard?.kill_switch === false}
+                    style={{
+                      border: "1px solid #00ffaa",
+                      background: decisionBoard?.kill_switch === false ? "rgba(0,255,170,0.14)" : "#09241d",
+                      color: "#fff",
+                      borderRadius: 10,
+                      padding: "10px 8px",
+                      cursor: controlLoading || decisionBoard?.kill_switch === false ? "not-allowed" : "pointer",
+                      fontWeight: 900,
+                      opacity: controlLoading || decisionBoard?.kill_switch === false ? 0.62 : 1,
+                    }}
+                  >
+                    KILL OFF
+                  </button>
+                </div>
+                {controlMessage ? <div style={{ fontSize: 12, color: controlMessage.includes("Gagal") ? "#ff9b9b" : "#8fd3ff", lineHeight: 1.45 }}>{controlMessage}</div> : null}
+                <div style={{ fontSize: 11, color: "#6f819f", lineHeight: 1.45 }}>
+                  ON memblokir entry baru. OFF hanya membuka gate; order tetap butuh AUTO MODE, AUTO TRADING, WS health, spread gate, dan risk gate lolos. Tidak market-close posisi live.
+                </div>
+              </div>
             </Section>
 
             <SignalCard

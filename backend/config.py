@@ -49,6 +49,7 @@ PAIRS = [p for p in list(dict.fromkeys(PAIRS)) if p not in REMOVE_FROM_CORE]
 MONTRA_MODE = os.getenv("MONTRA_MODE", "api_only")
 AUTO_MODE = os.getenv("AUTO_MODE", "false").lower() == "true"
 AUTO_TRADING = os.getenv("AUTO_TRADING", "false").lower() == "true"
+KILL_SWITCH_DEFAULT = (os.getenv("KILL_SWITCH", os.getenv("MONTRA_KILL_SWITCH", "false")) or "false").strip().lower() in ("1", "true", "yes", "on")
 MONTRA_PROFILE = os.getenv("MONTRA_PROFILE", "final_lock")
 STATE_FILE = os.getenv("STATE_FILE", "runtime_state.json")
 

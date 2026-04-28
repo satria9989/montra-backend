@@ -269,7 +269,7 @@ ACCOUNTS = [
     }
 ]
 
-from fastapi import FastAPI, Query, Body
+from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from binance.client import Client
@@ -859,7 +859,7 @@ print("🔥 ACTIVE ACCOUNTS:", len(CLIENTS))
 ACCOUNT_PROFIT = {}
 
 # ===== SAFETY =====
-KILL_SWITCH = False
+KILL_SWITCH = bool(globals().get("KILL_SWITCH_DEFAULT", False))
 
 START_EQUITY = None
 MAX_DRAWDOWN_PCT = 10   # stop kalau -10%
@@ -1060,7 +1060,8 @@ def load_runtime_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        KILL_SWITCH = bool(data.get("kill_switch", False))
+        if "kill_switch" in data:
+            KILL_SWITCH = bool(data.get("kill_switch"))
         START_EQUITY = data.get("start_equity")
         DAILY_START_EQUITY = data.get("daily_start_equity")
         LAST_DAY = data.get("last_day")
@@ -5572,7 +5573,7 @@ def health_state_reset():
     global daily_loss, consecutive_loss, current_risk
     global SYMBOL_COOLDOWN, GLOBAL_SYMBOL_LOCK, EXECUTION_IN_PROGRESS
 
-    KILL_SWITCH = False
+    KILL_SWITCH = bool(globals().get("KILL_SWITCH_DEFAULT", False))
     START_EQUITY = None
     DAILY_START_EQUITY = None
     LAST_DAY = None
@@ -5619,6 +5620,7 @@ def health_bot():
         "profile": MONTRA_PROFILE,
         "validation_mode": VALIDATION_MODE,
         "kill_switch": KILL_SWITCH,
+        "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
         "max_open_trades": MAX_OPEN_TRADES,
         "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
         "active_accounts": len(CLIENTS),
@@ -5961,6 +5963,7 @@ def debug_decision_board():
         "mode": MONTRA_MODE,
         "validation_mode": VALIDATION_MODE,
         "kill_switch": KILL_SWITCH,
+        "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
         "auto_mode": AUTO_MODE,
         "auto_trading": AUTO_TRADING,
 
@@ -6267,13 +6270,80 @@ def get_accounts():
 
     return {"accounts": data}
 
+
+def _parse_runtime_bool(value, field_name="state"):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        clean = value.strip().lower()
+        if clean in ("1", "true", "yes", "on", "enable", "enabled"):
+            return True
+        if clean in ("0", "false", "no", "off", "disable", "disabled"):
+            return False
+    raise HTTPException(status_code=400, detail=f"{field_name} must be boolean / on / off")
+
+
+def _kill_switch_payload(source="api"):
+    return {
+        "status": "ok",
+        "kill_switch": bool(KILL_SWITCH),
+        "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
+        "auto_mode": bool(AUTO_MODE),
+        "auto_trading": bool(AUTO_TRADING),
+        "source": source,
+        "note": "kill_switch_on_blocks_new_entries_only; it_does_not_market_close_existing_positions",
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/kill-switch")
+def get_kill_switch():
+    return _kill_switch_payload(source="read")
+
+
 @app.post("/kill-switch")
 def kill_switch(payload: dict = Body(...)):
     global KILL_SWITCH
-    state = payload.get("state", True)
-    KILL_SWITCH = state
-    save_runtime_state()
-    return {"kill_switch": KILL_SWITCH}
+
+    if not isinstance(payload, dict) or "state" not in payload:
+        raise HTTPException(status_code=400, detail="state is required: true/false or on/off")
+
+    next_state = _parse_runtime_bool(payload.get("state"), "state")
+    source = str(payload.get("source") or "api")[:32]
+    note = str(payload.get("note") or "")[:160]
+
+    previous_state = bool(KILL_SWITCH)
+    KILL_SWITCH = next_state
+
+    detail = {
+        "previous_state": previous_state,
+        "next_state": bool(KILL_SWITCH),
+        "source": source,
+        "note": note,
+        "auto_mode": bool(AUTO_MODE),
+        "auto_trading": bool(AUTO_TRADING),
+    }
+
+    try:
+        add_execution_decision(
+            "manual_kill_switch",
+            "_SYSTEM_",
+            "ON" if KILL_SWITCH else "OFF",
+            detail,
+        )
+        set_final_execution(
+            "KILL_SWITCH_ON" if KILL_SWITCH else "KILL_SWITCH_OFF",
+            reason="MANUAL_KILL_SWITCH_ON" if KILL_SWITCH else "MANUAL_KILL_SWITCH_OFF",
+            stage="manual_control",
+            detail=detail,
+        )
+    except Exception as e:
+        print("manual kill switch telemetry error:", e)
+
+    save_runtime_state(force=True)
+    return _kill_switch_payload(source=source)
 
 @app.get("/ai-memory")
 def get_ai_memory(active_only: bool = Query(default=False), include_meta: bool = Query(default=False)):
