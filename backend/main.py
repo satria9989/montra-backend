@@ -5,7 +5,7 @@ import requests
 import base64
 import json
 from dotenv import load_dotenv
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 
 load_dotenv()
 
@@ -44,15 +44,22 @@ VALIDATION_MODE = os.getenv(
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10" if VALIDATION_MODE else "30"))
 SCAN_INTERVAL_TOP = int(os.getenv("SCAN_INTERVAL_TOP", "30"))
-SCAN_INTERVAL_MID = int(os.getenv("SCAN_INTERVAL_MID", "60"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "46" if VALIDATION_MODE else "62"))
+SCAN_INTERVAL_MID = int(os.getenv("SCAN_INTERVAL_MID", "45"))
+SCAN_INTERVAL_MID_AGGRESSIVE = int(os.getenv("SCAN_INTERVAL_MID_AGGRESSIVE", os.getenv("SCAN_INTERVAL_MID", "45")))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "46" if VALIDATION_MODE else "65"))
 
 # safety core tetap dijaga, tapi live-safe lebih ketat
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2" if VALIDATION_MODE else "1"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2" if VALIDATION_MODE else "3"))
+# Atomic trade-slot reservation prevents multiple entries from racing past MAX_OPEN_TRADES
+# while Binance position/order state is still propagating.
+ENTRY_SLOT_TTL_SECONDS = float(os.getenv("ENTRY_SLOT_TTL_SECONDS", "180"))
+MAX_OPEN_TRADES_FORCE_REFRESH = os.getenv("MAX_OPEN_TRADES_FORCE_REFRESH", "true").lower() == "true"
 GLOBAL_SYMBOL_LOCK = set()
 SYMBOL_COOLDOWN = {}
 ORDER_AUDIT_LOG = []
 EXECUTION_IN_PROGRESS = set()
+EXECUTION_SLOT_LOCK = threading.RLock()
+RESERVED_TRADE_SLOTS = {}
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180" if VALIDATION_MODE else "360"))
 MAX_AUDIT_LOG = 500
 
@@ -66,9 +73,9 @@ STATE_FILE = os.getenv("STATE_FILE", "runtime_state.json")
 
 # ===== VALIDATION / LIVE GATES =====
 VALIDATION_RR_MIN = float(os.getenv("VALIDATION_RR_MIN", "1.8"))
-LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "2.0"))
+LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "2.5"))
 VALIDATION_TARGET_RR = float(os.getenv("VALIDATION_TARGET_RR", "2.0"))
-LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "2.5"))
+LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "3.5"))
 
 VALIDATION_VOL_MIN = float(os.getenv("VALIDATION_VOL_MIN", "0.0004"))
 VALIDATION_VOL_MAX = float(os.getenv("VALIDATION_VOL_MAX", "0.07"))
@@ -90,8 +97,8 @@ LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY = os.getenv("LIVE_ALLOW_SIDEWAYS_SCORE_PENALTY
 
 # ===== EXECUTION QUALITY / ORDER HARDENING =====
 # Guardrail live agar RR tidak "valid di angka" tetapi terlalu mepet untuk fee/spread/wick.
-MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0015"))  # 0.15%
-MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0030"))      # 0.30%
+MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0025"))  # 0.25%
+MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0050"))      # 0.50%
 FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))                    # haircut RR untuk fee/slippage/noise
 STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
 ORDER_ID_PREFIX = (os.getenv("ORDER_ID_PREFIX", "M") or "M").strip()[:8]
@@ -99,7 +106,52 @@ SIGNED_CALL_MIN_INTERVAL = float(os.getenv("SIGNED_CALL_MIN_INTERVAL", "0.15"))
 PROTECTION_PLACEMENT_GAP_SECONDS = float(os.getenv("PROTECTION_PLACEMENT_GAP_SECONDS", "0.35"))
 PROTECTION_VERIFY_RETRIES = int(os.getenv("PROTECTION_VERIFY_RETRIES", "4"))
 PROTECTION_VERIFY_DELAY = float(os.getenv("PROTECTION_VERIFY_DELAY", "0.50"))
-PROTECTION_ORDER_MODE = (os.getenv("PROTECTION_ORDER_MODE", "REDUCE_ONLY") or "REDUCE_ONLY").strip().upper()
+PROTECTION_ORDER_MODE = (os.getenv("PROTECTION_ORDER_MODE", "CLOSE_POSITION") or "CLOSE_POSITION").strip().upper()
+# Binance USDⓈ-M Futures conditional orders can be returned by the Algo Service
+# with algoId/clientAlgoId/algoStatus instead of standard orderId/status fields.
+PROTECTION_ACCEPT_ALGO_ID = os.getenv("PROTECTION_ACCEPT_ALGO_ID", "true").lower() == "true"
+PROTECTION_VERIFY_CONDITIONAL_ORDERS = os.getenv("PROTECTION_VERIFY_CONDITIONAL_ORDERS", "true").lower() == "true"
+PROTECTION_VERIFY_PLACEMENT_FALLBACK = os.getenv("PROTECTION_VERIFY_PLACEMENT_FALLBACK", "true").lower() == "true"
+PROTECTION_RECENT_PLACEMENT_TTL = float(os.getenv("PROTECTION_RECENT_PLACEMENT_TTL", "90"))
+PROTECTION_ENTRY_CONFIRM_RETRIES = int(os.getenv("PROTECTION_ENTRY_CONFIRM_RETRIES", "6"))
+PROTECTION_ENTRY_CONFIRM_DELAY = float(os.getenv("PROTECTION_ENTRY_CONFIRM_DELAY", "0.50"))
+EMERGENCY_CLOSE_VERIFY_RETRIES = int(os.getenv("EMERGENCY_CLOSE_VERIFY_RETRIES", "6"))
+EMERGENCY_CLOSE_VERIFY_DELAY = float(os.getenv("EMERGENCY_CLOSE_VERIFY_DELAY", "0.50"))
+
+# Controlled entry guard. Use a marketable LIMIT with a small tier-based cap
+# to avoid bad fills/slippage. SL/TP and emergency close remain market/conditional.
+ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()
+ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "15"))
+ENTRY_LIMIT_POLL_INTERVAL = float(os.getenv("ENTRY_LIMIT_POLL_INTERVAL", "0.50"))
+ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "2"))
+ENTRY_MARKET_FALLBACK = os.getenv("ENTRY_MARKET_FALLBACK", "false").lower() == "true"
+ENTRY_LIMIT_OFFSET_TOP = float(os.getenv("ENTRY_LIMIT_OFFSET_TOP", "0.0001"))
+ENTRY_LIMIT_OFFSET_MID = float(os.getenv("ENTRY_LIMIT_OFFSET_MID", "0.0002"))
+ENTRY_LIMIT_OFFSET_MID_AGGRESSIVE = float(os.getenv("ENTRY_LIMIT_OFFSET_MID_AGGRESSIVE", "0.0004"))
+ENTRY_LIMIT_OFFSET_DEFAULT = float(os.getenv("ENTRY_LIMIT_OFFSET_DEFAULT", "0.0004"))
+ENTRY_LIMIT_TIME_IN_FORCE = (os.getenv("ENTRY_LIMIT_TIME_IN_FORCE", "GTC") or "GTC").strip().upper()
+
+# Group leverage policy. Set on execution only and cached per symbol/account.
+ENABLE_AUTO_LEVERAGE = os.getenv("ENABLE_AUTO_LEVERAGE", "true").lower() == "true"
+TOP_LEVERAGE = int(os.getenv("TOP_LEVERAGE", "20"))
+MID_LEVERAGE = int(os.getenv("MID_LEVERAGE", "10"))
+MID_AGGRESSIVE_LEVERAGE = int(os.getenv("MID_AGGRESSIVE_LEVERAGE", "5"))
+LEVERAGE_SET_CACHE = set()
+
+# Price precision guard. Binance futures can expose tickSize that is finer than
+# effective order/display precision for some contracts. Use the stricter/coarser
+# pricePrecision step when available, unless disabled via env. Per-pair override:
+# PRICE_TICK_SIZE_SUIUSDT=0.0001
+PRICE_PRECISION_USE_PRICE_PRECISION = os.getenv("PRICE_PRECISION_USE_PRICE_PRECISION", "true").lower() == "true"
+PRICE_PRECISION_FAIL_ON_MISSING = os.getenv("PRICE_PRECISION_FAIL_ON_MISSING", "true").lower() == "true"
+
+# Close source audit diagnostics. Used when a position disappears from Binance so we can
+# distinguish exchange SL/TP, bot market close, manual/app close, or unknown close.
+CLOSE_AUDIT_ENABLED = os.getenv("CLOSE_AUDIT_ENABLED", "true").lower() == "true"
+CLOSE_AUDIT_LOOKBACK_MINUTES = int(os.getenv("CLOSE_AUDIT_LOOKBACK_MINUTES", "60"))
+CLOSE_AUDIT_FETCH_ORDERS = os.getenv("CLOSE_AUDIT_FETCH_ORDERS", "true").lower() == "true"
+CLOSE_AUDIT_TRADE_LIMIT = int(os.getenv("CLOSE_AUDIT_TRADE_LIMIT", "80"))
+CLOSE_AUDIT_ORDER_LIMIT = int(os.getenv("CLOSE_AUDIT_ORDER_LIMIT", "80"))
 
 
 # ===== CIRCUIT BREAKER / SPREAD GATE =====
@@ -109,7 +161,8 @@ CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", os.getenv
 CIRCUIT_BREAKER_PAUSE = float(os.getenv("CIRCUIT_BREAKER_PAUSE", "60"))
 WS_FALLBACK_POLL_INTERVAL = float(os.getenv("WS_FALLBACK_POLL_INTERVAL", "5"))
 SPREAD_THRESHOLD_TOP = float(os.getenv("SPREAD_THRESHOLD_TOP", "0.0008"))
-SPREAD_THRESHOLD_MID = float(os.getenv("SPREAD_THRESHOLD_MID", "0.0015"))
+SPREAD_THRESHOLD_MID = float(os.getenv("SPREAD_THRESHOLD_MID", "0.0012"))
+SPREAD_THRESHOLD_MID_AGGRESSIVE = float(os.getenv("SPREAD_THRESHOLD_MID_AGGRESSIVE", "0.0015"))
 SPREAD_WARN_MULTIPLIER = float(os.getenv("SPREAD_WARN_MULTIPLIER", "0.8"))
 SPREAD_CACHE_TTL = float(os.getenv("SPREAD_CACHE_TTL", "5"))
 SPREAD_ORDER_BOOK_LIMIT = int(os.getenv("SPREAD_ORDER_BOOK_LIMIT", "5"))
@@ -145,32 +198,36 @@ STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
 STRUCTURE_RECLAIM_TOLERANCE = float(os.getenv("STRUCTURE_RECLAIM_TOLERANCE", "0.0018"))
 STRUCTURE_MIN_BODY_RATIO = float(os.getenv("STRUCTURE_MIN_BODY_RATIO", "0.35"))
 STRUCTURE_RECENT_WINDOW = int(os.getenv("STRUCTURE_RECENT_WINDOW", "3"))
-STRUCTURE_ZONE_TOLERANCE = float(os.getenv("STRUCTURE_ZONE_TOLERANCE", "0.0018"))
+STRUCTURE_ZONE_TOLERANCE = float(os.getenv("STRUCTURE_ZONE_TOLERANCE", "0.0012"))
 STRUCTURE_STRONG_SCORE_BONUS = int(os.getenv("STRUCTURE_STRONG_SCORE_BONUS", "6"))
 STRUCTURE_MEDIUM_SCORE_PENALTY = int(os.getenv("STRUCTURE_MEDIUM_SCORE_PENALTY", "2"))
 
 # ===== EXECUTION / NOTIONAL QUALITY =====
-TOP_MIN_TRADE_NOTIONAL = float(os.getenv("TOP_MIN_TRADE_NOTIONAL", "150"))
-MID_MIN_TRADE_NOTIONAL = float(os.getenv("MID_MIN_TRADE_NOTIONAL", "120"))
+TOP_MIN_TRADE_NOTIONAL = float(os.getenv("TOP_MIN_TRADE_NOTIONAL", "100"))
+MID_MIN_TRADE_NOTIONAL = float(os.getenv("MID_MIN_TRADE_NOTIONAL", "100"))
 LOW_MIN_TRADE_NOTIONAL = float(os.getenv("LOW_MIN_TRADE_NOTIONAL", "100"))
-DEFAULT_MIN_TRADE_NOTIONAL = float(os.getenv("DEFAULT_MIN_TRADE_NOTIONAL", "120"))
+MID_AGGRESSIVE_MIN_TRADE_NOTIONAL = float(os.getenv("MID_AGGRESSIVE_MIN_TRADE_NOTIONAL", os.getenv("DEFAULT_MIN_TRADE_NOTIONAL", "100")))
+DEFAULT_MIN_TRADE_NOTIONAL = float(os.getenv("DEFAULT_MIN_TRADE_NOTIONAL", "100"))
+USE_DEFAULT_MIN_NOTIONAL_FOR_ALL = os.getenv("USE_DEFAULT_MIN_NOTIONAL_FOR_ALL", "true").lower() == "true"
 
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
-TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"])
-MID_PAIRS = globals().get("MID_PAIRS", ["HYPEUSDT", "SUIUSDT", "LINKUSDT", "AVAXUSDT", "WIFUSDT", "NEARUSDT", "ARBUSDT", "AAVEUSDT", "1000PEPEUSDT", "ADAUSDT", "LTCUSDT", "TRXUSDT", "TONUSDT", "WLDUSDT"])
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["LINKUSDT", "AVAXUSDT", "NEARUSDT", "ARBUSDT", "AAVEUSDT", "ADAUSDT", "LTCUSDT", "TRXUSDT", "TONUSDT", "WLDUSDT"])
+MID_AGGRESSIVE_PAIRS = globals().get("MID_AGGRESSIVE_PAIRS", ["HYPEUSDT", "SUIUSDT", "WIFUSDT", "1000PEPEUSDT"])
 VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
 REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
 
 # PAIRS dari config tetap jadi source of truth universe scan.
 # REMOVE_FROM_CORE diproteksi ulang di sini bila config masih membawa pair tersebut.
 PAIRS = [p for p in PAIRS if p not in REMOVE_FROM_CORE]
-LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS]
+LOW_PAIRS = [p for p in PAIRS if p not in TOP_PAIRS and p not in MID_PAIRS and p not in MID_AGGRESSIVE_PAIRS]
 
 TOP_PAIR_LIMIT = int(os.getenv("TOP_PAIR_LIMIT", "3" if VALIDATION_MODE else "2"))
 MID_PAIR_LIMIT = int(os.getenv("MID_PAIR_LIMIT", "2" if VALIDATION_MODE else "1"))
-LOW_PAIR_LIMIT = int(os.getenv("LOW_PAIR_LIMIT", "1" if VALIDATION_MODE else "0"))
+MID_AGGRESSIVE_PAIR_LIMIT = int(os.getenv("MID_AGGRESSIVE_PAIR_LIMIT", os.getenv("MID_PAIR_LIMIT", "1")))
+LOW_PAIR_LIMIT = int(os.getenv("LOW_PAIR_LIMIT", "0"))
 
 ACCOUNTS = [
     {
@@ -491,21 +548,125 @@ def fetch_futures_klines_cached(symbol, interval="15m", limit=100, max_age=None)
         raise
 
 
+def _protection_order_ref(order):
+    """Return (ref_type, ref_id) for standard or Algo Service conditional orders."""
+    if not isinstance(order, dict):
+        return (None, None)
+    order_id = order.get("orderId") or order.get("order_id")
+    if order_id not in (None, ""):
+        return ("orderId", order_id)
+    algo_id = order.get("algoId") or order.get("algo_id")
+    if PROTECTION_ACCEPT_ALGO_ID and algo_id not in (None, ""):
+        return ("algoId", algo_id)
+    client_algo_id = order.get("clientAlgoId") or order.get("client_algo_id")
+    if PROTECTION_ACCEPT_ALGO_ID and client_algo_id:
+        return ("clientAlgoId", client_algo_id)
+    return (None, None)
+
+
+def _protection_order_status(order):
+    if not isinstance(order, dict):
+        return None
+    return order.get("status") or order.get("algoStatus") or order.get("orderStatus")
+
+
+def _protection_order_type(order):
+    if not isinstance(order, dict):
+        return None
+    return order.get("type") or order.get("orderType") or order.get("origType")
+
+
+def _protection_stop_price(order):
+    if not isinstance(order, dict):
+        return 0.0
+    return _safe_float(order.get("stopPrice") or order.get("triggerPrice") or order.get("activatePrice"), 0.0)
+
+
+def _is_active_protection_status(status):
+    if status is None:
+        return True
+    return str(status).upper() not in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FILLED", "TRIGGERED", "FINISHED")
+
+
+def _annotate_protection_response(order, leg=None):
+    """Normalize Binance standard/algo response so internal logs remain stable."""
+    if not isinstance(order, dict):
+        return order
+    ref_type, ref_id = _protection_order_ref(order)
+    if ref_id is not None:
+        order.setdefault("_montra_ref_type", ref_type)
+        order.setdefault("_montra_ref_id", ref_id)
+        # Compatibility for existing logs/return payloads only. Do not use this
+        # as a standard cancel id when _montra_ref_type is algoId/clientAlgoId.
+        if "orderId" not in order and ref_type == "algoId":
+            order["orderId"] = ref_id
+    if leg:
+        order.setdefault("_montra_leg", leg)
+    return order
+
+
+def _remember_protection_order(symbol, leg, order):
+    if not isinstance(order, dict):
+        return
+    leg = str(leg or "").upper()
+    if leg not in ("SL", "TP"):
+        return
+    ref_type, ref_id = _protection_order_ref(order)
+    if not ref_id:
+        return
+    row = {
+        "ts": time.time(),
+        "leg": leg,
+        "ref_type": ref_type,
+        "ref_id": ref_id,
+        "order": dict(order),
+        "status": _protection_order_status(order),
+        "order_type": _protection_order_type(order),
+        "stop_price": _protection_stop_price(order),
+    }
+    RECENT_PROTECTION_ORDERS.setdefault(symbol, {})[leg] = row
+
+
+def _recent_protection_verify(symbol):
+    rows = RECENT_PROTECTION_ORDERS.get(symbol) or {}
+    now = time.time()
+    result = {"sl": None, "tp": None, "sl_ref": None, "tp_ref": None, "rows": []}
+    for leg, key in (("SL", "sl"), ("TP", "tp")):
+        row = rows.get(leg)
+        if not row:
+            continue
+        age = now - float(row.get("ts") or 0)
+        order = row.get("order") or {}
+        status = row.get("status") or _protection_order_status(order)
+        if age <= PROTECTION_RECENT_PLACEMENT_TTL and _is_active_protection_status(status):
+            result[key] = row.get("stop_price") or _protection_stop_price(order)
+            result[f"{key}_ref"] = {"type": row.get("ref_type"), "id": row.get("ref_id"), "status": status, "age": round(age, 2)}
+            result["rows"].append(row)
+    return result
+
+
 def build_exit_lookup(open_orders):
     rows = {}
     for o in open_orders or []:
         symbol = o.get("symbol")
         if not symbol:
             continue
-        stop_price = float(o.get("stopPrice", 0) or 0)
+        status = _protection_order_status(o)
+        if not _is_active_protection_status(status):
+            continue
+        stop_price = _protection_stop_price(o)
         if stop_price <= 0:
             continue
-        row = rows.setdefault(symbol, {"sl": None, "tp": None})
-        order_type = o.get("type")
+        row = rows.setdefault(symbol, {"sl": None, "tp": None, "sl_ref": None, "tp_ref": None})
+        order_type = str(_protection_order_type(o) or "").upper()
+        ref_type, ref_id = _protection_order_ref(o)
+        ref = {"type": ref_type, "id": ref_id, "status": status}
         if order_type == "STOP_MARKET":
             row["sl"] = stop_price
+            row["sl_ref"] = ref
         elif order_type == "TAKE_PROFIT_MARKET":
             row["tp"] = stop_price
+            row["tp_ref"] = ref
     return rows
 
 
@@ -726,6 +887,12 @@ LAST_FINAL_EXECUTION = {
         "boot_grace_seconds": EXECUTION_BOOT_GRACE_SECONDS,
     },
 }
+
+# Short-lived accepted protection responses keyed by symbol/leg. This prevents
+# false emergency-close when Binance accepts STOP_MARKET / TAKE_PROFIT_MARKET
+# as Algo Service objects but the open-order query lags or returns via a
+# separate conditional endpoint.
+RECENT_PROTECTION_ORDERS = {}  # {symbol: {"SL": row, "TP": row}}
 
 TELEGRAM_ALERT_STATE = {
     "last_sent_by_key": {},
@@ -950,16 +1117,20 @@ def active_target_rr():
     return VALIDATION_TARGET_RR if VALIDATION_MODE else max(LIVE_TARGET_RR, LIVE_RR_MIN)
 
 def get_pair_tier(symbol):
+    symbol = str(symbol or "").upper().strip()
     if symbol in TOP_PAIRS:
         return "TOP"
     if symbol in MID_PAIRS:
         return "MID"
+    if symbol in MID_AGGRESSIVE_PAIRS:
+        return "MID_AGGRESSIVE"
     return "LOW"
 
 def tier_limits():
     return {
         "TOP": TOP_PAIR_LIMIT,
         "MID": MID_PAIR_LIMIT,
+        "MID_AGGRESSIVE": MID_AGGRESSIVE_PAIR_LIMIT,
         "LOW": LOW_PAIR_LIMIT,
     }
 
@@ -968,9 +1139,11 @@ def tier_score_floor(symbol):
     if VALIDATION_MODE:
         return MIN_SCORE if tier != "LOW" else max(MIN_SCORE, 50)
     if tier == "TOP":
-        return max(MIN_SCORE, 62)
+        return max(MIN_SCORE, 65)
     if tier == "MID":
-        return max(MIN_SCORE, 66)
+        return max(MIN_SCORE, 65)
+    if tier == "MID_AGGRESSIVE":
+        return max(MIN_SCORE, 67)
     return 999
 
 def tier_score_bonus(symbol):
@@ -979,7 +1152,37 @@ def tier_score_bonus(symbol):
         return 5
     if tier == "MID":
         return 2
+    if tier == "MID_AGGRESSIVE":
+        return 0
     return 0
+
+def get_pair_leverage(symbol):
+    tier = get_pair_tier(symbol)
+    if tier == "TOP":
+        return TOP_LEVERAGE
+    if tier == "MID":
+        return MID_LEVERAGE
+    if tier == "MID_AGGRESSIVE":
+        return MID_AGGRESSIVE_LEVERAGE
+    return MID_AGGRESSIVE_LEVERAGE
+
+def ensure_symbol_leverage(client_obj, label, symbol):
+    if not ENABLE_AUTO_LEVERAGE:
+        return {"ok": True, "skipped": True, "reason": "auto_leverage_disabled"}
+    symbol = str(symbol or "").upper().strip()
+    target = int(get_pair_leverage(symbol))
+    key = (label, symbol, target)
+    if key in LEVERAGE_SET_CACHE:
+        return {"ok": True, "cached": True, "leverage": target, "symbol": symbol}
+    try:
+        add_order_audit("LEVERAGE_SET_ATTEMPT", symbol, {"account": label, "target_leverage": target, "tier": get_pair_tier(symbol)})
+        res = signed_call(client_obj, client_obj.futures_change_leverage, label=label, symbol=symbol, leverage=target)
+        LEVERAGE_SET_CACHE.add(key)
+        add_order_audit("LEVERAGE_SET_OK", symbol, {"account": label, "target_leverage": target, "response": res})
+        return {"ok": True, "leverage": target, "response": res}
+    except Exception as exc:
+        add_order_audit("LEVERAGE_SET_FAILED", symbol, {"account": label, "target_leverage": target, "error": str(exc)})
+        return {"ok": False, "leverage": target, "error": str(exc)}
 
 def detect_recent_fvg(ohlcv, bars=None):
     bars = bars or STRUCTURE_FVG_LOOKBACK
@@ -1362,6 +1565,47 @@ def _execution_age(ts):
     return round(max(0.0, time.time() - ts), 2)
 
 
+
+def _decision_rows_current_only(rows=None):
+    """Return execution decisions from the current scan/execution era only.
+
+    Prevents old BLOCK/PASS rows from previous scans from driving the current
+    execution summary or Telegram alert source-of-truth.
+    """
+    rows = rows if rows is not None else EXECUTION_DECISIONS
+    if not rows:
+        return []
+
+    if not TELEGRAM_ALERT_CURRENT_ONLY:
+        return list(rows)
+
+    try:
+        final_ts = float((LAST_FINAL_EXECUTION or {}).get("ts") or 0)
+    except Exception:
+        final_ts = 0.0
+
+    try:
+        scan_ts = float(LAST_SCAN_CYCLE_TS or 0)
+    except Exception:
+        scan_ts = 0.0
+
+    # Use the latest scan cycle as the primary cutoff. Fall back to the most
+    # recent final_execution timestamp minus a small tolerance for rows written
+    # immediately before set_final_execution().
+    cutoff = max(scan_ts, final_ts - 1.0)
+    if cutoff <= 0:
+        return []
+
+    current = []
+    for row in rows:
+        try:
+            ts = float(row.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        if ts >= cutoff:
+            current.append(row)
+    return current
+
 def mark_scan_cycle(status="SCANNING", reason="SCAN_CYCLE_STARTED", pairs=None, detail=None):
     global LAST_SCAN_CYCLE_TS
     LAST_SCAN_CYCLE_TS = time.time()
@@ -1369,6 +1613,7 @@ def mark_scan_cycle(status="SCANNING", reason="SCAN_CYCLE_STARTED", pairs=None, 
         "pairs_due": len(pairs or []),
         "scan_interval_top": SCAN_INTERVAL_TOP,
         "scan_interval_mid": SCAN_INTERVAL_MID,
+            "scan_interval_mid_aggressive": SCAN_INTERVAL_MID_AGGRESSIVE,
     }
     if detail:
         payload.update(detail)
@@ -1637,6 +1882,89 @@ load_ml_model()
 load_ai_memory()
 load_rl_weights()
 
+def _symbol_env_key(symbol):
+    return str(symbol or "").upper().replace("/", "").replace("-", "").replace(" ", "")
+
+
+def _decimal_or_none(value):
+    try:
+        d = Decimal(str(value))
+        if d > 0:
+            return d
+    except Exception:
+        return None
+    return None
+
+
+def _precision_step(price_precision):
+    try:
+        pp = int(price_precision)
+        if pp < 0:
+            return None
+        return Decimal("1").scaleb(-pp)
+    except Exception:
+        return None
+
+
+def get_price_tick_detail(symbol):
+    """Return effective tick step for entry/SL/TP.
+
+    Source order:
+    1) PRICE_TICK_SIZE_<SYMBOL> env override
+    2) EXCHANGE_CACHE PRICE_FILTER tickSize
+    3) EXCHANGE_CACHE pricePrecision fallback
+
+    With PRICE_PRECISION_USE_PRICE_PRECISION=true, MONTRA uses the coarser of
+    tickSize and pricePrecision step. This prevents candidates like SUIUSDT
+    TP=0.91835 when effective precision is 4 decimals -> 0.9184.
+    """
+    sym = _symbol_env_key(symbol)
+    f = EXCHANGE_CACHE.get(sym) or {}
+    override = os.getenv(f"PRICE_TICK_SIZE_{sym}") or os.getenv(f"TICK_SIZE_{sym}")
+
+    tick_source = "missing"
+    tick = None
+    if override:
+        tick = _decimal_or_none(override)
+        tick_source = "env_override"
+    if tick is None:
+        tick = _decimal_or_none(f.get("tickSizeText") or f.get("tickSize"))
+        tick_source = "exchange_tickSize" if tick is not None else "missing"
+
+    precision_step = _precision_step(f.get("pricePrecision"))
+    if PRICE_PRECISION_USE_PRICE_PRECISION and precision_step is not None and precision_step > 0:
+        if tick is None or precision_step > tick:
+            tick = precision_step
+            tick_source = "pricePrecision"
+        else:
+            tick_source = tick_source + "+pricePrecision_checked"
+
+    if tick is None or tick <= 0:
+        return {
+            "ok": False,
+            "reason": "missing_tick_size",
+            "tick": None,
+            "tickSize": None,
+            "tick_text": None,
+            "source": tick_source,
+            "exchange": f,
+            "pricePrecision": f.get("pricePrecision"),
+        }
+
+    tick_text = format(tick, "f")
+    return {
+        "ok": True,
+        "reason": "OK",
+        "tick": tick,
+        "tickSize": float(tick),
+        "tick_text": tick_text,
+        "source": tick_source,
+        "pricePrecision": f.get("pricePrecision"),
+        "exchange_tickSize": f.get("tickSize"),
+        "exchange_tickSizeText": f.get("tickSizeText"),
+    }
+
+
 def floor_to_step(value, step):
     d = Decimal(str(value))
     s = Decimal(str(step))
@@ -1671,11 +1999,10 @@ def _format_decimal_to_step(value, step):
     return format(d.quantize(q), "f")
 
 def normalize_price(symbol, price):
-    f = EXCHANGE_CACHE.get(symbol)
-    if not f:
+    tick_detail = get_price_tick_detail(symbol)
+    if not tick_detail.get("ok"):
         return price
-    tick = f["tickSize"]
-    return floor_to_step(price, tick)
+    return float(_round_decimal_to_step(price, tick_detail["tick"], rounding=ROUND_HALF_UP))
 
 
 def normalize_protective_price_detail(symbol, price, side, leg):
@@ -1684,19 +2011,20 @@ def normalize_protective_price_detail(symbol, price, side, leg):
     No extra Binance API call is made here. If tickSize is missing, the caller
     gets tick_missing=True so entry can be blocked before creating an unprotected position.
     """
-    f = EXCHANGE_CACHE.get(symbol) or {}
-    tick = f.get("tickSize")
+    tick_detail = get_price_tick_detail(symbol)
+    tick = tick_detail.get("tick")
     raw = Decimal(str(price or 0))
     side = str(side or "").upper()
     leg = str(leg or "").upper()
     if raw <= 0:
-        return {"ok": False, "reason": "invalid_price", "raw": float(raw), "value": float(raw), "text": str(raw), "tickSize": tick}
-    if not tick or float(tick) <= 0:
-        return {"ok": False, "reason": "missing_tick_size", "raw": float(raw), "value": float(raw), "text": format(raw, "f"), "tickSize": tick}
+        return {"ok": False, "reason": "invalid_price", "raw": float(raw), "value": float(raw), "text": str(raw), "tickSize": tick_detail.get("tickSize"), "tick_source": tick_detail.get("source")}
+    if not tick_detail.get("ok"):
+        return {"ok": False, "reason": tick_detail.get("reason", "missing_tick_size"), "raw": float(raw), "value": float(raw), "text": format(raw, "f"), "tickSize": tick_detail.get("tickSize"), "tick_source": tick_detail.get("source")}
 
-    rounding = ROUND_DOWN
-    if side == "SELL" and leg == "SL":
-        rounding = ROUND_UP
+    # MONTRA v4.9.4: entry, SL and TP must be tick-clean before quality
+    # checks, candidate exposure and order placement. Use Decimal HALF_UP so
+    # SUIUSDT 0.91835 at 0.0001 tick becomes 0.9184.
+    rounding = ROUND_HALF_UP
 
     rounded = _round_decimal_to_step(raw, tick, rounding=rounding)
     return {
@@ -1706,12 +2034,78 @@ def normalize_protective_price_detail(symbol, price, side, leg):
         "value": float(rounded),
         "text": _format_decimal_to_step(rounded, tick),
         "tickSize": float(tick),
-        "rounding": "UP" if rounding == ROUND_UP else "DOWN",
+        "tick_text": tick_detail.get("tick_text"),
+        "tick_source": tick_detail.get("source"),
+        "pricePrecision": tick_detail.get("pricePrecision"),
+        "rounding": "HALF_UP",
         "leg": leg,
     }
 
 def normalize_protective_price(symbol, price, side, leg):
     return normalize_protective_price_detail(symbol, price, side, leg).get("value", float(price or 0))
+
+def normalize_entry_price_detail(symbol, price):
+    tick_detail = get_price_tick_detail(symbol)
+    tick = tick_detail.get("tick")
+    raw = Decimal(str(price or 0))
+    if raw <= 0:
+        return {"ok": False, "reason": "invalid_entry", "raw": float(raw), "value": float(raw), "text": str(raw), "tickSize": tick_detail.get("tickSize"), "tick_source": tick_detail.get("source")}
+    if not tick_detail.get("ok"):
+        return {"ok": False, "reason": tick_detail.get("reason", "missing_tick_size"), "raw": float(raw), "value": float(raw), "text": format(raw, "f"), "tickSize": tick_detail.get("tickSize"), "tick_source": tick_detail.get("source")}
+    rounded = _round_decimal_to_step(raw, tick, rounding=ROUND_HALF_UP)
+    return {
+        "ok": True,
+        "reason": "OK",
+        "raw": float(raw),
+        "value": float(rounded),
+        "text": _format_decimal_to_step(rounded, tick),
+        "tickSize": float(tick),
+        "tick_text": tick_detail.get("tick_text"),
+        "tick_source": tick_detail.get("source"),
+        "pricePrecision": tick_detail.get("pricePrecision"),
+        "rounding": "HALF_UP",
+        "leg": "ENTRY",
+    }
+
+def normalize_signal_execution_prices(signal, reference_price=None):
+    symbol = str((signal or {}).get("symbol") or "").upper().strip()
+    side = str((signal or {}).get("type") or (signal or {}).get("side") or "").upper().strip()
+    raw_entry = _safe_float((signal or {}).get("entry"), 0.0)
+    if raw_entry <= 0 and reference_price is not None:
+        raw_entry = _safe_float(reference_price, 0.0)
+    raw_sl = _safe_float((signal or {}).get("sl"), 0.0)
+    raw_tp = _safe_float((signal or {}).get("tp"), 0.0)
+
+    entry_detail = normalize_entry_price_detail(symbol, raw_entry)
+    sl_detail = normalize_protective_price_detail(symbol, raw_sl, side, "SL")
+    tp_detail = normalize_protective_price_detail(symbol, raw_tp, side, "TP")
+
+    ok = bool(entry_detail.get("ok") and sl_detail.get("ok") and tp_detail.get("ok"))
+    return {
+        "ok": ok,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry_detail.get("value", raw_entry),
+        "sl": sl_detail.get("value", raw_sl),
+        "tp": tp_detail.get("value", raw_tp),
+        "entry_text": entry_detail.get("text"),
+        "sl_text": sl_detail.get("text"),
+        "tp_text": tp_detail.get("text"),
+        "details": {"entry": entry_detail, "sl": sl_detail, "tp": tp_detail},
+    }
+
+def apply_clean_prices_to_signal(signal, reference_price=None):
+    clean = normalize_signal_execution_prices(signal, reference_price=reference_price)
+    if clean.get("ok"):
+        signal["entry"] = clean["entry"]
+        signal["sl"] = clean["sl"]
+        signal["tp"] = clean["tp"]
+        signal["entry_text"] = clean.get("entry_text")
+        signal["sl_text"] = clean.get("sl_text")
+        signal["tp_text"] = clean.get("tp_text")
+        signal["price_precision"] = clean.get("details")
+        signal["rr"] = round(abs(clean["tp"] - clean["entry"]) / max(abs(clean["entry"] - clean["sl"]), 1e-12), 2)
+    return signal
 
 def normalize_quantity_detail(symbol, qty):
     f = EXCHANGE_CACHE.get(symbol) or {}
@@ -1745,8 +2139,13 @@ def load_exchange_cache():
 
             EXCHANGE_CACHE[symbol] = {
                 "stepSize": float(lot["stepSize"]),
+                "stepSizeText": str(lot["stepSize"]),
                 "minQty": float(lot["minQty"]),
+                "minQtyText": str(lot["minQty"]),
                 "tickSize": float(price["tickSize"]),
+                "tickSizeText": str(price["tickSize"]),
+                "pricePrecision": s.get("pricePrecision"),
+                "quantityPrecision": s.get("quantityPrecision"),
             }
 
         print("✅ Exchange cache loaded:", len(EXCHANGE_CACHE))
@@ -1761,25 +2160,30 @@ def adjust_precision(symbol, qty, price):
 
     step = f["stepSize"]
     min_qty = f["minQty"]
-    tick = f["tickSize"]
+    tick_detail = get_price_tick_detail(symbol)
+    tick = tick_detail.get("tickSize") or f["tickSize"]
 
     qty = floor_to_step(qty, step)
     if qty < min_qty:
         qty = min_qty
     qty = floor_to_step(qty, step)
 
-    price = floor_to_step(price, tick)
+    price = float(_round_decimal_to_step(price, tick, rounding=ROUND_HALF_UP))
     return qty, price
 
 def get_min_trade_notional(symbol):
+    # v5.3 default: all active groups use DEFAULT_MIN_TRADE_NOTIONAL=100
+    # unless USE_DEFAULT_MIN_NOTIONAL_FOR_ALL=false is explicitly set.
+    if USE_DEFAULT_MIN_NOTIONAL_FOR_ALL:
+        return DEFAULT_MIN_TRADE_NOTIONAL
     tier = get_pair_tier(symbol)
     if tier == "TOP":
         return TOP_MIN_TRADE_NOTIONAL
     if tier == "MID":
         return MID_MIN_TRADE_NOTIONAL
-    if tier == "LOW":
-        return LOW_MIN_TRADE_NOTIONAL
-    return DEFAULT_MIN_TRADE_NOTIONAL
+    if tier == "MID_AGGRESSIVE":
+        return MID_AGGRESSIVE_MIN_TRADE_NOTIONAL
+    return LOW_MIN_TRADE_NOTIONAL
 
 def _safe_float(value, default=0.0):
     try:
@@ -1802,21 +2206,40 @@ def build_order_client_id(symbol, side, purpose):
 
 def evaluate_signal_execution_quality(signal, reference_price=None):
     symbol = signal.get("symbol")
-    side = str(signal.get("type") or "").upper()
-    entry = _safe_float(signal.get("entry"), 0.0)
-    if entry <= 0 and reference_price:
-        entry = _safe_float(reference_price, 0.0)
-    sl = _safe_float(signal.get("sl"), 0.0)
-    tp = _safe_float(signal.get("tp"), 0.0)
+    side = str(signal.get("type") or signal.get("side") or "").upper()
+
+    clean = normalize_signal_execution_prices(signal, reference_price=reference_price)
+    entry = _safe_float(clean.get("entry"), 0.0)
+    sl = _safe_float(clean.get("sl"), 0.0)
+    tp = _safe_float(clean.get("tp"), 0.0)
+
+    # Mutate the signal intentionally so downstream placement, decision-board,
+    # Telegram and quality metrics use the exact tick-clean prices.
+    if clean.get("ok"):
+        signal["entry"] = entry
+        signal["sl"] = sl
+        signal["tp"] = tp
+        signal["entry_text"] = clean.get("entry_text")
+        signal["sl_text"] = clean.get("sl_text")
+        signal["tp_text"] = clean.get("tp_text")
+        signal["price_precision"] = clean.get("details")
 
     detail = {
         "entry": entry,
         "sl": sl,
         "tp": tp,
+        "entry_text": clean.get("entry_text"),
+        "sl_text": clean.get("sl_text"),
+        "tp_text": clean.get("tp_text"),
+        "price_precision": clean.get("details"),
         "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
         "min_tp_distance_pct": MIN_TP_DISTANCE_PCT,
         "fee_buffer_rr": FEE_BUFFER_RR,
     }
+
+    if not clean.get("ok"):
+        detail["reason"] = "precision_normalization_failed"
+        return False, "PRICE_PRECISION_INVALID", detail
 
     if not symbol or side not in ("BUY", "SELL") or entry <= 0 or sl <= 0 or tp <= 0:
         detail["reason"] = "missing_symbol_side_or_prices"
@@ -1859,41 +2282,124 @@ def evaluate_signal_execution_quality(signal, reference_price=None):
     return True, "OK", detail
 
 
+def fetch_conditional_open_orders_for_client(client_obj, label, symbol):
+    """Fetch Binance Algo Service conditional open orders when python-binance supports it."""
+    if not PROTECTION_VERIFY_CONDITIONAL_ORDERS or client_obj is None:
+        return []
+    try:
+        orders = signed_call(
+            client_obj,
+            client_obj.futures_get_open_orders,
+            symbol=symbol,
+            conditional=True,
+            label=label,
+        )
+        return orders or []
+    except TypeError as exc:
+        add_order_audit("CONDITIONAL_OPEN_ORDERS_UNSUPPORTED", symbol, {"account": label, "error": str(exc)})
+        return []
+    except Exception as exc:
+        add_order_audit("CONDITIONAL_OPEN_ORDERS_ERROR", symbol, {"account": label, "error": str(exc)})
+        return []
+
+
+def cancel_conditional_order_for_client(client_obj, label, symbol, order):
+    ref_type, ref_id = _protection_order_ref(order)
+    if not ref_id:
+        return False
+    params = {"symbol": symbol, "conditional": True}
+    if ref_type == "algoId":
+        params["algoId"] = ref_id
+    elif ref_type == "clientAlgoId":
+        params["clientAlgoId"] = ref_id
+    else:
+        # Standard orders are cancelled by the normal cancel path.
+        return False
+    try:
+        signed_call(client_obj, client_obj.futures_cancel_order, label=label, **params)
+        add_order_audit("CANCEL_CONDITIONAL_PROTECTION_OK", symbol, {"account": label, "ref_type": ref_type, "ref_id": ref_id})
+        return True
+    except Exception as exc:
+        add_order_audit("CANCEL_CONDITIONAL_PROTECTION_ERROR", symbol, {"account": label, "ref_type": ref_type, "ref_id": ref_id, "error": str(exc)})
+        return False
+
+
 def cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True):
     if client_obj is None:
         return False
+    ok = True
     try:
+        # Standard active orders.
         orders = signed_call(client_obj, client_obj.futures_get_open_orders, symbol=symbol, label=label)
         for o in orders or []:
-            otype = o.get("type")
+            otype = str(_protection_order_type(o) or "").upper()
             should_cancel = (cancel_sl and otype == "STOP_MARKET") or (cancel_tp and otype == "TAKE_PROFIT_MARKET")
             if not should_cancel:
                 continue
             try:
                 signed_call(client_obj, client_obj.futures_cancel_order, symbol=symbol, orderId=o["orderId"], label=label)
+                add_order_audit("CANCEL_STANDARD_PROTECTION_OK", symbol, {"account": label, "orderId": o.get("orderId"), "type": otype})
             except Exception as exc:
-                print(f"Cancel protective order error {label} {symbol}:", exc)
+                ok = False
+                add_order_audit("CANCEL_STANDARD_PROTECTION_ERROR", symbol, {"account": label, "orderId": o.get("orderId"), "type": otype, "error": str(exc)})
+
+        # Conditional Algo Service orders. Binance migrated STOP_MARKET / TP_MARKET
+        # conditional orders to algo order objects, so they must be queried and
+        # cancelled with conditional=True + algoId/clientAlgoId.
+        algo_orders = fetch_conditional_open_orders_for_client(client_obj, label, symbol)
+        for o in algo_orders or []:
+            otype = str(_protection_order_type(o) or "").upper()
+            should_cancel = (cancel_sl and otype == "STOP_MARKET") or (cancel_tp and otype == "TAKE_PROFIT_MARKET")
+            if not should_cancel:
+                continue
+            if not cancel_conditional_order_for_client(client_obj, label, symbol, o):
+                ok = False
+
+        RECENT_PROTECTION_ORDERS.pop(symbol, None)
         if client_obj is binance:
             invalidate_main_open_orders_cache()
-        return True
+        return ok
     except Exception as exc:
         print(f"Cancel protective orders error {label} {symbol}:", exc)
+        add_order_audit("CANCEL_PROTECTIVE_ORDERS_ERROR", symbol, {"account": label, "error": str(exc)})
         return False
 
 
 def verify_protective_orders_for_client(client_obj, label, symbol):
     try:
-        orders = signed_call(client_obj, client_obj.futures_get_open_orders, symbol=symbol, label=label)
-        exits = build_exit_lookup(orders).get(symbol, {})
-        sl_ok = _safe_float(exits.get("sl"), 0.0) > 0
-        tp_ok = _safe_float(exits.get("tp"), 0.0) > 0
+        standard_orders = signed_call(client_obj, client_obj.futures_get_open_orders, symbol=symbol, label=label) or []
+        algo_orders = fetch_conditional_open_orders_for_client(client_obj, label, symbol)
+        combined = list(standard_orders or []) + list(algo_orders or [])
+        exits = build_exit_lookup(combined).get(symbol, {})
+        recent = _recent_protection_verify(symbol) if PROTECTION_VERIFY_PLACEMENT_FALLBACK else {"rows": []}
+
+        sl = exits.get("sl") or recent.get("sl")
+        tp = exits.get("tp") or recent.get("tp")
+        sl_ok = _safe_float(sl, 0.0) > 0
+        tp_ok = _safe_float(tp, 0.0) > 0
+        source = "open_orders"
+        if (not exits.get("sl") or not exits.get("tp")) and sl_ok and tp_ok:
+            source = "recent_algo_placement_fallback"
+            add_order_audit("PROTECTION_VERIFY_RECENT_PLACEMENT_FALLBACK", symbol, {
+                "account": label,
+                "sl_ref": recent.get("sl_ref"),
+                "tp_ref": recent.get("tp_ref"),
+                "standard_open_order_count": len(standard_orders or []),
+                "conditional_open_order_count": len(algo_orders or []),
+            })
+
         return {
             "ok": bool(sl_ok and tp_ok),
             "sl_resolved": bool(sl_ok),
             "tp_resolved": bool(tp_ok),
-            "sl": exits.get("sl"),
-            "tp": exits.get("tp"),
-            "open_order_count": len(orders or []),
+            "sl": sl,
+            "tp": tp,
+            "sl_ref": exits.get("sl_ref") or recent.get("sl_ref"),
+            "tp_ref": exits.get("tp_ref") or recent.get("tp_ref"),
+            "open_order_count": len(combined or []),
+            "standard_open_order_count": len(standard_orders or []),
+            "conditional_open_order_count": len(algo_orders or []),
+            "source": source,
         }
     except Exception as exc:
         return {"ok": False, "sl_resolved": False, "tp_resolved": False, "error": str(exc)}
@@ -1918,12 +2424,98 @@ def verify_protective_orders_with_retry(client_obj, label, symbol, attempts=None
     return last or {"ok": False, "sl_resolved": False, "tp_resolved": False, "attempts": attempts}
 
 
+def get_position_amt_for_client(client_obj, label, symbol):
+    """Return current futures position amount from Binance, bypassing app caches."""
+    try:
+        positions = signed_call(client_obj, client_obj.futures_position_information, symbol=symbol, label=label)
+        for pos in positions or []:
+            if str(pos.get("symbol", "")).upper() == str(symbol).upper():
+                return _safe_float(pos.get("positionAmt"), 0.0)
+    except Exception as exc:
+        add_order_audit("POSITION_FETCH_ERROR", symbol, {"account": label, "error": str(exc)})
+    return 0.0
+
+
+def wait_for_position_for_client(client_obj, label, symbol, side, min_qty=0.0, attempts=None, delay=None):
+    """Wait until the market entry is reflected as an open position."""
+    attempts = max(1, int(attempts if attempts is not None else PROTECTION_ENTRY_CONFIRM_RETRIES))
+    delay = float(delay if delay is not None else PROTECTION_ENTRY_CONFIRM_DELAY)
+    side = str(side or "").upper()
+    min_qty = abs(_safe_float(min_qty, 0.0))
+    last_amt = 0.0
+
+    for attempt in range(1, attempts + 1):
+        amt = get_position_amt_for_client(client_obj, label, symbol)
+        last_amt = amt
+        ok = (side == "BUY" and amt > 0) or (side == "SELL" and amt < 0)
+        if ok and abs(amt) >= max(min_qty * 0.25, 1e-12):
+            detail = {"account": label, "side": side, "position_amt": amt, "qty": abs(amt), "attempt": attempt, "attempts": attempts}
+            add_order_audit("ENTRY_POSITION_CONFIRMED", symbol, detail)
+            return {"ok": True, **detail}
+        if attempt < attempts:
+            add_order_audit("ENTRY_POSITION_WAIT", symbol, {
+                "account": label, "side": side, "position_amt": amt, "attempt": attempt, "attempts": attempts, "sleep": delay,
+            })
+            time.sleep(delay)
+
+    detail = {"account": label, "side": side, "position_amt": last_amt, "qty": abs(last_amt), "attempts": attempts}
+    add_order_audit("ENTRY_POSITION_NOT_CONFIRMED", symbol, detail)
+    return {"ok": False, **detail}
+
+
+def wait_for_position_closed_for_client(client_obj, label, symbol, attempts=None, delay=None):
+    attempts = max(1, int(attempts if attempts is not None else EMERGENCY_CLOSE_VERIFY_RETRIES))
+    delay = float(delay if delay is not None else EMERGENCY_CLOSE_VERIFY_DELAY)
+    step = _safe_float((EXCHANGE_CACHE.get(symbol) or {}).get("stepSize"), 0.0)
+    tolerance = max(step * 0.5, 1e-12)
+    last_amt = 0.0
+
+    for attempt in range(1, attempts + 1):
+        amt = get_position_amt_for_client(client_obj, label, symbol)
+        last_amt = amt
+        if abs(amt) <= tolerance:
+            detail = {"account": label, "position_amt": amt, "attempt": attempt, "attempts": attempts}
+            add_order_audit("EMERGENCY_CLOSE_CONFIRMED", symbol, detail)
+            return {"ok": True, **detail}
+        if attempt < attempts:
+            add_order_audit("EMERGENCY_CLOSE_WAIT", symbol, {
+                "account": label, "position_amt": amt, "attempt": attempt, "attempts": attempts, "sleep": delay,
+            })
+            time.sleep(delay)
+
+    detail = {"account": label, "position_amt": last_amt, "attempts": attempts}
+    add_order_audit("EMERGENCY_CLOSE_NOT_CONFIRMED", symbol, detail)
+    return {"ok": False, **detail}
+
+
 def emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_failed"):
     try:
-        close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
-        close_qty = floor_to_step(abs(float(qty)), EXCHANGE_CACHE.get(symbol, {}).get("stepSize", 0.001))
+        live_amt = get_position_amt_for_client(client_obj, label, symbol)
+        if abs(live_amt) > 0:
+            close_side = SIDE_SELL if live_amt > 0 else SIDE_BUY
+            close_qty_raw = abs(live_amt)
+        else:
+            close_side = SIDE_SELL if str(side).upper() == "BUY" else SIDE_BUY
+            close_qty_raw = abs(float(qty or 0))
+
+        close_qty_detail = normalize_quantity_detail(symbol, close_qty_raw)
+        if not close_qty_detail.get("ok"):
+            add_order_audit("EMERGENCY_CLOSE_QTY_INVALID", symbol, {
+                "account": label, "raw_qty": close_qty_raw, "detail": close_qty_detail, "reason": reason,
+            })
+            return {"status": "rejected", "reason": "close_qty_invalid", "detail": close_qty_detail}
+
+        close_qty = close_qty_detail["value"]
+        close_qty_text = close_qty_detail["text"]
         if close_qty <= 0:
             return {"status": "rejected", "reason": "close_qty_zero"}
+
+        client_order_id = build_order_client_id(symbol, side, "CLS")
+        add_order_audit("EMERGENCY_CLOSE_ATTEMPT", symbol, {
+            "account": label, "side": close_side, "qty": close_qty, "qty_text": close_qty_text,
+            "live_position_amt": live_amt, "reason": reason, "clientOrderId": client_order_id,
+        })
+
         order = signed_call(
             client_obj,
             client_obj.futures_create_order,
@@ -1931,16 +2523,370 @@ def emergency_close_position_for_client(client_obj, label, symbol, side, qty, re
             symbol=symbol,
             side=close_side,
             type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=close_qty,
+            quantity=close_qty_text,
             reduceOnly=True,
-            newClientOrderId=build_order_client_id(symbol, side, "CLS"),
+            newClientOrderId=client_order_id,
         )
-        add_order_audit("EMERGENCY_CLOSE_SENT", symbol, {"account": label, "qty": close_qty, "reason": reason})
-        return {"status": "OK", "order": order}
+        if client_obj is binance:
+            invalidate_main_positions_cache()
+            invalidate_main_open_orders_cache()
+
+        add_order_audit("EMERGENCY_CLOSE_SENT", symbol, {
+            "account": label, "qty": close_qty, "qty_text": close_qty_text, "reason": reason,
+            "order_id": order.get("orderId") if isinstance(order, dict) else None,
+            "status": order.get("status") if isinstance(order, dict) else None,
+        })
+        close_verify = wait_for_position_closed_for_client(client_obj, label, symbol)
+        return {"status": "OK" if close_verify.get("ok") else "SENT_NOT_CONFIRMED", "order": order, "verify_close": close_verify}
     except Exception as exc:
         add_order_audit("EMERGENCY_CLOSE_ERROR", symbol, {"account": label, "error": str(exc), "reason": reason})
         return {"status": "error", "error": str(exc)}
 
+
+def place_protective_order_for_client(client_obj, label, symbol, leg, order_type, close_side, stop_price_text, qty_text, client_order_id):
+    """Place one protective order and accept both standard orderId and Algo Service algoId responses."""
+    leg = str(leg or "").upper()
+    params = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": order_type,
+        "stopPrice": stop_price_text,
+        "workingType": "MARK_PRICE",
+        "newClientOrderId": client_order_id,
+    }
+    if PROTECTION_ORDER_MODE == "CLOSE_POSITION":
+        params["closePosition"] = True
+    else:
+        params["quantity"] = qty_text
+        params["reduceOnly"] = True
+
+    add_order_audit(f"PLACE_{leg}_ATTEMPT", symbol, {
+        "account": label,
+        "clientOrderId": client_order_id,
+        "protection_order_mode": PROTECTION_ORDER_MODE,
+        "params": {k: v for k, v in params.items() if k != "newClientOrderId"},
+    })
+
+    try:
+        order = signed_call(client_obj, client_obj.futures_create_order, label=label, **params)
+        if isinstance(order, dict):
+            order = _annotate_protection_response(order, leg=leg)
+        ref_type, ref_id = _protection_order_ref(order)
+        status = _protection_order_status(order)
+        if not ref_id:
+            raise RuntimeError(f"{leg} order accepted without orderId/algoId: {order}")
+        if not _is_active_protection_status(status):
+            raise RuntimeError(f"{leg} order returned inactive status {status}: {order}")
+
+        _remember_protection_order(symbol, leg, order)
+        add_order_audit(f"PLACE_{leg}_OK", symbol, {
+            "account": label,
+            "ref_type": ref_type,
+            "ref_id": ref_id,
+            "order_id": order.get("orderId") if isinstance(order, dict) else None,
+            "algo_id": order.get("algoId") if isinstance(order, dict) else None,
+            "clientAlgoId": order.get("clientAlgoId") if isinstance(order, dict) else None,
+            "clientOrderId": client_order_id,
+            "stopPrice": stop_price_text,
+            "triggerPrice": order.get("triggerPrice") if isinstance(order, dict) else None,
+            "status": status,
+            "type": _protection_order_type(order),
+            "closePosition": order.get("closePosition") if isinstance(order, dict) else None,
+            "reduceOnly": order.get("reduceOnly") if isinstance(order, dict) else None,
+            "protection_order_mode": PROTECTION_ORDER_MODE,
+        })
+        if client_obj is binance:
+            invalidate_main_open_orders_cache()
+        return order
+    except Exception as exc:
+        add_order_audit(f"PLACE_{leg}_FAILED", symbol, {
+            "account": label,
+            "error": str(exc),
+            "stopPrice": stop_price_text,
+            "clientOrderId": client_order_id,
+            "protection_order_mode": PROTECTION_ORDER_MODE,
+            "params": {k: v for k, v in params.items() if k != "newClientOrderId"},
+        })
+        raise
+
+
+
+def get_entry_limit_offset(symbol):
+    symbol = str(symbol or "").upper().strip()
+    override = os.getenv(f"ENTRY_LIMIT_OFFSET_{symbol}")
+    if override is not None:
+        try:
+            return float(override)
+        except Exception:
+            pass
+    tier = get_pair_tier(symbol)
+    if tier == "TOP":
+        return ENTRY_LIMIT_OFFSET_TOP
+    if tier == "MID":
+        return ENTRY_LIMIT_OFFSET_MID
+    if tier == "MID_AGGRESSIVE":
+        return ENTRY_LIMIT_OFFSET_MID_AGGRESSIVE
+    return ENTRY_LIMIT_OFFSET_DEFAULT
+
+def build_entry_limit_plan(client_obj, label, symbol, side, force=False):
+    """Build a marketable limit-entry plan from live orderbook.
+
+    BUY caps price near best ask; SELL caps price near best bid. This prevents
+    unexpected slippage while still allowing immediate fill when liquidity is present.
+    """
+    symbol = str(symbol or "").upper().strip()
+    side = str(side or "").upper().strip()
+    tier = get_pair_tier(symbol)
+    offset = get_entry_limit_offset(symbol)
+    spread = get_live_spread(client_obj, symbol, tier, force=force)
+    best_bid = _safe_float(spread.get("best_bid"), 0.0)
+    best_ask = _safe_float(spread.get("best_ask"), 0.0)
+
+    if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+        return {
+            "ok": False,
+            "reason": "ENTRY_ORDERBOOK_UNAVAILABLE",
+            "symbol": symbol,
+            "side": side,
+            "tier": tier,
+            "spread": spread,
+            "offset": offset,
+        }
+
+    if side == "BUY":
+        raw_price = best_ask * (1.0 + offset)
+        anchor = "best_ask"
+    elif side == "SELL":
+        raw_price = best_bid * (1.0 - offset)
+        anchor = "best_bid"
+    else:
+        return {"ok": False, "reason": "INVALID_SIDE", "symbol": symbol, "side": side}
+
+    price_detail = normalize_entry_price_detail(symbol, raw_price)
+    if not price_detail.get("ok"):
+        return {
+            "ok": False,
+            "reason": "ENTRY_LIMIT_PRICE_INVALID",
+            "symbol": symbol,
+            "side": side,
+            "tier": tier,
+            "spread": spread,
+            "offset": offset,
+            "price_detail": price_detail,
+        }
+
+    return {
+        "ok": True,
+        "reason": "OK",
+        "symbol": symbol,
+        "side": side,
+        "tier": tier,
+        "offset": offset,
+        "anchor": anchor,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_pct": spread.get("spread_pct"),
+        "limit_price": price_detail.get("value"),
+        "limit_price_text": price_detail.get("text"),
+        "price_detail": price_detail,
+        "spread": spread,
+        "time_in_force": ENTRY_LIMIT_TIME_IN_FORCE,
+        "ttl_seconds": ENTRY_LIMIT_TTL_SECONDS,
+    }
+
+
+def get_entry_reference_price_for_quality(client_obj, label, symbol, side):
+    """Return the price used for quality/qty calculation before entry.
+
+    For LIMIT entries, use the same tick-clean capped limit price that will be
+    used in placement. For MARKET entries, use current ticker as before.
+    """
+    if ENTRY_ORDER_TYPE == "LIMIT":
+        plan = build_entry_limit_plan(client_obj, label, symbol, side, force=False)
+        if plan.get("ok"):
+            return float(plan["limit_price"]), plan
+        return None, plan
+
+    try:
+        ticker_price = float(client_obj.futures_symbol_ticker(symbol=symbol)["price"])
+        detail = normalize_entry_price_detail(symbol, ticker_price)
+        if detail.get("ok"):
+            ticker_price = float(detail.get("value"))
+        return ticker_price, {"ok": True, "reason": "MARKET_REFERENCE", "entry_order_type": ENTRY_ORDER_TYPE, "price_detail": detail}
+    except Exception as exc:
+        return None, {"ok": False, "reason": "TICKER_REFERENCE_ERROR", "error": str(exc)}
+
+
+def _fetch_entry_order_status(client_obj, label, symbol, order=None, client_order_id=None):
+    try:
+        params = {"symbol": symbol}
+        if isinstance(order, dict) and order.get("orderId"):
+            params["orderId"] = order.get("orderId")
+        elif client_order_id:
+            params["origClientOrderId"] = client_order_id
+        else:
+            return {"ok": False, "reason": "missing_order_reference"}
+        data = signed_call(client_obj, client_obj.futures_get_order, label=label, **params)
+        return {"ok": True, "order": data, "status": str((data or {}).get("status") or "UNKNOWN").upper()}
+    except Exception as exc:
+        return {"ok": False, "reason": "fetch_order_status_error", "error": str(exc)}
+
+
+def _cancel_entry_limit_order(client_obj, label, symbol, order=None, client_order_id=None, reason="ttl_expired"):
+    try:
+        params = {"symbol": symbol}
+        if isinstance(order, dict) and order.get("orderId"):
+            params["orderId"] = order.get("orderId")
+        elif client_order_id:
+            params["origClientOrderId"] = client_order_id
+        else:
+            return {"ok": False, "reason": "missing_order_reference"}
+        result = signed_call(client_obj, client_obj.futures_cancel_order, label=label, **params)
+        add_order_audit("ENTRY_LIMIT_CANCEL_SENT", symbol, {
+            "account": label,
+            "reason": reason,
+            "order_id": result.get("orderId") if isinstance(result, dict) else None,
+            "clientOrderId": client_order_id,
+            "status": result.get("status") if isinstance(result, dict) else None,
+        })
+        return {"ok": True, "order": result}
+    except Exception as exc:
+        add_order_audit("ENTRY_LIMIT_CANCEL_ERROR", symbol, {"account": label, "reason": reason, "error": str(exc), "clientOrderId": client_order_id})
+        return {"ok": False, "error": str(exc)}
+
+
+def wait_for_limit_entry_fill(client_obj, label, symbol, side, order, client_order_id, qty, ttl_seconds=None, poll_interval=None):
+    ttl_seconds = float(ENTRY_LIMIT_TTL_SECONDS if ttl_seconds is None else ttl_seconds)
+    poll_interval = float(ENTRY_LIMIT_POLL_INTERVAL if poll_interval is None else poll_interval)
+    deadline = time.time() + max(0.5, ttl_seconds)
+    last_status = None
+    last_order = None
+
+    while time.time() <= deadline:
+        status_row = _fetch_entry_order_status(client_obj, label, symbol, order=order, client_order_id=client_order_id)
+        if status_row.get("ok"):
+            last_status = status_row.get("status")
+            last_order = status_row.get("order")
+            executed = _safe_float((last_order or {}).get("executedQty"), 0.0)
+            add_order_audit("ENTRY_LIMIT_STATUS", symbol, {
+                "account": label,
+                "clientOrderId": client_order_id,
+                "status": last_status,
+                "executedQty": executed,
+            })
+            if last_status == "FILLED" or executed > 0:
+                # Position is the source of truth; partial fills are protected by actual live qty.
+                fill = wait_for_position_for_client(client_obj, label, symbol, side, min_qty=max(executed, 0.0), attempts=2, delay=0.25)
+                if fill.get("ok"):
+                    fill["order_status"] = last_status
+                    fill["executedQty"] = executed
+                    return fill
+            if last_status in ("CANCELED", "EXPIRED", "REJECTED"):
+                break
+        else:
+            add_order_audit("ENTRY_LIMIT_STATUS_ERROR", symbol, {"account": label, "clientOrderId": client_order_id, "status": status_row})
+        time.sleep(max(0.1, poll_interval))
+
+    cancel_result = _cancel_entry_limit_order(client_obj, label, symbol, order=order, client_order_id=client_order_id, reason="entry_limit_not_filled")
+    # After cancel, check once more in case a partial fill landed just before cancel.
+    fill = wait_for_position_for_client(client_obj, label, symbol, side, min_qty=0.0, attempts=2, delay=0.25)
+    if fill.get("ok"):
+        fill["order_status"] = last_status
+        fill["cancel_result"] = cancel_result
+        return fill
+    return {
+        "ok": False,
+        "reason": "entry_limit_not_filled",
+        "last_status": last_status,
+        "last_order": last_order,
+        "cancel_result": cancel_result,
+    }
+
+
+def place_market_entry_for_client(client_obj, label, symbol, side, qty_text, entry_client_id):
+    add_order_audit("ENTRY_PLACE_ATTEMPT", symbol, {
+        "account": label,
+        "entry_order_type": "MARKET",
+        "side": side,
+        "qty_text": qty_text,
+        "clientOrderId": entry_client_id,
+    })
+    order = signed_call(
+        client_obj,
+        client_obj.futures_create_order,
+        label=label,
+        symbol=symbol,
+        side=SIDE_BUY if side == "BUY" else SIDE_SELL,
+        type=FUTURE_ORDER_TYPE_MARKET,
+        quantity=qty_text,
+        newClientOrderId=entry_client_id,
+    )
+    add_order_audit("ENTRY_PLACE_OK", symbol, {
+        "account": label,
+        "entry_order_type": "MARKET",
+        "order_id": order.get("orderId") if isinstance(order, dict) else None,
+        "clientOrderId": entry_client_id,
+        "status": order.get("status") if isinstance(order, dict) else None,
+        "executedQty": order.get("executedQty") if isinstance(order, dict) else None,
+    })
+    fill = wait_for_position_for_client(client_obj, label, symbol, side, min_qty=float(qty_text or 0))
+    return order, fill, {"entry_order_type": "MARKET"}
+
+
+def place_controlled_entry_for_client(client_obj, label, symbol, side, qty_text):
+    entry_type = ENTRY_ORDER_TYPE
+    if entry_type not in ("LIMIT", "MARKET"):
+        entry_type = "LIMIT"
+
+    if entry_type == "MARKET":
+        cid = build_order_client_id(symbol, side, "ENT")
+        return place_market_entry_for_client(client_obj, label, symbol, side, qty_text, cid)
+
+    attempts = 1 + max(0, int(ENTRY_LIMIT_MAX_REPRICE))
+    last_detail = None
+    for attempt in range(1, attempts + 1):
+        plan = build_entry_limit_plan(client_obj, label, symbol, side, force=(attempt > 1))
+        last_detail = plan
+        if not plan.get("ok"):
+            add_order_audit("ENTRY_LIMIT_PLAN_FAILED", symbol, {"account": label, "attempt": attempt, "attempts": attempts, "plan": plan})
+            break
+
+        cid = build_order_client_id(symbol, side, f"L{attempt}")
+        params = {
+            "symbol": symbol,
+            "side": SIDE_BUY if side == "BUY" else SIDE_SELL,
+            "type": "LIMIT",
+            "timeInForce": ENTRY_LIMIT_TIME_IN_FORCE,
+            "quantity": qty_text,
+            "price": plan["limit_price_text"],
+            "newClientOrderId": cid,
+        }
+        add_order_audit("ENTRY_LIMIT_PLAN", symbol, {"account": label, "attempt": attempt, "attempts": attempts, "plan": plan})
+        add_order_audit("ENTRY_LIMIT_PLACE_ATTEMPT", symbol, {"account": label, "attempt": attempt, "params": {k: v for k, v in params.items() if k != "newClientOrderId"}, "clientOrderId": cid})
+        try:
+            order = signed_call(client_obj, client_obj.futures_create_order, label=label, **params)
+            add_order_audit("ENTRY_LIMIT_PLACE_OK", symbol, {
+                "account": label,
+                "attempt": attempt,
+                "order_id": order.get("orderId") if isinstance(order, dict) else None,
+                "clientOrderId": cid,
+                "status": order.get("status") if isinstance(order, dict) else None,
+                "price": plan.get("limit_price_text"),
+            })
+            fill = wait_for_limit_entry_fill(client_obj, label, symbol, side, order, cid, qty_text)
+            if fill.get("ok"):
+                return order, fill, {"entry_order_type": "LIMIT", "entry_limit_plan": plan, "attempt": attempt, "attempts": attempts}
+            add_order_audit("ENTRY_LIMIT_NOT_FILLED", symbol, {"account": label, "attempt": attempt, "attempts": attempts, "fill": fill, "plan": plan})
+        except Exception as exc:
+            add_order_audit("ENTRY_LIMIT_PLACE_FAILED", symbol, {"account": label, "attempt": attempt, "attempts": attempts, "error": str(exc), "plan": plan})
+            last_detail = {"ok": False, "reason": "ENTRY_LIMIT_PLACE_FAILED", "error": str(exc), "plan": plan}
+
+    if ENTRY_MARKET_FALLBACK:
+        add_order_audit("ENTRY_MARKET_FALLBACK", symbol, {"account": label, "last_detail": last_detail})
+        cid = build_order_client_id(symbol, side, "ENT")
+        return place_market_entry_for_client(client_obj, label, symbol, side, qty_text, cid)
+
+    return None, {"ok": False, "reason": "entry_limit_not_filled", "detail": last_detail, "attempts": attempts}, {"entry_order_type": "LIMIT", "entry_limit_detail": last_detail}
 
 def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     if client_obj is None:
@@ -1951,7 +2897,6 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     if side not in ("BUY", "SELL"):
         return {"account": label, "error": "invalid_side"}
 
-    # Use EXCHANGE_CACHE precision only; no extra exchangeInfo/API call here.
     qty_detail = normalize_quantity_detail(symbol, qty)
     sl_detail = normalize_protective_price_detail(symbol, sl, side, "SL")
     tp_detail = normalize_protective_price_detail(symbol, tp, side, "TP")
@@ -1982,14 +2927,15 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     add_order_audit("PROTECTION_PRICE_NORMALIZED", symbol, {
         "account": label,
         "side": side,
+        "raw_qty": float(qty_detail.get("raw", qty)),
+        "qty": qty,
+        "qty_text": qty_text,
         "raw_sl": float(sl),
         "raw_tp": float(tp),
         "sl": sl_price,
         "tp": tp_price,
         "sl_text": sl_text,
         "tp_text": tp_text,
-        "qty": qty,
-        "qty_text": qty_text,
         "tickSize": sl_detail.get("tickSize"),
         "stepSize": qty_detail.get("stepSize"),
         "rounding": {"sl": sl_detail.get("rounding"), "tp": tp_detail.get("rounding")},
@@ -2003,110 +2949,102 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
     entry_order = None
     sl_order = None
     tp_order = None
-
-    def _protective_order_kwargs(order_type, stop_price_text, client_order_id):
-        base = {
-            "symbol": symbol,
-            "side": close_side,
-            "type": order_type,
-            "stopPrice": stop_price_text,
-            "workingType": "MARK_PRICE",
-            "newClientOrderId": client_order_id,
-        }
-        # REDUCE_ONLY is the default because it is explicit and easier to verify
-        # than closePosition=True. CLOSE_POSITION remains available by env fallback.
-        if PROTECTION_ORDER_MODE == "CLOSE_POSITION":
-            base["closePosition"] = True
-        else:
-            base["quantity"] = qty_text
-            base["reduceOnly"] = True
-        return base
+    entry_fill = None
+    entry_detail = None
+    protect_qty = qty
+    protect_qty_text = qty_text
 
     try:
-        entry_client_id = build_order_client_id(symbol, side, "ENT")
-        add_order_audit("ENTRY_PLACE_ATTEMPT", symbol, {
-            "account": label, "side": side, "qty": qty, "qty_text": qty_text, "clientOrderId": entry_client_id
-        })
-        entry_order = signed_call(
-            client_obj,
-            client_obj.futures_create_order,
-            label=label,
-            symbol=symbol,
-            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=qty_text,
-            newClientOrderId=entry_client_id,
-        )
-        add_order_audit("ENTRY_PLACE_OK", symbol, {
-            "account": label,
-            "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
-            "clientOrderId": entry_client_id,
-            "status": entry_order.get("status") if isinstance(entry_order, dict) else None,
-        })
+        entry_order, entry_fill, entry_detail = place_controlled_entry_for_client(client_obj, label, symbol, side, qty_text)
+        if client_obj is binance:
+            invalidate_main_positions_cache()
+            invalidate_main_open_orders_cache()
+
+        if not entry_fill.get("ok"):
+            # LIMIT entries that do not fill are skipped, not emergency-closed.
+            # MARKET fallback/market entries still use strict close verification if a position might exist.
+            close_result = None
+            if entry_order and (entry_detail or {}).get("entry_order_type") == "MARKET":
+                close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="entry_position_not_confirmed")
+            cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
+            return {
+                "account": label,
+                "status": "ENTRY_NOT_FILLED",
+                "error": entry_fill.get("reason") or "entry_not_filled",
+                "qty": qty,
+                "qty_text": qty_text,
+                "entry_fill": entry_fill,
+                "entry_detail": entry_detail,
+                "close_result": close_result,
+                "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "entry_order_type": (entry_detail or {}).get("entry_order_type"),
+                "protection_order_mode": PROTECTION_ORDER_MODE,
+            }
+
+        live_qty_detail = normalize_quantity_detail(symbol, entry_fill.get("qty") or qty)
+        if live_qty_detail.get("ok"):
+            protect_qty = live_qty_detail["value"]
+            protect_qty_text = live_qty_detail["text"]
 
         time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
 
         sl_client_id = build_order_client_id(symbol, side, "SL")
-        sl_kwargs = _protective_order_kwargs(FUTURE_ORDER_TYPE_STOP_MARKET, sl_text, sl_client_id)
-        add_order_audit("PLACE_SL_ATTEMPT", symbol, {
-            "account": label,
-            "params": {k: v for k, v in sl_kwargs.items() if k != "newClientOrderId"},
-            "clientOrderId": sl_client_id,
-        })
         try:
-            sl_order = signed_call(
-                client_obj,
-                client_obj.futures_create_order,
-                label=label,
-                **sl_kwargs,
+            sl_order = place_protective_order_for_client(
+                client_obj, label, symbol, "SL", FUTURE_ORDER_TYPE_STOP_MARKET,
+                close_side, sl_text, protect_qty_text, sl_client_id
             )
-            add_order_audit("PLACE_SL_OK", symbol, {
-                "account": label,
-                "order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
-                "clientOrderId": sl_client_id,
-                "stopPrice": sl_text,
-                "status": sl_order.get("status") if isinstance(sl_order, dict) else None,
-                "type": sl_order.get("type") if isinstance(sl_order, dict) else None,
-                "closePosition": sl_order.get("closePosition") if isinstance(sl_order, dict) else None,
-                "reduceOnly": sl_order.get("reduceOnly") if isinstance(sl_order, dict) else None,
-            })
         except Exception as sl_exc:
-            add_order_audit("PLACE_SL_FAILED", symbol, {
-                "account": label, "error": str(sl_exc), "stopPrice": sl_text, "clientOrderId": sl_client_id,
-                "params": {k: v for k, v in sl_kwargs.items() if k != "newClientOrderId"},
-            })
-            raise
+            close_result = emergency_close_position_for_client(client_obj, label, symbol, side, protect_qty, reason="place_sl_failed")
+            cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
+            return {
+                "account": label,
+                "status": "CLOSED_PROTECTION_PLACE_FAILED",
+                "error": "place_sl_failed",
+                "error_detail": str(sl_exc),
+                "qty": protect_qty,
+                "qty_text": protect_qty_text,
+                "sl": sl_price,
+                "tp": tp_price,
+                "sl_text": sl_text,
+                "tp_text": tp_text,
+                "entry_fill": entry_fill,
+                "close_result": close_result,
+                "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "sl_order_id": None,
+                "tp_order_id": None,
+                "protection_order_mode": PROTECTION_ORDER_MODE,
+            }
+
+        time.sleep(max(0.0, PROTECTION_PLACEMENT_GAP_SECONDS))
 
         tp_client_id = build_order_client_id(symbol, side, "TP")
-        tp_kwargs = _protective_order_kwargs(FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET, tp_text, tp_client_id)
-        add_order_audit("PLACE_TP_ATTEMPT", symbol, {
-            "account": label,
-            "params": {k: v for k, v in tp_kwargs.items() if k != "newClientOrderId"},
-            "clientOrderId": tp_client_id,
-        })
         try:
-            tp_order = signed_call(
-                client_obj,
-                client_obj.futures_create_order,
-                label=label,
-                **tp_kwargs,
+            tp_order = place_protective_order_for_client(
+                client_obj, label, symbol, "TP", FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                close_side, tp_text, protect_qty_text, tp_client_id
             )
-            add_order_audit("PLACE_TP_OK", symbol, {
-                "account": label,
-                "order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
-                "clientOrderId": tp_client_id,
-                "stopPrice": tp_text,
-                "status": tp_order.get("status") if isinstance(tp_order, dict) else None,
-                "type": tp_order.get("type") if isinstance(tp_order, dict) else None,
-                "closePosition": tp_order.get("closePosition") if isinstance(tp_order, dict) else None,
-                "reduceOnly": tp_order.get("reduceOnly") if isinstance(tp_order, dict) else None,
-            })
         except Exception as tp_exc:
-            add_order_audit("PLACE_TP_FAILED", symbol, {
-                "account": label, "error": str(tp_exc), "stopPrice": tp_text, "clientOrderId": tp_client_id,
-                "params": {k: v for k, v in tp_kwargs.items() if k != "newClientOrderId"},
-            })
-            raise
+            close_result = emergency_close_position_for_client(client_obj, label, symbol, side, protect_qty, reason="place_tp_failed")
+            cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
+            return {
+                "account": label,
+                "status": "CLOSED_PROTECTION_PLACE_FAILED",
+                "error": "place_tp_failed",
+                "error_detail": str(tp_exc),
+                "qty": protect_qty,
+                "qty_text": protect_qty_text,
+                "sl": sl_price,
+                "tp": tp_price,
+                "sl_text": sl_text,
+                "tp_text": tp_text,
+                "entry_fill": entry_fill,
+                "close_result": close_result,
+                "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
+                "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
+                "tp_order_id": None,
+                "protection_order_mode": PROTECTION_ORDER_MODE,
+            }
 
         verify = verify_protective_orders_with_retry(client_obj, label, symbol)
         if client_obj is binance:
@@ -2118,13 +3056,14 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "account": label,
                 "symbol": symbol,
                 "side": side,
-                "qty": qty,
-                "qty_text": qty_text,
+                "qty": protect_qty,
+                "qty_text": protect_qty_text,
                 "sl": sl_price,
                 "tp": tp_price,
                 "sl_text": sl_text,
                 "tp_text": tp_text,
                 "verify": verify,
+                "entry_fill": entry_fill,
                 "entry_order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
                 "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
                 "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
@@ -2134,19 +3073,20 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             }
             add_order_audit("PROTECTION_VERIFY_FAILED", symbol, detail)
             if STRICT_PROTECTION:
-                close_result = emergency_close_position_for_client(client_obj, label, symbol, side, qty, reason="protection_verify_failed")
+                close_result = emergency_close_position_for_client(client_obj, label, symbol, side, protect_qty, reason="protection_verify_failed")
                 cancel_protective_orders_for_client(client_obj, label, symbol, cancel_tp=True, cancel_sl=True)
                 return {
                     "account": label,
                     "status": "CLOSED_UNPROTECTED",
                     "error": "protection_verify_failed",
-                    "qty": qty,
-                    "qty_text": qty_text,
+                    "qty": protect_qty,
+                    "qty_text": protect_qty_text,
                     "sl": sl_price,
                     "tp": tp_price,
                     "sl_text": sl_text,
                     "tp_text": tp_text,
                     "verify": verify,
+                    "entry_fill": entry_fill,
                     "close_result": close_result,
                     "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
                     "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
@@ -2158,13 +3098,14 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "account": label,
                 "status": "UNPROTECTED",
                 "error": "protection_verify_failed",
-                "qty": qty,
-                "qty_text": qty_text,
+                "qty": protect_qty,
+                "qty_text": protect_qty_text,
                 "sl": sl_price,
                 "tp": tp_price,
                 "sl_text": sl_text,
                 "tp_text": tp_text,
                 "verify": verify,
+                "entry_fill": entry_fill,
                 "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
                 "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
                 "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
@@ -2174,13 +3115,14 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
         add_order_audit("PROTECTION_RESOLVED", symbol, {
             "account": label,
             "side": side,
-            "qty": qty,
-            "qty_text": qty_text,
+            "qty": protect_qty,
+            "qty_text": protect_qty_text,
             "sl": sl_price,
             "tp": tp_price,
             "sl_text": sl_text,
             "tp_text": tp_text,
             "verify": verify,
+            "entry_fill": entry_fill,
             "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
             "protection_order_mode": PROTECTION_ORDER_MODE,
@@ -2189,14 +3131,15 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
         return {
             "account": label,
             "status": "OK",
-            "qty": qty,
-            "qty_text": qty_text,
+            "qty": protect_qty,
+            "qty_text": protect_qty_text,
             "sl": sl_price,
             "tp": tp_price,
             "sl_text": sl_text,
             "tp_text": tp_text,
             "protective_resolved": True,
             "verify": verify,
+            "entry_fill": entry_fill,
             "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None,
             "sl_order_id": sl_order.get("orderId") if isinstance(sl_order, dict) else None,
             "tp_order_id": tp_order.get("orderId") if isinstance(tp_order, dict) else None,
@@ -2216,6 +3159,7 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
             "sl_text": sl_text,
             "tp_text": tp_text,
             "qty_text": qty_text,
+            "entry_fill": entry_fill,
             "protection_order_mode": PROTECTION_ORDER_MODE,
         })
         if entry_order and STRICT_PROTECTION:
@@ -2232,286 +3176,6 @@ def place_order_for_client(client_obj, label, symbol, side, qty, sl, tp):
                 "protection_order_mode": PROTECTION_ORDER_MODE,
             }
         return {"account": label, "error": err, "order_id": entry_order.get("orderId") if isinstance(entry_order, dict) else None}
-
-
-def _telegram_clear_alert_key(key: str) -> None:
-    if not TELEGRAM_CLEAR_RESOLVED_KEYS:
-        return
-    try:
-        TELEGRAM_ALERT_STATE.get("last_sent_by_key", {}).pop(key, None)
-    except Exception:
-        pass
-
-
-def _telegram_clear_alert_prefix(prefix: str) -> None:
-    if not TELEGRAM_CLEAR_RESOLVED_KEYS:
-        return
-    try:
-        last_sent = TELEGRAM_ALERT_STATE.get("last_sent_by_key", {})
-        for key in list(last_sent.keys()):
-            if str(key).startswith(prefix):
-                last_sent.pop(key, None)
-    except Exception:
-        pass
-
-
-def _telegram_mark_suppressed(key: str, reason: str, detail=None) -> None:
-    TELEGRAM_ALERT_STATE.setdefault("suppressed_by_key", {})[key] = {
-        "reason": reason,
-        "detail": detail or {},
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "ts": time.time(),
-    }
-
-
-def _decision_rows_current_only(rows=None):
-    """Return execution decisions from the current scan/execution era only."""
-    rows = rows if rows is not None else EXECUTION_DECISIONS
-    if not rows:
-        return []
-    if not TELEGRAM_ALERT_CURRENT_ONLY:
-        return list(rows)
-    try:
-        cutoff = max(float(LAST_SCAN_CYCLE_TS or 0), float((LAST_FINAL_EXECUTION or {}).get("ts") or 0) - 1.0)
-    except Exception:
-        cutoff = float(LAST_SCAN_CYCLE_TS or 0)
-    if cutoff <= 0:
-        return []
-    current = []
-    for row in rows:
-        try:
-            ts = float(row.get("ts") or 0)
-        except Exception:
-            ts = 0.0
-        if ts >= cutoff:
-            current.append(row)
-    return current
-
-
-def send_telegram(msg: str):
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        resp = requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=8)
-        return bool(resp.ok)
-    except Exception as exc:
-        print("telegram send error:", exc)
-        return False
-
-
-def telegram_available():
-    return bool(os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
-
-
-def _telegram_record_alert(key, msg, sent):
-    now = time.time()
-    TELEGRAM_ALERT_STATE["last_sent_by_key"][key] = now
-    TELEGRAM_ALERT_STATE["last_alerts"].append({
-        "key": key,
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "ts": now,
-        "sent": bool(sent),
-        "message": msg[:500],
-    })
-    TELEGRAM_ALERT_STATE["last_alerts"] = TELEGRAM_ALERT_STATE["last_alerts"][-25:]
-
-
-def send_telegram_alert(key, msg, force=False):
-    if not TELEGRAM_ALERTS_ENABLED or not telegram_available():
-        return False
-    now = time.time()
-    last = float(TELEGRAM_ALERT_STATE["last_sent_by_key"].get(key, 0) or 0)
-    if not force and last and (now - last) < TELEGRAM_ALERT_COOLDOWN_SECONDS:
-        return False
-    sent = send_telegram(msg)
-    _telegram_record_alert(key, msg, sent)
-    return sent
-
-
-def build_telegram_alert_status():
-    now = time.time()
-    last_sent = TELEGRAM_ALERT_STATE.get("last_sent_by_key", {})
-    return {
-        "enabled": TELEGRAM_ALERTS_ENABLED,
-        "available": telegram_available(),
-        "cooldown_seconds": TELEGRAM_ALERT_COOLDOWN_SECONDS,
-        "blocked_alert_minutes": TELEGRAM_BLOCKED_ALERT_MINUTES,
-        "scan_stale_alert_seconds": TELEGRAM_SCAN_STALE_ALERT_SECONDS,
-        "ws_block_alert_seconds": TELEGRAM_WS_BLOCK_ALERT_SECONDS,
-        "unprotected_alert_seconds": TELEGRAM_UNPROTECTED_ALERT_SECONDS,
-        "ws_startup_grace_seconds": TELEGRAM_WS_STARTUP_GRACE_SECONDS,
-        "require_ws_block": TELEGRAM_REQUIRE_WS_BLOCK,
-        "send_recovery_alert": TELEGRAM_SEND_RECOVERY_ALERT,
-        "current_only": TELEGRAM_ALERT_CURRENT_ONLY,
-        "clear_resolved_keys": TELEGRAM_CLEAR_RESOLVED_KEYS,
-        "ws_block_active": bool(TELEGRAM_ALERT_STATE.get("ws_block_active", False)),
-        "ws_block_reason": TELEGRAM_ALERT_STATE.get("ws_block_reason"),
-        "app_uptime_seconds": round(now - APP_START_TS, 2),
-        "current_state": TELEGRAM_ALERT_STATE.get("current_state", {}),
-        "suppressed_by_key": TELEGRAM_ALERT_STATE.get("suppressed_by_key", {}),
-        "last_sent_ago_by_key": {k: round(now - float(v), 2) for k, v in last_sent.items()},
-        "last_alerts": TELEGRAM_ALERT_STATE.get("last_alerts", [])[-10:],
-    }
-
-
-def check_runtime_telegram_alerts():
-    """Telegram alerts bound to current source-of-truth only.
-
-    Important: never alert from stale EXECUTION_DECISIONS rows. A resolved/fresh
-    scan must suppress old scan_stale/ws_stale/blocked:* alert keys.
-    """
-    if not TELEGRAM_ALERTS_ENABLED or not AUTO_MODE:
-        return
-
-    now = time.time()
-    try:
-        live_rows = build_live_position_rows()[:10]
-    except Exception:
-        live_rows = []
-
-    candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
-    summary = build_final_execution_summary(candidate_rows, live_rows)
-    status = str(summary.get("status") or "UNKNOWN")
-    reason = str(summary.get("reason") or "UNKNOWN")
-    age = float(summary.get("age_seconds") or 0)
-    symbol = summary.get("symbol") or "_SYSTEM_"
-    last_stage = summary.get("last_stage") or "-"
-    last_scan_age = summary.get("last_scan_age_seconds")
-
-    TELEGRAM_ALERT_STATE.setdefault("current_state", {})["execution"] = status
-
-    current_final_status = str((LAST_FINAL_EXECUTION or {}).get("status") or "")
-    current_final_ts = float((LAST_FINAL_EXECUTION or {}).get("ts") or 0)
-    current_summary_ts = float(summary.get("since_ts") or 0)
-    is_current_block = (
-        status == "BLOCKED"
-        and current_final_status == "BLOCKED"
-        and current_summary_ts >= max(0.0, current_final_ts - 1.0)
-    )
-
-    if is_current_block and age >= TELEGRAM_BLOCKED_ALERT_MINUTES * 60:
-        send_telegram_alert(
-            f"blocked:{symbol}:{reason}",
-            f"⚠️ MONTRA BLOCKED > {TELEGRAM_BLOCKED_ALERT_MINUTES:.0f}m\nSymbol: {symbol}\nReason: {reason}\nAge: {age:.0f}s\nStage: {last_stage}"
-        )
-    else:
-        _telegram_clear_alert_prefix("blocked:")
-        if status == "BLOCKED" and not is_current_block:
-            _telegram_mark_suppressed("blocked", "stale_or_resolved_block", {
-                "status": status,
-                "reason": reason,
-                "current_final_status": current_final_status,
-                "summary_ts": current_summary_ts,
-                "final_ts": current_final_ts,
-            })
-
-    if status == "LIVE_UNPROTECTED" and age >= TELEGRAM_UNPROTECTED_ALERT_SECONDS:
-        send_telegram_alert(
-            f"unprotected:{symbol}",
-            f"🚨 MONTRA LIVE POSITION UNPROTECTED\nSymbol: {symbol}\nAge: {age:.0f}s\nAction: verify SL/TP immediately."
-        )
-    elif status != "LIVE_UNPROTECTED":
-        _telegram_clear_alert_prefix("unprotected:")
-
-    if AUTO_TRADING and LAST_SCAN_CYCLE_TS <= 0:
-        boot_age = now - APP_START_TS
-        if boot_age > (EXECUTION_BOOT_GRACE_SECONDS + TELEGRAM_SCAN_STALE_ALERT_SECONDS):
-            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "NEVER_STARTED"
-            send_telegram_alert(
-                "scan_never_started",
-                f"⚠️ MONTRA scan telemetry belum mulai\nUptime: {boot_age:.0f}s\nBoot grace: {EXECUTION_BOOT_GRACE_SECONDS:.0f}s"
-            )
-        else:
-            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "BOOT_GRACE"
-            _telegram_clear_alert_key("scan_never_started")
-            _telegram_clear_alert_key("scan_stale")
-    elif AUTO_TRADING and LAST_SCAN_CYCLE_TS > 0:
-        scan_age = float(last_scan_age if last_scan_age is not None else (now - LAST_SCAN_CYCLE_TS))
-        stale_limit = max(TELEGRAM_SCAN_STALE_ALERT_SECONDS, SCAN_INTERVAL_MID * 2)
-        if scan_age > stale_limit:
-            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "STALE"
-            send_telegram_alert(
-                "scan_stale",
-                f"⚠️ MONTRA scan stale\nLast scan age: {scan_age:.0f}s\nLimit: {stale_limit:.0f}s"
-            )
-        else:
-            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "OK"
-            _telegram_clear_alert_key("scan_never_started")
-            _telegram_clear_alert_key("scan_stale")
-
-    ws_status = get_ws_status()
-    ws_gate = ws_health_snapshot()
-    ws_age = float(ws_status.get("last_message_age") or 9999)
-    uptime = now - APP_START_TS
-    ws_block_reason = str(ws_gate.get("reason") or "UNKNOWN")
-    ws_gate_blocking = bool(ws_gate.get("block")) and ws_block_reason in ("STALE_BLOCK", "SOCKET_DOWN", "THREAD_DEAD")
-
-    if uptime < TELEGRAM_WS_STARTUP_GRACE_SECONDS:
-        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "STARTUP_GRACE"
-        _telegram_mark_suppressed("ws_stale", "startup_grace", {"uptime": round(uptime, 2), "age": ws_age})
-    elif ws_gate_blocking:
-        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "BLOCKING"
-        TELEGRAM_ALERT_STATE["ws_block_active"] = True
-        TELEGRAM_ALERT_STATE["ws_block_reason"] = ws_block_reason
-        send_telegram_alert(
-            "ws_stale",
-            f"⚠️ MONTRA WS stale/blocking\nReason: {ws_block_reason}\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}"
-        )
-    else:
-        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "OK"
-        _telegram_clear_alert_key("ws_stale")
-        if TELEGRAM_SEND_RECOVERY_ALERT and TELEGRAM_ALERT_STATE.get("ws_block_active"):
-            TELEGRAM_ALERT_STATE["ws_block_active"] = False
-            prev_reason = TELEGRAM_ALERT_STATE.get("ws_block_reason") or "UNKNOWN"
-            TELEGRAM_ALERT_STATE["ws_block_reason"] = None
-            send_telegram_alert(
-                "ws_recovered",
-                f"✅ MONTRA WS recovered\nPrevious reason: {prev_reason}\nCurrent reason: {ws_block_reason}\nLast message age: {ws_age:.2f}s\nRestart count: {ws_status.get('restart_count')}",
-                force=True,
-            )
-
-    if circuit_breaker_active():
-        send_telegram_alert(
-            "circuit_breaker",
-            f"🧯 MONTRA circuit breaker active\nRemaining: {circuit_breaker_remaining():.0f}s\nErrors: {CONSECUTIVE_ERRORS}/{CIRCUIT_BREAKER_THRESHOLD}"
-        )
-    else:
-        _telegram_clear_alert_key("circuit_breaker")
-
-
-def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = True):
-    if binance is None:
-        print("⚠️ cancel skipped: binance client not ready")
-        return False
-    try:
-        orders = signed_call(binance, binance.futures_get_open_orders, symbol=symbol, label="MAIN")
-        for o in orders:
-            otype = o.get("type")
-            should_cancel = False
-            if cancel_sl and otype == "STOP_MARKET":
-                should_cancel = True
-            if cancel_tp and otype == "TAKE_PROFIT_MARKET":
-                should_cancel = True
-            if should_cancel:
-                try:
-                    signed_call(binance, binance.futures_cancel_order, symbol=symbol, orderId=o["orderId"], label="MAIN")
-                except Exception as e:
-                    print("Cancel single order error:", e)
-        time.sleep(1.0)
-        invalidate_main_open_orders_cache()
-        return True
-    except Exception as e:
-        print("Cancel error:", e)
-        return False
-    
-def place_futures_order(symbol, side, quantity, sl, tp):
-    result = place_order_for_client(binance, "MAIN", symbol, side, quantity, sl, tp)
-    if result.get("status") == "OK":
-        return {"status": "FILLED", "order": result}
-    return {"error": result.get("error") or result.get("status") or "order_failed", "detail": result}
 
 
 def update_account_profit(client, name):
@@ -2540,6 +3204,14 @@ Withdraw: {amount:.2f}
         ACCOUNT_PROFIT[name] = 0
 
 def place_order_multi(symbol, side, sl, tp):
+    symbol = str(symbol or "").upper().strip()
+    slot_ok, slot_reason, slot_detail = reserve_trade_slot(symbol, side=side, reason="place_order_multi", allow_existing=True)
+    if not slot_ok:
+        detail = {"reason": slot_reason, "risk_slots": slot_detail}
+        add_order_audit("ORDER_REJECTED_RISK_SLOT", symbol, detail)
+        set_final_execution("BLOCKED", symbol=symbol, side=side, reason=slot_reason, stage="risk_slot_gate", detail=detail)
+        return [{"account": "MAIN", "status": "REJECTED", "error": slot_reason, "risk_slots": slot_detail}]
+
     results = []
     for acc in CLIENTS:
         label = acc["name"]
@@ -2557,15 +3229,31 @@ def place_order_multi(symbol, side, sl, tp):
             balance = float(usdt["balance"]) if usdt else 0
             alloc = min(portfolio_alloc.get(symbol, 0.25), 0.12)
 
-            price = float(c.futures_symbol_ticker(symbol=symbol)["price"])
-            quality_ok, quality_reason, quality_detail = evaluate_signal_execution_quality({
+            price, entry_reference_detail = get_entry_reference_price_for_quality(c, label, symbol, side)
+            if price is None or price <= 0:
+                results.append({
+                    "account": label,
+                    "error": "entry_reference_unavailable",
+                    "entry_reference": entry_reference_detail,
+                })
+                continue
+
+            exec_signal = apply_clean_prices_to_signal({
                 "symbol": symbol,
                 "type": side,
                 "entry": price,
                 "sl": sl,
                 "tp": tp,
                 "rr": abs(float(tp) - price) / max(abs(price - float(sl)), 1e-12),
-            })
+            }, reference_price=price)
+            price = float(exec_signal.get("entry", price))
+            sl = float(exec_signal.get("sl", sl))
+            tp = float(exec_signal.get("tp", tp))
+
+            quality_ok, quality_reason, quality_detail = evaluate_signal_execution_quality(exec_signal, reference_price=price)
+            if isinstance(quality_detail, dict):
+                quality_detail["entry_reference"] = entry_reference_detail
+                quality_detail["entry_order_type"] = ENTRY_ORDER_TYPE
             if not quality_ok:
                 results.append({
                     "account": label,
@@ -2598,8 +3286,18 @@ def place_order_multi(symbol, side, sl, tp):
                 })
                 continue
 
+            leverage_result = ensure_symbol_leverage(c, label, symbol)
+            if not leverage_result.get("ok"):
+                results.append({
+                    "account": label,
+                    "error": "leverage_set_failed",
+                    "leverage": leverage_result,
+                })
+                continue
+
             result = place_order_for_client(c, label, symbol, side, qty, sl, tp)
             result["entry_price"] = price
+            result["leverage"] = leverage_result
             result["min_notional"] = min_notional
             result["quality"] = quality_detail
             results.append(result)
@@ -2617,9 +3315,11 @@ def place_order_multi(symbol, side, sl, tp):
         add_order_audit("ORDER_MULTI_FAILED", symbol, {"results": results})
         TRADE_SNAPSHOTS.pop(symbol, None)
         set_symbol_cooldown(symbol, reason="multi_order_failed")
+        release_trade_slot(symbol, reason="order_failed", unlock=True)
     else:
         set_final_execution("ORDER_OK_PROTECTED", symbol=symbol, side=side, reason="PROTECTED_ORDER_OK", stage="order_result", detail={"results": results})
         add_order_audit("ORDER_MULTI_OK", symbol, {"results": results})
+        release_trade_slot(symbol, reason="order_ok_protected", unlock=False)
 
     return results
 
@@ -2680,6 +3380,227 @@ def update_stop_loss(symbol, side, new_sl):
         print("SL update skipped after retries:", symbol)
     except Exception as e:
         print("SL update error:", e)
+
+
+
+# ================= TELEGRAM ALERT SOURCE-OF-TRUTH HELPERS (v4.9.2) =================
+def send_telegram(msg: str):
+    """Send a plain Telegram message. Safe no-op when token/chat id are absent."""
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(url, json={"chat_id": chat_id, "text": str(msg)}, timeout=8)
+        return bool(resp.ok)
+    except Exception as exc:
+        print("telegram send error:", exc)
+        return False
+
+
+def telegram_available():
+    return bool(os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def _telegram_clear_alert_key(key: str) -> None:
+    try:
+        TELEGRAM_ALERT_STATE.setdefault("last_sent_by_key", {}).pop(key, None)
+        TELEGRAM_ALERT_STATE.setdefault("suppressed_by_key", {}).pop(key, None)
+    except Exception:
+        pass
+
+
+def _telegram_clear_alert_prefix(prefix: str) -> None:
+    try:
+        sent = TELEGRAM_ALERT_STATE.setdefault("last_sent_by_key", {})
+        suppressed = TELEGRAM_ALERT_STATE.setdefault("suppressed_by_key", {})
+        for key in list(sent.keys()):
+            if str(key).startswith(prefix):
+                sent.pop(key, None)
+        for key in list(suppressed.keys()):
+            if str(key).startswith(prefix):
+                suppressed.pop(key, None)
+    except Exception:
+        pass
+
+
+def _telegram_mark_suppressed(key: str, reason: str, detail=None) -> None:
+    try:
+        TELEGRAM_ALERT_STATE.setdefault("suppressed_by_key", {})[key] = {
+            "reason": reason,
+            "detail": detail or {},
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": time.time(),
+        }
+    except Exception:
+        pass
+
+
+def _telegram_record_alert(key, msg, sent):
+    now = time.time()
+    TELEGRAM_ALERT_STATE.setdefault("last_sent_by_key", {})[key] = now
+    TELEGRAM_ALERT_STATE.setdefault("last_alerts", []).append({
+        "key": key,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": now,
+        "sent": bool(sent),
+        "message": str(msg)[:500],
+    })
+    TELEGRAM_ALERT_STATE["last_alerts"] = TELEGRAM_ALERT_STATE.get("last_alerts", [])[-25:]
+
+
+def send_telegram_alert(key, msg, force=False):
+    if not TELEGRAM_ALERTS_ENABLED or not telegram_available():
+        return False
+    now = time.time()
+    last = float(TELEGRAM_ALERT_STATE.setdefault("last_sent_by_key", {}).get(key, 0) or 0)
+    if not force and last and (now - last) < TELEGRAM_ALERT_COOLDOWN_SECONDS:
+        return False
+    sent = send_telegram(msg)
+    _telegram_record_alert(key, msg, sent)
+    return sent
+
+
+def build_telegram_alert_status():
+    now = time.time()
+    last_sent = TELEGRAM_ALERT_STATE.get("last_sent_by_key", {})
+    return {
+        "enabled": TELEGRAM_ALERTS_ENABLED,
+        "available": telegram_available(),
+        "cooldown_seconds": TELEGRAM_ALERT_COOLDOWN_SECONDS,
+        "blocked_alert_minutes": TELEGRAM_BLOCKED_ALERT_MINUTES,
+        "scan_stale_alert_seconds": TELEGRAM_SCAN_STALE_ALERT_SECONDS,
+        "ws_block_alert_seconds": TELEGRAM_WS_BLOCK_ALERT_SECONDS,
+        "unprotected_alert_seconds": TELEGRAM_UNPROTECTED_ALERT_SECONDS,
+        "ws_startup_grace_seconds": TELEGRAM_WS_STARTUP_GRACE_SECONDS,
+        "require_ws_block": TELEGRAM_REQUIRE_WS_BLOCK,
+        "send_recovery_alert": TELEGRAM_SEND_RECOVERY_ALERT,
+        "current_only": TELEGRAM_ALERT_CURRENT_ONLY,
+        "clear_resolved_keys": TELEGRAM_CLEAR_RESOLVED_KEYS,
+        "ws_block_active": bool(TELEGRAM_ALERT_STATE.get("ws_block_active", False)),
+        "ws_block_reason": TELEGRAM_ALERT_STATE.get("ws_block_reason"),
+        "app_uptime_seconds": round(now - APP_START_TS, 2),
+        "current_state": TELEGRAM_ALERT_STATE.get("current_state", {}),
+        "suppressed_by_key": TELEGRAM_ALERT_STATE.get("suppressed_by_key", {}),
+        "last_sent_ago_by_key": {k: round(now - float(v), 2) for k, v in last_sent.items()},
+        "last_alerts": TELEGRAM_ALERT_STATE.get("last_alerts", [])[-10:],
+    }
+
+
+def check_runtime_telegram_alerts():
+    """Telegram alerts bound only to current runtime state."""
+    if not TELEGRAM_ALERTS_ENABLED or not AUTO_MODE:
+        return
+
+    now = time.time()
+    try:
+        live_rows = build_live_position_rows()[:10]
+    except Exception:
+        live_rows = []
+
+    candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+    summary = build_final_execution_summary(candidate_rows, live_rows)
+    status = str(summary.get("status") or "UNKNOWN")
+    reason = str(summary.get("reason") or "UNKNOWN")
+    age = float(summary.get("age_seconds") or 0)
+    symbol = summary.get("symbol") or "_SYSTEM_"
+    last_stage = summary.get("last_stage") or "-"
+    last_scan_age = summary.get("last_scan_age_seconds")
+
+    TELEGRAM_ALERT_STATE.setdefault("current_state", {})["execution"] = status
+
+    current_final_status = str((LAST_FINAL_EXECUTION or {}).get("status") or "")
+    current_final_ts = float((LAST_FINAL_EXECUTION or {}).get("ts") or 0)
+    current_summary_ts = float(summary.get("since_ts") or 0)
+    is_current_block = (
+        status == "BLOCKED"
+        and current_final_status == "BLOCKED"
+        and current_summary_ts >= max(0.0, current_final_ts - 1.0)
+    )
+
+    if is_current_block and age >= TELEGRAM_BLOCKED_ALERT_MINUTES * 60:
+        send_telegram_alert(
+            f"blocked:{symbol}:{reason}",
+            f"⚠️ MONTRA BLOCKED > {TELEGRAM_BLOCKED_ALERT_MINUTES:.0f}m\nSymbol: {symbol}\nReason: {reason}\nAge: {age:.0f}s\nStage: {last_stage}"
+        )
+    else:
+        _telegram_clear_alert_prefix("blocked:")
+        if status == "BLOCKED" and not is_current_block:
+            _telegram_mark_suppressed("blocked", "stale_or_resolved_block", {
+                "status": status,
+                "reason": reason,
+                "current_final_status": current_final_status,
+                "summary_ts": current_summary_ts,
+                "final_ts": current_final_ts,
+            })
+
+    if status == "LIVE_UNPROTECTED" and age >= TELEGRAM_UNPROTECTED_ALERT_SECONDS:
+        send_telegram_alert(
+            f"unprotected:{symbol}",
+            f"🚨 MONTRA LIVE POSITION UNPROTECTED\nSymbol: {symbol}\nAge: {age:.0f}s\nAction: verify SL/TP immediately."
+        )
+    elif status != "LIVE_UNPROTECTED":
+        _telegram_clear_alert_prefix("unprotected:")
+
+    if AUTO_TRADING and LAST_SCAN_CYCLE_TS <= 0:
+        boot_age = now - APP_START_TS
+        if boot_age > (EXECUTION_BOOT_GRACE_SECONDS + TELEGRAM_SCAN_STALE_ALERT_SECONDS):
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "NEVER_STARTED"
+            send_telegram_alert("scan_never_started", f"⚠️ MONTRA scan telemetry belum mulai\nUptime: {boot_age:.0f}s")
+        else:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "BOOT_GRACE"
+            _telegram_clear_alert_key("scan_never_started")
+            _telegram_clear_alert_key("scan_stale")
+    elif AUTO_TRADING and LAST_SCAN_CYCLE_TS > 0:
+        scan_age = float(last_scan_age if last_scan_age is not None else (now - LAST_SCAN_CYCLE_TS))
+        stale_limit = max(TELEGRAM_SCAN_STALE_ALERT_SECONDS, max(SCAN_INTERVAL_MID, SCAN_INTERVAL_MID_AGGRESSIVE) * 2)
+        if scan_age > stale_limit:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "STALE"
+            send_telegram_alert("scan_stale", f"⚠️ MONTRA scan stale\nLast scan age: {scan_age:.0f}s\nLimit: {stale_limit:.0f}s")
+        else:
+            TELEGRAM_ALERT_STATE.setdefault("current_state", {})["scan"] = "OK"
+            _telegram_clear_alert_key("scan_never_started")
+            _telegram_clear_alert_key("scan_stale")
+
+    ws_status = get_ws_status()
+    ws_gate = ws_health_snapshot()
+    ws_age = float(ws_status.get("last_message_age") or 9999)
+    uptime = now - APP_START_TS
+    ws_block_reason = str(ws_gate.get("reason") or "UNKNOWN")
+    ws_gate_blocking = bool(ws_gate.get("block")) and ws_block_reason in ("STALE_BLOCK", "SOCKET_DOWN", "THREAD_DEAD")
+
+    if uptime < TELEGRAM_WS_STARTUP_GRACE_SECONDS:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "STARTUP_GRACE"
+        _telegram_mark_suppressed("ws_stale", "startup_grace", {"uptime": round(uptime, 2), "age": ws_age})
+    elif ws_gate_blocking:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "BLOCKING"
+        TELEGRAM_ALERT_STATE["ws_block_active"] = True
+        TELEGRAM_ALERT_STATE["ws_block_reason"] = ws_block_reason
+        send_telegram_alert("ws_stale", f"⚠️ MONTRA WS stale/blocking\nReason: {ws_block_reason}\nLast message age: {ws_age:.1f}s\nRestart count: {ws_status.get('restart_count')}")
+    else:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["ws"] = "OK"
+        _telegram_clear_alert_key("ws_stale")
+        if TELEGRAM_SEND_RECOVERY_ALERT and TELEGRAM_ALERT_STATE.get("ws_block_active"):
+            TELEGRAM_ALERT_STATE["ws_block_active"] = False
+            prev_reason = TELEGRAM_ALERT_STATE.get("ws_block_reason") or "UNKNOWN"
+            TELEGRAM_ALERT_STATE["ws_block_reason"] = None
+            send_telegram_alert("ws_recovered", f"✅ MONTRA WS recovered\nPrevious reason: {prev_reason}\nCurrent reason: {ws_block_reason}\nLast message age: {ws_age:.2f}s", force=True)
+
+    if circuit_breaker_active():
+        send_telegram_alert("circuit_breaker", f"🧯 MONTRA circuit breaker active\nRemaining: {circuit_breaker_remaining():.0f}s\nErrors: {CONSECUTIVE_ERRORS}/{CIRCUIT_BREAKER_THRESHOLD}")
+    else:
+        _telegram_clear_alert_key("circuit_breaker")
+
+
+# Compatibility alias for old callers. Use the newer cancel_protective_orders_for_client under the hood.
+def cancel_existing_orders(symbol, cancel_tp: bool = True, cancel_sl: bool = True):
+    if binance is None:
+        print("⚠️ cancel skipped: binance client not ready")
+        return False
+    return cancel_protective_orders_for_client(binance, "MAIN", symbol, cancel_tp=cancel_tp, cancel_sl=cancel_sl)
+
+# ================= END TELEGRAM ALERT SOURCE-OF-TRUTH HELPERS =================
 
 # ================= TOTAL EQUITY & SAFETY =================
 def get_daily_loss_pct_now():
@@ -3381,13 +4302,126 @@ def update_portfolio_allocation():
     print("📊 PORTFOLIO TOP:", [(sym, round(w, 4)) for sym, w in top_rows])
     save_portfolio()
 
-def get_open_positions():
+def get_open_positions(force=False):
+    """Return live open positions. Use force=True for pre-entry risk gates."""
     try:
-        positions = fetch_main_positions(force=False, max_age=POSITION_CACHE_TTL, label="MAIN")
-        return [p for p in positions if float(p["positionAmt"]) != 0]
+        positions = fetch_main_positions(
+            force=bool(force),
+            max_age=0 if force else POSITION_CACHE_TTL,
+            label="MAIN",
+        )
+        return [p for p in positions if abs(float(p.get("positionAmt", 0) or 0)) > 0]
     except Exception as e:
         print("Error get_open_positions:", e)
         return []
+
+
+def _cleanup_reserved_trade_slots(now=None):
+    now = time.time() if now is None else float(now)
+    expired = []
+    with EXECUTION_SLOT_LOCK:
+        for sym, row in list(RESERVED_TRADE_SLOTS.items()):
+            ts = float(row.get("ts", 0) or 0)
+            if ts <= 0 or (now - ts) > ENTRY_SLOT_TTL_SECONDS:
+                expired.append(sym)
+        for sym in expired:
+            RESERVED_TRADE_SLOTS.pop(sym, None)
+            EXECUTION_IN_PROGRESS.discard(sym)
+    return expired
+
+
+def get_risk_slot_snapshot(symbol=None, force=True):
+    """Source-of-truth slot count = forced Binance positions + in-flight reservations."""
+    symbol = str(symbol or "").upper().strip() or None
+    now = time.time()
+    open_positions = get_open_positions(force=bool(force and MAX_OPEN_TRADES_FORCE_REFRESH))
+    open_symbols = sorted({p.get("symbol") for p in open_positions if p.get("symbol")})
+
+    with EXECUTION_SLOT_LOCK:
+        _cleanup_reserved_trade_slots(now)
+        reserved_rows = {sym: dict(row) for sym, row in RESERVED_TRADE_SLOTS.items()}
+
+    reserved_symbols = sorted([sym for sym in reserved_rows.keys() if sym not in set(open_symbols)])
+    used_slots = len(open_symbols) + len(reserved_symbols)
+    available_slots = max(0, MAX_OPEN_TRADES - used_slots)
+    return {
+        "max_open_trades": MAX_OPEN_TRADES,
+        "open_count": len(open_symbols),
+        "reserved_count": len(reserved_symbols),
+        "used_slots": used_slots,
+        "available_slots": available_slots,
+        "open_symbols": open_symbols,
+        "reserved_symbols": reserved_symbols,
+        "reserved_rows": reserved_rows,
+        "symbol": symbol,
+        "force_refresh": bool(force and MAX_OPEN_TRADES_FORCE_REFRESH),
+        "ts": now,
+    }
+
+
+def can_open_new_trade(symbol, force=True):
+    symbol = str(symbol or "").upper().strip()
+    snap = get_risk_slot_snapshot(symbol=symbol, force=force)
+    if symbol in snap["open_symbols"]:
+        return False, "POSITION_ALREADY_OPEN", snap
+    if symbol in snap["reserved_symbols"]:
+        return False, "RISK_SLOT_RESERVED", snap
+    if snap["used_slots"] >= MAX_OPEN_TRADES:
+        return False, "MAX_POSITION", snap
+    return True, "OK", snap
+
+
+def reserve_trade_slot(symbol, side=None, reason="entry", allow_existing=False):
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return False, "NO_SYMBOL", {}
+    with EXECUTION_SLOT_LOCK:
+        if symbol in RESERVED_TRADE_SLOTS:
+            if allow_existing:
+                return True, "ALREADY_RESERVED", get_risk_slot_snapshot(symbol=symbol, force=True)
+            return False, "RISK_SLOT_RESERVED", get_risk_slot_snapshot(symbol=symbol, force=True)
+        if symbol in EXECUTION_IN_PROGRESS and not allow_existing:
+            return False, "EXECUTION_IN_PROGRESS", get_risk_slot_snapshot(symbol=symbol, force=True)
+
+        ok, reason2, snap = can_open_new_trade(symbol, force=True)
+        if not ok:
+            return False, reason2, snap
+
+        row = {
+            "symbol": symbol,
+            "side": side,
+            "reason": reason,
+            "ts": time.time(),
+            "expires_at": time.time() + ENTRY_SLOT_TTL_SECONDS,
+        }
+        RESERVED_TRADE_SLOTS[symbol] = row
+        EXECUTION_IN_PROGRESS.add(symbol)
+        GLOBAL_SYMBOL_LOCK.add(symbol)
+        snap = get_risk_slot_snapshot(symbol=symbol, force=True)
+        snap["reservation"] = row
+
+    add_order_audit("RISK_SLOT_RESERVED", symbol, {
+        "side": side,
+        "reason": reason,
+        "slot": {k: snap.get(k) for k in ("max_open_trades", "open_count", "reserved_count", "used_slots", "available_slots", "open_symbols", "reserved_symbols")},
+    })
+    return True, "RESERVED", snap
+
+
+def release_trade_slot(symbol, reason="done", unlock=False):
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return
+    with EXECUTION_SLOT_LOCK:
+        RESERVED_TRADE_SLOTS.pop(symbol, None)
+        EXECUTION_IN_PROGRESS.discard(symbol)
+        if unlock:
+            GLOBAL_SYMBOL_LOCK.discard(symbol)
+    try:
+        add_order_audit("RISK_SLOT_RELEASED", symbol, {"reason": reason, "unlock": bool(unlock)})
+    except Exception:
+        pass
+
 
 # ⭐ NEW: centralized decision
 def pre_entry_spread_gate(symbol):
@@ -3471,13 +4505,10 @@ def should_execute_trade(signal):
         if pair_regime == "BEAR" and side != "SELL":
             return False, "PAIR_REGIME_BEAR_MISMATCH"
 
-    positions = get_open_positions()
-
-    if len(positions) >= MAX_OPEN_TRADES:
-        return False, "MAX_POSITION"
-
-    if any(p["symbol"] == symbol for p in positions):
-        return False, "POSITION_ALREADY_OPEN"
+    slot_ok, slot_reason, slot_detail = can_open_new_trade(symbol, force=True)
+    signal["risk_slots"] = slot_detail
+    if not slot_ok:
+        return False, slot_reason
 
     strategy = get_strategy(symbol)
     if strategy == "DEFENSIVE" and score < max(75, min_score_needed):
@@ -3527,6 +4558,150 @@ def resolve_closed_trade_pnl(symbol, fallback_pnl=0.0):
     return float(fallback_pnl or 0.0)
 
 
+
+def _parse_montra_time_ms(value):
+    if not value:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            val = float(value)
+            return int(val if val > 1e12 else val * 1000)
+        text = str(value).strip()
+        return int(time.mktime(time.strptime(text[:19], "%Y-%m-%d %H:%M:%S")) * 1000)
+    except Exception:
+        return None
+
+
+def _safe_trade_row(row):
+    if not isinstance(row, dict):
+        return {}
+    return {
+        "time": int(row.get("time", 0) or 0),
+        "side": row.get("side"),
+        "price": _safe_float(row.get("price"), 0.0),
+        "qty": _safe_float(row.get("qty"), 0.0),
+        "quoteQty": _safe_float(row.get("quoteQty"), 0.0),
+        "realizedPnl": _safe_float(row.get("realizedPnl"), 0.0),
+        "commission": _safe_float(row.get("commission"), 0.0),
+        "commissionAsset": row.get("commissionAsset"),
+        "orderId": row.get("orderId"),
+        "buyer": row.get("buyer"),
+        "maker": row.get("maker"),
+        "positionSide": row.get("positionSide"),
+    }
+
+
+def _safe_order_row(row):
+    if not isinstance(row, dict):
+        return {}
+    return {
+        "orderId": row.get("orderId"),
+        "clientOrderId": row.get("clientOrderId"),
+        "symbol": row.get("symbol"),
+        "side": row.get("side"),
+        "type": row.get("type") or row.get("origType") or row.get("orderType"),
+        "origType": row.get("origType"),
+        "status": row.get("status") or row.get("algoStatus") or row.get("orderStatus"),
+        "price": row.get("price"),
+        "avgPrice": row.get("avgPrice"),
+        "stopPrice": row.get("stopPrice") or row.get("triggerPrice"),
+        "origQty": row.get("origQty") or row.get("quantity"),
+        "executedQty": row.get("executedQty"),
+        "reduceOnly": row.get("reduceOnly"),
+        "closePosition": row.get("closePosition"),
+        "updateTime": row.get("updateTime"),
+        "time": row.get("time"),
+        "workingType": row.get("workingType"),
+    }
+
+
+def _infer_close_source(symbol, snapshot, close_trades, matching_orders):
+    signal = (snapshot or {}).get("signal", {}) if isinstance(snapshot, dict) else {}
+    side = str((snapshot or {}).get("side") or signal.get("type") or "").upper()
+    sl = _safe_float((snapshot or {}).get("sl") or signal.get("sl"), 0.0)
+    tp = _safe_float((snapshot or {}).get("tp") or signal.get("tp"), 0.0)
+    order_types = {str(o.get("type") or o.get("origType") or "").upper() for o in matching_orders or []}
+    reduce_market = any(
+        str(o.get("type") or o.get("origType") or "").upper() == "MARKET" and bool(o.get("reduceOnly"))
+        for o in matching_orders or []
+    )
+    if "STOP_MARKET" in order_types:
+        return "EXCHANGE_SL_TRIGGERED"
+    if "TAKE_PROFIT_MARKET" in order_types:
+        return "EXCHANGE_TP_TRIGGERED"
+    if reduce_market:
+        return "MARKET_REDUCE_CLOSE"
+    close_price = _safe_float((close_trades[-1] or {}).get("price"), 0.0) if close_trades else 0.0
+    if close_price > 0:
+        if sl and abs(close_price - sl) / max(sl, 1e-12) < 0.0015:
+            return "PRICE_NEAR_SL"
+        if tp and abs(close_price - tp) / max(tp, 1e-12) < 0.0015:
+            return "PRICE_NEAR_TP"
+    if close_trades:
+        return "UNKNOWN_CLOSE_WITH_TRADE"
+    return "NO_RECENT_CLOSE_TRADE_FOUND"
+
+
+def build_position_close_diagnostic(symbol, snapshot=None, last_state=None):
+    if not CLOSE_AUDIT_ENABLED or binance is None:
+        return {"enabled": bool(CLOSE_AUDIT_ENABLED), "source": "disabled_or_no_client"}
+    snapshot = snapshot or {}
+    signal = snapshot.get("signal", {}) if isinstance(snapshot, dict) else {}
+    side = str(snapshot.get("side") or signal.get("type") or (last_state or {}).get("side") or "").upper()
+    close_side = "BUY" if side == "SELL" else "SELL" if side == "BUY" else None
+    opened_ms = _parse_montra_time_ms(snapshot.get("opened_at") or signal.get("opened_at"))
+    now_ms = int(time.time() * 1000)
+    lookback_ms = max(1, int(CLOSE_AUDIT_LOOKBACK_MINUTES)) * 60 * 1000
+    start_ms = max(opened_ms or 0, now_ms - lookback_ms)
+    diag = {
+        "symbol": symbol,
+        "side": side or None,
+        "expected_close_side": close_side,
+        "opened_ms": opened_ms,
+        "start_ms": start_ms,
+        "lookback_minutes": CLOSE_AUDIT_LOOKBACK_MINUTES,
+        "last_state": last_state or {},
+        "snapshot_entry": snapshot.get("entry") or signal.get("entry"),
+        "snapshot_sl": snapshot.get("sl") or signal.get("sl"),
+        "snapshot_tp": snapshot.get("tp") or signal.get("tp"),
+    }
+    close_rows = []
+    close_order_ids = []
+    try:
+        trades = signed_call(binance, binance.futures_account_trades, symbol=symbol, label="MAIN") or []
+        rows = [_safe_trade_row(t) for t in trades[-max(10, CLOSE_AUDIT_TRADE_LIMIT):]]
+        recent_rows = [r for r in rows if int(r.get("time") or 0) >= start_ms]
+        side_rows = [r for r in recent_rows if str(r.get("side") or "").upper() == close_side] if close_side else recent_rows
+        realized_rows = [r for r in recent_rows if abs(_safe_float(r.get("realizedPnl"), 0.0)) > 0]
+        close_rows = (realized_rows or side_rows)[-10:]
+        close_order_ids = sorted({r.get("orderId") for r in close_rows if r.get("orderId") is not None})
+        diag.update({
+            "recent_trade_count": len(recent_rows),
+            "close_trade_count": len(close_rows),
+            "close_order_ids": close_order_ids,
+            "close_trades": close_rows,
+            "realized_pnl_from_close_rows": round(sum(_safe_float(r.get("realizedPnl"), 0.0) for r in close_rows), 8),
+        })
+    except Exception as exc:
+        diag["trades_error"] = str(exc)
+    matching_orders = []
+    if CLOSE_AUDIT_FETCH_ORDERS:
+        try:
+            all_orders_fn = getattr(binance, "futures_get_all_orders", None)
+            if all_orders_fn:
+                all_orders = signed_call(binance, all_orders_fn, symbol=symbol, limit=max(10, CLOSE_AUDIT_ORDER_LIMIT), label="MAIN") or []
+                for o in all_orders:
+                    if isinstance(o, dict) and o.get("orderId") in close_order_ids:
+                        matching_orders.append(_safe_order_row(o))
+                diag["matching_orders"] = matching_orders
+                diag["matching_order_count"] = len(matching_orders)
+            else:
+                diag["orders_error"] = "futures_get_all_orders unavailable"
+        except Exception as exc:
+            diag["orders_error"] = str(exc)
+    diag["inferred_close_source"] = _infer_close_source(symbol, snapshot, close_rows, matching_orders)
+    return diag
+
 def finalize_closed_trade(
     symbol,
     fallback_pnl=0.0,
@@ -3535,6 +4710,7 @@ def finalize_closed_trade(
     note=None,
     send_notice=True,
     audit_event="POSITION_CLOSED",
+    last_state=None,
 ):
     pnl = resolve_closed_trade_pnl(symbol, fallback_pnl)
     if pnl > 0:
@@ -3557,6 +4733,11 @@ def finalize_closed_trade(
     }
     if note:
         close_info["note"] = note
+
+    snapshot_for_close = TRADE_SNAPSHOTS.get(symbol, {})
+    close_audit = build_position_close_diagnostic(symbol, snapshot=snapshot_for_close, last_state=last_state)
+    close_info["close_audit"] = close_audit
+    add_order_audit("POSITION_CLOSE_DIAGNOSTIC", symbol, close_audit)
 
     if result in ("WIN", "LOSS"):
         update_pair_stats(symbol, result, pnl)
@@ -3582,8 +4763,8 @@ def finalize_closed_trade(
     add_order_audit(audit_event, symbol, close_info)
     move_snapshot_to_replay(symbol, close_info)
 
+    release_trade_slot(symbol, reason="position_closed", unlock=True)
     GLOBAL_SYMBOL_LOCK.discard(symbol)
-    EXECUTION_IN_PROGRESS.discard(symbol)
     if result in ("WIN", "LOSS"):
         set_symbol_cooldown(symbol, reason=f"position_closed_{result.lower()}")
 
@@ -3633,6 +4814,7 @@ def monitor_positions_for_memory_update():
                         vol=last_vol if last_vol else 0.0,
                         send_notice=True,
                         audit_event="POSITION_CLOSED",
+                        last_state=last,
                     )
                     print(f"📊 Position closed: {symbol} {close_info}")
 
@@ -3900,6 +5082,7 @@ def health_pairs():
         "scan_pairs": PAIRS,
         "top_pairs": TOP_PAIRS,
         "mid_pairs": MID_PAIRS,
+        "mid_aggressive_pairs": MID_AGGRESSIVE_PAIRS,
         "low_pairs": LOW_PAIRS,
         "validation_only": VALIDATION_ONLY,
         "remove_from_core": REMOVE_FROM_CORE,
@@ -4153,9 +5336,18 @@ def debug_pair_tiers():
         })
     return {"rows": rows}
 
+def clean_signal_row_for_output(row):
+    try:
+        clean_row = dict(row or {})
+        apply_clean_prices_to_signal(clean_row)
+        return clean_row
+    except Exception:
+        return dict(row or {})
+
+
 @app.get("/debug/candidates")
 def debug_candidates():
-    rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
+    rows = [clean_signal_row_for_output(r) for r in sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)]
     return {
         "count": len(rows),
         "rows": rows[:20]
@@ -4242,6 +5434,24 @@ def debug_sweep_memory(symbol: str, timeframe: str = Query(default="15m"), limit
         return {"symbol": symbol.upper(), "error": str(e)}
 
 
+@app.get("/debug/price-precision/{symbol}")
+def debug_price_precision(symbol: str):
+    sym = symbol.upper()
+    tick = get_price_tick_detail(sym)
+    return {
+        "symbol": sym,
+        "effective_tick_ok": tick.get("ok"),
+        "effective_tick": tick.get("tick_text"),
+        "tick_source": tick.get("source"),
+        "pricePrecision": tick.get("pricePrecision"),
+        "exchange_tickSize": tick.get("exchange_tickSize"),
+        "exchange_tickSizeText": tick.get("exchange_tickSizeText"),
+        "price_precision_use_price_precision": PRICE_PRECISION_USE_PRICE_PRECISION,
+        "env_override": os.getenv(f"PRICE_TICK_SIZE_{sym}") or os.getenv(f"TICK_SIZE_{sym}"),
+        "example_0_91835": normalize_protective_price_detail(sym, 0.91835, "SELL", "TP"),
+    }
+
+
 @app.get("/debug/exchange-filter/{symbol}")
 def debug_exchange_filter(symbol: str):
     sym = str(symbol or "").upper().strip()
@@ -4276,6 +5486,7 @@ def debug_spread_all(force: bool = Query(default=False)):
         "thresholds": {
             "TOP": SPREAD_THRESHOLD_TOP,
             "MID": SPREAD_THRESHOLD_MID,
+            "MID_AGGRESSIVE": SPREAD_THRESHOLD_MID_AGGRESSIVE,
             "warn_multiplier": SPREAD_WARN_MULTIPLIER,
             "cache_ttl": SPREAD_CACHE_TTL,
         }
@@ -4354,11 +5565,15 @@ def debug_decision_board():
             "max_open_trades": MAX_OPEN_TRADES,
         },
 
+        "risk_slots": get_risk_slot_snapshot(force=False),
+
         "locks": {
             "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
             "execution_in_progress_count": len(EXECUTION_IN_PROGRESS),
+            "reserved_slot_count": len(RESERVED_TRADE_SLOTS),
             "locked_symbols": sorted(list(GLOBAL_SYMBOL_LOCK)),
             "executing_symbols": sorted(list(EXECUTION_IN_PROGRESS)),
+            "reserved_symbols": sorted(list(RESERVED_TRADE_SLOTS.keys())),
         },
 
         "portfolio": {
@@ -4404,6 +5619,7 @@ def debug_decision_board():
         "spread": {
             "threshold_top": SPREAD_THRESHOLD_TOP,
             "threshold_mid": SPREAD_THRESHOLD_MID,
+            "threshold_mid_aggressive": SPREAD_THRESHOLD_MID_AGGRESSIVE,
             "cache_ttl": SPREAD_CACHE_TTL,
         },
 
@@ -4443,6 +5659,23 @@ def get_positions():
         return {"count": len(rows), "rows": rows}
     except Exception as e:
         return {"count": 0, "rows": [], "error": str(e)}
+
+
+@app.get("/debug/close-audit/{symbol}")
+def debug_close_audit(symbol: str, limit: int = Query(default=20, ge=1, le=100)):
+    symbol = symbol.upper().strip()
+    audit_rows = [r for r in ORDER_AUDIT_LOG if r.get("symbol") == symbol and "CLOSE" in str(r.get("event", ""))]
+    replay_rows = [r for r in TRADE_REPLAY_LOG if r.get("symbol") == symbol]
+    snapshot = TRADE_SNAPSHOTS.get(symbol, {})
+    live_diag = build_position_close_diagnostic(symbol, snapshot=snapshot, last_state=last_position_state.get(symbol)) if snapshot else None
+    return {
+        "symbol": symbol,
+        "audit_count": len(audit_rows),
+        "audit_rows": audit_rows[-limit:],
+        "replay_count": len(replay_rows),
+        "replay_rows": replay_rows[-limit:],
+        "live_diagnostic": live_diag,
+    }
 
 
 @app.post("/positions/{symbol}/protect")
@@ -4655,6 +5888,11 @@ def debug_cooldowns():
         "rows": rows,
     }
 
+@app.get("/debug/risk-slots")
+def debug_risk_slots():
+    return get_risk_slot_snapshot(force=True)
+
+
 # ⭐ NEW: signal receiver endpoint
 @app.post("/signal")
 def receive_signal(signal: dict):
@@ -4771,7 +6009,7 @@ def smart_trailing():
             else:
                 time.sleep(TRAILING_LOOP_INTERVAL)
 
-LAST_SCAN_BY_TIER = {"TOP": 0.0, "MID": 0.0}
+LAST_SCAN_BY_TIER = {"TOP": 0.0, "MID": 0.0, "MID_AGGRESSIVE": 0.0}
 
 
 def get_due_scan_pairs():
@@ -4783,8 +6021,10 @@ def get_due_scan_pairs():
     if now - LAST_SCAN_BY_TIER.get("MID", 0.0) >= SCAN_INTERVAL_MID:
         due.extend([p for p in MID_PAIRS if p in PAIRS])
         LAST_SCAN_BY_TIER["MID"] = now
+    if now - LAST_SCAN_BY_TIER.get("MID_AGGRESSIVE", 0.0) >= SCAN_INTERVAL_MID_AGGRESSIVE:
+        due.extend([p for p in MID_AGGRESSIVE_PAIRS if p in PAIRS])
+        LAST_SCAN_BY_TIER["MID_AGGRESSIVE"] = now
     return list(dict.fromkeys(due))
-
 
 def apply_news_bias(signal_type, news_reverse):
     if news_reverse:
@@ -4917,6 +6157,7 @@ def auto_trader():
                 set_final_execution("IDLE", reason="WAITING_FOR_TIER_SCAN_INTERVAL", stage="scan_scheduler", detail={
                     "scan_interval_top": SCAN_INTERVAL_TOP,
                     "scan_interval_mid": SCAN_INTERVAL_MID,
+            "scan_interval_mid_aggressive": SCAN_INTERVAL_MID_AGGRESSIVE,
                     "last_top_scan_age": round(time.time() - LAST_SCAN_BY_TIER.get("TOP", 0.0), 2) if LAST_SCAN_BY_TIER.get("TOP") else None,
                     "last_mid_scan_age": round(time.time() - LAST_SCAN_BY_TIER.get("MID", 0.0), 2) if LAST_SCAN_BY_TIER.get("MID") else None,
                 })
@@ -4926,7 +6167,7 @@ def auto_trader():
             mark_scan_cycle("SCANNING", "SCAN_CYCLE_STARTED", pairs=pairs, detail={"pairs": pairs})
 
             scores_map = {}
-            candidate_map = {"TOP": [], "MID": [], "LOW": []}
+            candidate_map = {tier_name: [] for tier_name in tier_limits().keys()}
 
             # --- Kumpulkan skor untuk semua pair ---
             for symbol in pairs:
@@ -5032,7 +6273,7 @@ def auto_trader():
                         })
                         continue
                     
-                    signal = {
+                    signal = apply_clean_prices_to_signal({
                         "symbol": symbol,
                         "type": final_side,
                         "entry": last_price,
@@ -5043,7 +6284,11 @@ def auto_trader():
                         "sweep_low": sweep_low,
                         "sweep_memory": sweep_ctx,
                         "structure_grade": structure_grade,
-                    }
+                    })
+                    last_price = float(signal.get("entry", last_price))
+                    sl = float(signal.get("sl", sl))
+                    tp = float(signal.get("tp", tp))
+                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
 
                     score = meta_score(symbol, signal, regime, vol)
                     
@@ -5085,9 +6330,12 @@ def auto_trader():
                         "score": score,
                         "side": final_side,
                         "type": final_side,
-                        "entry": round(float(last_price), 8),
-                        "sl": round(float(sl), 8),
-                        "tp": round(float(tp), 8),
+                        "entry": float(signal.get("entry", last_price)),
+                        "sl": float(signal.get("sl", sl)),
+                        "tp": float(signal.get("tp", tp)),
+                        "entry_text": signal.get("entry_text"),
+                        "sl_text": signal.get("sl_text"),
+                        "tp_text": signal.get("tp_text"),
                         "rr": round(rr, 2),
                         "pair_regime": pair_regime,
                         "regime": pair_regime,
@@ -5096,7 +6344,8 @@ def auto_trader():
                         "structure_grade": structure_grade,
                     }
 
-                    candidate_map[tier].append(row)
+                    row = clean_signal_row_for_output(row)
+                    candidate_map.setdefault(tier, []).append(row)
                     candidate_list_live.append(row)
                     
                     if VALIDATION_MODE:
@@ -5117,7 +6366,7 @@ def auto_trader():
             selected_row_map = {}
 
             for tier_name, limit in tier_limits().items():
-                rows = sorted(candidate_map[tier_name], key=lambda x: x["score"], reverse=True)
+                rows = sorted(candidate_map.get(tier_name, []), key=lambda x: x["score"], reverse=True)
                 for idx, row in enumerate(rows, start=1):
                     sym = row["symbol"]
                     candidate_symbols.add(sym)
@@ -5267,7 +6516,7 @@ def auto_trader():
                     if rr < active_rr_min():
                         continue
                     
-                    signal = {
+                    signal = apply_clean_prices_to_signal({
                         "symbol": symbol,
                         "type": final_side,
                         "entry": last_price,
@@ -5280,7 +6529,11 @@ def auto_trader():
                         "sweep_memory": sweep_ctx,
                         "rr": round(rr, 2),
                         "structure_grade": structure_grade,
-                    }
+                    })
+                    last_price = float(signal.get("entry", last_price))
+                    sl = float(signal.get("sl", sl))
+                    tp = float(signal.get("tp", tp))
+                    rr = abs(tp - last_price) / max(abs(last_price - sl), 1e-9)
 
                     min_score_needed = tier_score_floor(symbol)
                     if signal["score"] < min_score_needed:
@@ -5370,13 +6623,13 @@ def auto_trader():
                         "limit": divergence_limit,
                     })
 
-                    positions = get_open_positions()
-                    if len(positions) >= MAX_OPEN_TRADES:
-                        print(f"❌ SKIP {symbol} - MAX_POSITION")
+                    slot_ok, slot_reason, slot_detail = can_open_new_trade(symbol, force=True)
+                    if not slot_ok:
+                        add_skip_reason(symbol, slot_reason, slot_detail)
+                        add_execution_decision("risk_slot_gate", symbol, "BLOCK", slot_detail)
+                        print(f"❌ SKIP {symbol} - {slot_reason} slots={slot_detail.get('used_slots')}/{slot_detail.get('max_open_trades')}")
                         continue
-                    if any(p["symbol"] == symbol for p in positions):
-                        continue
-                    
+
                     if symbol in GLOBAL_SYMBOL_LOCK:
                         print(f"🔒 SKIP {symbol} already open")
                         continue

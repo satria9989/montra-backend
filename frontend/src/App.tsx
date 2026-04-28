@@ -191,6 +191,7 @@ type PairHealth = {
   scan_pairs: string[];
   top_pairs: string[];
   mid_pairs: string[];
+  mid_aggressive_pairs?: string[];
   low_pairs: string[];
   validation_only: string[];
   remove_from_core: string[];
@@ -631,7 +632,7 @@ export default function App() {
               <KeyValue label="OpenAI" value={healthReady?.openai ? "ON" : "OFF"} accent={healthReady?.openai ? "#00ffaa" : "#ff7272"} />
               <KeyValue label="Accounts" value={healthReady?.accounts ?? "-"} />
               <KeyValue label="Universe scan" value={scanUniverse} />
-              <KeyValue label="TOP / MID / LOW" value={`${pairHealth?.top_pairs?.length || 0} / ${pairHealth?.mid_pairs?.length || 0} / ${pairHealth?.low_pairs?.length || 0}`} />
+              <KeyValue label="TOP / MID / MID-AGG" value={`${pairHealth?.top_pairs?.length || 0} / ${pairHealth?.mid_pairs?.length || 0} / ${pairHealth?.mid_aggressive_pairs?.length || 0}`} />
               <KeyValue label="WS reason" value={decisionBoard?.ws?.reason || "-"} accent={wsHealthy ? "#00ffaa" : "#ffb000"} />
               <KeyValue label="WS msg age" value={`${formatNum(decisionBoard?.ws?.last_message_age, 2)}s`} accent={wsHealthy ? "#00ffaa" : "#ffb000"} />
               <KeyValue label="WS max age" value={`${formatNum(maxSampleAge, 2)}s`} accent={maxSampleAge < 20 ? "#00ffaa" : "#ffb000"} />

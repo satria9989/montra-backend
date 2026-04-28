@@ -48,9 +48,11 @@ def get_threshold_for_symbol(symbol: str, tier: str) -> Dict[str, Any]:
         if tier == "TOP":
             threshold = _env_float("SPREAD_THRESHOLD_TOP", 0.0008)
         elif tier == "MID":
-            threshold = _env_float("SPREAD_THRESHOLD_MID", 0.0015)
+            threshold = _env_float("SPREAD_THRESHOLD_MID", 0.0012)
+        elif tier == "MID_AGGRESSIVE":
+            threshold = _env_float("SPREAD_THRESHOLD_MID_AGGRESSIVE", _env_float("SPREAD_THRESHOLD_MID", 0.0015))
         else:
-            # LOW is intentionally not active in MONTRA v4 live universe.
+            # LOW is intentionally not active in MONTRA live universe.
             threshold = None
 
     warn_multiplier = _env_float("SPREAD_WARN_MULTIPLIER", 0.8)
