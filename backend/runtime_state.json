@@ -7,8 +7,221 @@
   "consecutive_loss": 3,
   "current_risk": 0.017787,
   "cooldowns": {},
-  "locked_symbols": [],
-  "trade_snapshots": {},
+  "locked_symbols": [
+    "DOGEUSDT"
+  ],
+  "trade_snapshots": {
+    "DOGEUSDT": {
+      "opened_at": "2026-04-29 20:54:06",
+      "source": "auto_trader",
+      "signal": {
+        "symbol": "DOGEUSDT",
+        "type": "BUY",
+        "entry": 0.10635,
+        "sl": 0.10484,
+        "tp": 0.11165,
+        "score": 81.0,
+        "pair_regime": "BULL",
+        "sweep_high": false,
+        "sweep_low": true,
+        "sweep_memory": {
+          "sweep_high": false,
+          "sweep_low": true,
+          "raw_sweep_high": false,
+          "raw_sweep_low": true,
+          "high": null,
+          "low": {
+            "age_candles": 0,
+            "level": 0.10537,
+            "wick_price": 0.10507,
+            "close": 0.10629,
+            "reclaimed": true,
+            "time": 1777470300000
+          },
+          "lookback": 10,
+          "memory_window": 5,
+          "require_reclaim": true
+        },
+        "rr": 3.51,
+        "structure_grade": "MEDIUM",
+        "pre_score": 98.0,
+        "fng_value": 26,
+        "fng_classification": "NEUTRAL",
+        "fng_bias": 0,
+        "sl_source": "last_bearish_before_break",
+        "sl_buffer": 0.0002332,
+        "atr": 0.00106,
+        "tp_source": "rr_target",
+        "entry_text": "0.10635",
+        "sl_text": "0.10484",
+        "tp_text": "0.11165",
+        "price_precision": {
+          "entry": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.10635,
+            "value": 0.10635,
+            "text": "0.10635",
+            "tickSize": 1e-05,
+            "tick_text": "0.000010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 6,
+            "rounding": "HALF_UP",
+            "leg": "ENTRY"
+          },
+          "sl": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.10484,
+            "value": 0.10484,
+            "text": "0.10484",
+            "tickSize": 1e-05,
+            "tick_text": "0.000010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 6,
+            "rounding": "HALF_UP",
+            "leg": "SL"
+          },
+          "tp": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.11165,
+            "value": 0.11165,
+            "text": "0.11165",
+            "tickSize": 1e-05,
+            "tick_text": "0.000010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 6,
+            "rounding": "HALF_UP",
+            "leg": "TP"
+          }
+        },
+        "execution_quality": {
+          "entry": 0.10635,
+          "sl": 0.10484,
+          "tp": 0.11165,
+          "entry_text": "0.10635",
+          "sl_text": "0.10484",
+          "tp_text": "0.11165",
+          "price_precision": {
+            "entry": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.10635,
+              "value": 0.10635,
+              "text": "0.10635",
+              "tickSize": 1e-05,
+              "tick_text": "0.000010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 6,
+              "rounding": "HALF_UP",
+              "leg": "ENTRY"
+            },
+            "sl": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.10484,
+              "value": 0.10484,
+              "text": "0.10484",
+              "tickSize": 1e-05,
+              "tick_text": "0.000010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 6,
+              "rounding": "HALF_UP",
+              "leg": "SL"
+            },
+            "tp": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.11165,
+              "value": 0.11165,
+              "text": "0.11165",
+              "tickSize": 1e-05,
+              "tick_text": "0.000010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 6,
+              "rounding": "HALF_UP",
+              "leg": "TP"
+            }
+          },
+          "min_stop_distance_pct": 0.0025,
+          "min_tp_distance_pct": 0.005,
+          "fee_buffer_rr": 0.15,
+          "stop_distance_pct": 0.014198,
+          "tp_distance_pct": 0.049835,
+          "raw_rr": 3.5099,
+          "effective_rr": 3.3599,
+          "spread_pct": null
+        },
+        "spread_gate": {
+          "symbol": "DOGEUSDT",
+          "tier": "TOP",
+          "ok": true,
+          "reason": "OK",
+          "best_bid": 0.10636,
+          "best_ask": 0.10637,
+          "mid": 0.106365,
+          "spread_abs": 1.0000000000010001e-05,
+          "spread_pct": 9.401588868528182e-05,
+          "threshold_pct": 0.0008,
+          "warn_pct": 0.00064,
+          "threshold_source": "tier",
+          "cache": "miss",
+          "limit": 5,
+          "ts": 1777470846.271539
+        },
+        "risk_slots": {
+          "max_open_trades": 1,
+          "open_count": 0,
+          "reserved_count": 0,
+          "used_slots": 0,
+          "available_slots": 1,
+          "open_symbols": [],
+          "reserved_symbols": [],
+          "reserved_rows": {},
+          "symbol": "DOGEUSDT",
+          "force_refresh": true,
+          "ts": 1777470846.3710496
+        }
+      },
+      "score": 81.0,
+      "side": "BUY",
+      "sl": 0.10484,
+      "tp": 0.11165,
+      "entry": 0.10635,
+      "regime": "BULL",
+      "pair_regime": "BULL",
+      "pair_tier": "TOP",
+      "vol": 0.0031100405077538287,
+      "news_impact": "NORMAL",
+      "news_reverse": false,
+      "portfolio_weight": 0.053549190535491904,
+      "btc_strength": -0.40202308390610814,
+      "alt_strength": -0.783874580067196,
+      "fvg_up": false,
+      "fvg_down": true,
+      "sweep_high": false,
+      "sweep_low": true,
+      "sweep_memory": {
+        "sweep_high": false,
+        "sweep_low": true,
+        "raw_sweep_high": false,
+        "raw_sweep_low": true,
+        "high": null,
+        "low": {
+          "age_candles": 0,
+          "level": 0.10537,
+          "wick_price": 0.10507,
+          "close": 0.10629,
+          "reclaimed": true,
+          "time": 1777470300000
+        },
+        "lookback": 10,
+        "memory_window": 5,
+        "require_reclaim": true
+      }
+    }
+  },
   "trade_replay_log": [
     {
       "symbol": "AVAXUSDT",
@@ -3297,9 +3510,18 @@
       "note": null
     }
   ],
-  "last_position_state": {},
+  "last_position_state": {
+    "DOGEUSDT": {
+      "side": "BUY",
+      "size": 941.0,
+      "entry": 0.10638,
+      "unrealized": -0.20987123,
+      "leverage": 0.0
+    }
+  },
   "position_entry_score": {
-    "TRXUSDT": 67
+    "TRXUSDT": 67,
+    "DOGEUSDT": 81.0
   },
   "portfolio_alloc": {
     "BTCUSDT": 0.05977584059775841,
@@ -3323,5 +3545,5 @@
     "WIFUSDT": 0.053549190535491904,
     "1000PEPEUSDT": 0.05977584059775841
   },
-  "updated_at": "2026-04-29 05:43:17"
+  "updated_at": "2026-04-29 21:36:54"
 }

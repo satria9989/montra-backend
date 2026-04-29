@@ -145,6 +145,11 @@ TELEGRAM_REQUIRE_WS_BLOCK = os.getenv("TELEGRAM_REQUIRE_WS_BLOCK", "true").lower
 TELEGRAM_SEND_RECOVERY_ALERT = os.getenv("TELEGRAM_SEND_RECOVERY_ALERT", "true").lower() == "true"
 TELEGRAM_ALERT_CURRENT_ONLY = os.getenv("TELEGRAM_ALERT_CURRENT_ONLY", "true").lower() == "true"
 TELEGRAM_CLEAR_RESOLVED_KEYS = os.getenv("TELEGRAM_CLEAR_RESOLVED_KEYS", "true").lower() == "true"
+TELEGRAM_CANDIDATE_ALERT_ENABLED = os.getenv("TELEGRAM_CANDIDATE_ALERT_ENABLED", "true").lower() == "true"
+TELEGRAM_CANDIDATE_MIN_SCORE = float(os.getenv("TELEGRAM_CANDIDATE_MIN_SCORE", "87"))
+TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS", "900"))
+TELEGRAM_CANDIDATE_ALERT_TOP_N = int(os.getenv("TELEGRAM_CANDIDATE_ALERT_TOP_N", "3"))
+TELEGRAM_ENTRY_ALERT_SIMPLE = os.getenv("TELEGRAM_ENTRY_ALERT_SIMPLE", "true").lower() == "true"
 
 # Controlled limit entry to avoid bad fills/slippage. SL/TP and emergency close stay market/conditional.
 ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()

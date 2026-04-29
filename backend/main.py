@@ -34,6 +34,7 @@ check_env()
 
 AUTO_MODE = os.getenv("AUTO_MODE", "true").lower() == "true"
 AUTO_TRADING = os.getenv("AUTO_TRADING", "true").lower() == "true"
+KILL_SWITCH_DEFAULT = (os.getenv("KILL_SWITCH", os.getenv("MONTRA_KILL_SWITCH", "false")) or "false").strip().lower() in ("1", "true", "yes", "on")
 
 # ===== PROFILE / HARDENING =====
 MONTRA_PROFILE = os.getenv("MONTRA_PROFILE", "final_lock").lower()
@@ -191,6 +192,11 @@ TELEGRAM_SEND_RECOVERY_ALERT = os.getenv("TELEGRAM_SEND_RECOVERY_ALERT", "true")
 # Telegram alerts must be based on current WS/execution state, not old audit rows.
 TELEGRAM_ALERT_CURRENT_ONLY = os.getenv("TELEGRAM_ALERT_CURRENT_ONLY", "true").lower() == "true"
 TELEGRAM_CLEAR_RESOLVED_KEYS = os.getenv("TELEGRAM_CLEAR_RESOLVED_KEYS", "true").lower() == "true"
+TELEGRAM_CANDIDATE_ALERT_ENABLED = os.getenv("TELEGRAM_CANDIDATE_ALERT_ENABLED", "true").lower() == "true"
+TELEGRAM_CANDIDATE_MIN_SCORE = float(os.getenv("TELEGRAM_CANDIDATE_MIN_SCORE", "87"))
+TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS", "900"))
+TELEGRAM_CANDIDATE_ALERT_TOP_N = int(os.getenv("TELEGRAM_CANDIDATE_ALERT_TOP_N", "3"))
+TELEGRAM_ENTRY_ALERT_SIMPLE = os.getenv("TELEGRAM_ENTRY_ALERT_SIMPLE", "true").lower() == "true"
 
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
@@ -1060,8 +1066,7 @@ def load_runtime_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        if "kill_switch" in data:
-            KILL_SWITCH = bool(data.get("kill_switch"))
+        KILL_SWITCH = bool(data.get("kill_switch", False))
         START_EQUITY = data.get("start_equity")
         DAILY_START_EQUITY = data.get("daily_start_equity")
         LAST_DAY = data.get("last_day")
@@ -3878,17 +3883,170 @@ def _telegram_record_alert(key, msg, sent):
     TELEGRAM_ALERT_STATE["last_alerts"] = TELEGRAM_ALERT_STATE.get("last_alerts", [])[-25:]
 
 
-def send_telegram_alert(key, msg, force=False):
+def send_telegram_alert(key, msg, force=False, cooldown_seconds=None):
     if not TELEGRAM_ALERTS_ENABLED or not telegram_available():
         return False
     now = time.time()
+    cooldown = TELEGRAM_ALERT_COOLDOWN_SECONDS if cooldown_seconds is None else float(cooldown_seconds)
     last = float(TELEGRAM_ALERT_STATE.setdefault("last_sent_by_key", {}).get(key, 0) or 0)
-    if not force and last and (now - last) < TELEGRAM_ALERT_COOLDOWN_SECONDS:
+    if not force and last and (now - last) < cooldown:
         return False
     sent = send_telegram(msg)
     _telegram_record_alert(key, msg, sent)
     return sent
 
+
+
+def _tg_float(value, default=0.0):
+    try:
+        num = float(value)
+        return num if num == num else default
+    except Exception:
+        return default
+
+
+def _tg_price(value, digits=6):
+    num = _tg_float(value, None)
+    if num is None or num <= 0:
+        return "-"
+    if abs(num) >= 100:
+        return f"{num:.2f}"
+    if abs(num) >= 1:
+        return f"{num:.4f}"
+    return f"{num:.6f}".rstrip("0").rstrip(".")
+
+
+def _tg_score(value):
+    num = _tg_float(value, 0.0)
+    return f"{num:.0f}" if abs(num - round(num)) < 0.05 else f"{num:.1f}"
+
+
+def _tg_rr(signal):
+    rr = signal.get("rr") if isinstance(signal, dict) else None
+    try:
+        rr_num = float(rr)
+        if rr_num > 0:
+            return rr_num
+    except Exception:
+        pass
+    try:
+        entry = float(signal.get("entry"))
+        sl = float(signal.get("sl"))
+        tp = float(signal.get("tp"))
+        return abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    except Exception:
+        return 0.0
+
+
+def build_candidate_telegram_message(signal):
+    symbol = str(signal.get("symbol") or "-").upper()
+    side = str(signal.get("type") or signal.get("side") or "-").upper()
+    score = _tg_score(signal.get("score"))
+    rr = _tg_rr(signal)
+    tier = str(signal.get("tier") or signal.get("pair_tier") or get_pair_tier(symbol) or "-").upper()
+    regime = str(signal.get("pair_regime") or signal.get("regime") or "-").upper()
+    grade = str(signal.get("structure_grade") or signal.get("setupTag") or "-").upper()
+    sweep = "SWEEP" if signal.get("sweep_high") or signal.get("sweep_low") or signal.get("sweep_memory") else "NO SWEEP"
+    tp_source = str(signal.get("tp_source") or "RR").upper()
+    return (
+        f"🎯 MONTRA Candidate {score}\n"
+        f"{symbol} {side} | RR {rr:.2f} | {tier}\n"
+        f"Entry {_tg_price(signal.get('entry'))} | SL {_tg_price(signal.get('sl'))} | TP {_tg_price(signal.get('tp'))}\n"
+        f"Setup {grade} | {regime} | {sweep} | TP {tp_source}"
+    )
+
+
+def maybe_send_candidate_alerts(rows):
+    if not TELEGRAM_CANDIDATE_ALERT_ENABLED or not TELEGRAM_ALERTS_ENABLED or not telegram_available():
+        return 0
+    if not rows:
+        return 0
+    try:
+        top_n = max(1, int(TELEGRAM_CANDIDATE_ALERT_TOP_N))
+        min_score = float(TELEGRAM_CANDIDATE_MIN_SCORE)
+    except Exception:
+        top_n = 3
+        min_score = 87.0
+
+    eligible = []
+    for row in rows:
+        try:
+            if float(row.get("score", 0) or 0) >= min_score:
+                eligible.append(row)
+        except Exception:
+            continue
+    eligible = sorted(eligible, key=lambda x: float(x.get("score", 0) or 0), reverse=True)[:top_n]
+
+    sent_count = 0
+    for row in eligible:
+        symbol = str(row.get("symbol") or "UNKNOWN").upper()
+        side = str(row.get("type") or row.get("side") or "-").upper()
+        key = f"candidate:{symbol}:{side}"
+        if send_telegram_alert(
+            key,
+            build_candidate_telegram_message(row),
+            cooldown_seconds=TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS,
+        ):
+            sent_count += 1
+    if sent_count:
+        TELEGRAM_ALERT_STATE.setdefault("current_state", {})["candidate_alerts_sent"] = sent_count
+    return sent_count
+
+
+def _best_order_result(result):
+    if isinstance(result, dict):
+        return result if result.get("status") == "OK" else result
+    if isinstance(result, list):
+        for row in result:
+            if isinstance(row, dict) and row.get("status") == "OK":
+                return row
+        for row in result:
+            if isinstance(row, dict):
+                return row
+    return {}
+
+
+def build_simple_entry_telegram_message(signal, result=None, weight=None, order_ok=True):
+    symbol = str(signal.get("symbol") or "-").upper()
+    side = str(signal.get("type") or signal.get("side") or "-").upper()
+    score = _tg_score(signal.get("score", 0))
+    rr = _tg_rr(signal)
+    row = _best_order_result(result or {})
+    qty = row.get("qty_text") or row.get("qty") or row.get("executedQty") or "-"
+    lev_obj = row.get("leverage") if isinstance(row, dict) else None
+    lev = None
+    if isinstance(lev_obj, dict):
+        lev = lev_obj.get("leverage")
+    elif lev_obj not in (None, ""):
+        lev = lev_obj
+    lev_txt = f" | Lev {lev}x" if lev not in (None, "") else ""
+    protected = "Protected" if order_ok and (row.get("protective_resolved") or row.get("status") == "OK") else ("Failed" if not order_ok else "Protection pending")
+    partial = ""
+    if PARTIAL_TP_ENABLED:
+        partial = f"\nPartial {PARTIAL_TP_R1_RATIO * 100:.0f}% @ R1"
+    prefix = "✅ MONTRA ENTRY" if order_ok else "❌ MONTRA ENTRY FAILED"
+    return (
+        f"{prefix}\n"
+        f"{symbol} {side} | Score {score} | RR {rr:.2f}\n"
+        f"Entry {_tg_price(signal.get('entry'))} | SL {_tg_price(signal.get('sl'))} | TP {_tg_price(signal.get('tp'))}\n"
+        f"Qty {qty}{lev_txt} | {protected}"
+        f"{partial}"
+    )
+
+
+def send_auto_entry_telegram(signal, result=None, weight=None, order_ok=True):
+    if not TELEGRAM_ENTRY_ALERT_SIMPLE:
+        symbol = str(signal.get("symbol") or "UNKNOWN").upper()
+        side = str(signal.get("type") or signal.get("side") or "-").upper()
+        return send_telegram(f"🤖 MULTI AUTO TRADE\n{symbol} {side}\nScore: {float(signal.get('score', 0) or 0):.1f}\n{result}")
+    key_status = "ok" if order_ok else "failed"
+    symbol = str(signal.get("symbol") or "UNKNOWN").upper()
+    side = str(signal.get("type") or signal.get("side") or "-").upper()
+    return send_telegram_alert(
+        f"entry:{key_status}:{symbol}:{side}",
+        build_simple_entry_telegram_message(signal, result=result, weight=weight, order_ok=order_ok),
+        force=bool(order_ok),
+    )
 
 def build_telegram_alert_status():
     now = time.time()
@@ -3906,6 +4064,11 @@ def build_telegram_alert_status():
         "send_recovery_alert": TELEGRAM_SEND_RECOVERY_ALERT,
         "current_only": TELEGRAM_ALERT_CURRENT_ONLY,
         "clear_resolved_keys": TELEGRAM_CLEAR_RESOLVED_KEYS,
+        "candidate_alert_enabled": TELEGRAM_CANDIDATE_ALERT_ENABLED,
+        "candidate_min_score": TELEGRAM_CANDIDATE_MIN_SCORE,
+        "candidate_cooldown_seconds": TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS,
+        "candidate_top_n": TELEGRAM_CANDIDATE_ALERT_TOP_N,
+        "entry_alert_simple": TELEGRAM_ENTRY_ALERT_SIMPLE,
         "ws_block_active": bool(TELEGRAM_ALERT_STATE.get("ws_block_active", False)),
         "ws_block_reason": TELEGRAM_ALERT_STATE.get("ws_block_reason"),
         "app_uptime_seconds": round(now - APP_START_TS, 2),
@@ -5573,7 +5736,7 @@ def health_state_reset():
     global daily_loss, consecutive_loss, current_risk
     global SYMBOL_COOLDOWN, GLOBAL_SYMBOL_LOCK, EXECUTION_IN_PROGRESS
 
-    KILL_SWITCH = bool(globals().get("KILL_SWITCH_DEFAULT", False))
+    KILL_SWITCH = False
     START_EQUITY = None
     DAILY_START_EQUITY = None
     LAST_DAY = None
@@ -5620,7 +5783,6 @@ def health_bot():
         "profile": MONTRA_PROFILE,
         "validation_mode": VALIDATION_MODE,
         "kill_switch": KILL_SWITCH,
-        "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
         "max_open_trades": MAX_OPEN_TRADES,
         "symbol_lock_count": len(GLOBAL_SYMBOL_LOCK),
         "active_accounts": len(CLIENTS),
@@ -5963,7 +6125,6 @@ def debug_decision_board():
         "mode": MONTRA_MODE,
         "validation_mode": VALIDATION_MODE,
         "kill_switch": KILL_SWITCH,
-        "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
         "auto_mode": AUTO_MODE,
         "auto_trading": AUTO_TRADING,
 
@@ -6270,24 +6431,22 @@ def get_accounts():
 
     return {"accounts": data}
 
-
 def _parse_runtime_bool(value, field_name="state"):
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return bool(value)
     if isinstance(value, str):
-        clean = value.strip().lower()
-        if clean in ("1", "true", "yes", "on", "enable", "enabled"):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
             return True
-        if clean in ("0", "false", "no", "off", "disable", "disabled"):
+        if normalized in ("0", "false", "no", "off"):
             return False
-    raise HTTPException(status_code=400, detail=f"{field_name} must be boolean / on / off")
+    raise HTTPException(status_code=400, detail=f"{field_name} must be true/false or on/off")
 
 
 def _kill_switch_payload(source="api"):
     return {
-        "status": "ok",
         "kill_switch": bool(KILL_SWITCH),
         "kill_switch_default": bool(globals().get("KILL_SWITCH_DEFAULT", False)),
         "auto_mode": bool(AUTO_MODE),
@@ -6306,14 +6465,12 @@ def get_kill_switch():
 @app.post("/kill-switch")
 def kill_switch(payload: dict = Body(...)):
     global KILL_SWITCH
-
     if not isinstance(payload, dict) or "state" not in payload:
         raise HTTPException(status_code=400, detail="state is required: true/false or on/off")
 
     next_state = _parse_runtime_bool(payload.get("state"), "state")
     source = str(payload.get("source") or "api")[:32]
     note = str(payload.get("note") or "")[:160]
-
     previous_state = bool(KILL_SWITCH)
     KILL_SWITCH = next_state
 
@@ -6325,14 +6482,8 @@ def kill_switch(payload: dict = Body(...)):
         "auto_mode": bool(AUTO_MODE),
         "auto_trading": bool(AUTO_TRADING),
     }
-
     try:
-        add_execution_decision(
-            "manual_kill_switch",
-            "_SYSTEM_",
-            "ON" if KILL_SWITCH else "OFF",
-            detail,
-        )
+        add_execution_decision("manual_kill_switch", "_SYSTEM_", "ON" if KILL_SWITCH else "OFF", detail)
         set_final_execution(
             "KILL_SWITCH_ON" if KILL_SWITCH else "KILL_SWITCH_OFF",
             reason="MANUAL_KILL_SWITCH_ON" if KILL_SWITCH else "MANUAL_KILL_SWITCH_OFF",
@@ -6449,11 +6600,8 @@ def receive_signal(signal: dict):
                 "result": result,
             })
 
-            send_telegram(
-                f"🚀 SIGNAL TRADE\n"
-                f"{signal['symbol']} {signal['type']}\n"
-                f"Score: {signal.get('score', 0)}"
-            )
+            order_ok = any(isinstance(r, dict) and r.get("status") == "OK" for r in (result or []))
+            send_auto_entry_telegram(signal, result=result, order_ok=order_ok)
 
         except Exception as e:
             add_order_audit("ORDER_ERROR", symbol, {"error": str(e)})
@@ -6550,10 +6698,8 @@ def auto_trader():
                 print("telegram alert monitor error:", alert_error)
 
             if KILL_SWITCH:
-                set_final_execution("KILL_SWITCH_ON", reason="KILL_SWITCH_TRUE", stage="safety_gate")
-                print("🛑 KILL SWITCH ACTIVE")
-                time.sleep(5)
-                continue
+                set_final_execution("KILL_SWITCH_ON", reason="KILL_SWITCH_TRUE_SCAN_ONLY", stage="safety_gate", detail={"scan_only": True, "entry_blocked": True})
+                print("🛑 KILL SWITCH ACTIVE → scan only, entry blocked")
 
             if not AUTO_MODE:
                 set_final_execution("AUTO_MODE_OFF", reason="AUTO_MODE_FALSE", stage="mode_gate")
@@ -6875,6 +7021,11 @@ def auto_trader():
 
                 except Exception as e:
                     print(f"Scoring error {symbol}: {e}")
+
+            try:
+                maybe_send_candidate_alerts(candidate_list_live)
+            except Exception as candidate_alert_error:
+                print("candidate telegram alert error:", candidate_alert_error)
 
             if not candidate_list_live:
                 set_idle_after_scan("NO_CANDIDATE_AFTER_SCAN", pairs=pairs, detail={
@@ -7236,12 +7387,7 @@ def auto_trader():
 
                     position_entry_score[symbol] = signal["score"]
 
-                    send_telegram(f"""
-🤖 MULTI AUTO TRADE
-{symbol} {signal['type']}
-Score: {signal['score']:.1f} | Weight: {w:.2f}
-{result}
-""")
+                    send_auto_entry_telegram(signal, result=result, weight=w, order_ok=order_ok)
                     print("AUTO EXEC:", result)
 
                     if signal["score"] >= 90:
