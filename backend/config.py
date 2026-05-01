@@ -8,7 +8,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FIREBASE_URL = os.getenv("FIREBASE_URL")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", 5))  # USD
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", 3))  # USD
 MAX_CONSECUTIVE_LOSS = int(os.getenv("MAX_CONSECUTIVE_LOSS", 3))
 BASE_RISK = float(os.getenv("BASE_RISK", "0.01"))  # decimal fraction, 0.01 = 1% per trade
 MIN_RISK = float(os.getenv("MIN_RISK", "0.003"))  # 0.3%
@@ -68,9 +68,9 @@ CIRCUIT_BREAKER_PAUSE = float(os.getenv("CIRCUIT_BREAKER_PAUSE", "60"))
 WS_FALLBACK_POLL_INTERVAL = float(os.getenv("WS_FALLBACK_POLL_INTERVAL", "5"))
 
 # Execution quality gate.
-MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.0025"))
+MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.004"))
 MIN_TP_DISTANCE_PCT = float(os.getenv("MIN_TP_DISTANCE_PCT", "0.0050"))
-FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.15"))
+FEE_BUFFER_RR = float(os.getenv("FEE_BUFFER_RR", "0.30"))
 STRICT_PROTECTION = os.getenv("STRICT_PROTECTION", "true").lower() == "true"
 PROTECTION_ORDER_MODE = (os.getenv("PROTECTION_ORDER_MODE", "CLOSE_POSITION") or "CLOSE_POSITION").strip().upper()
 PROTECTION_ACCEPT_ALGO_ID = os.getenv("PROTECTION_ACCEPT_ALGO_ID", "true").lower() == "true"
@@ -96,7 +96,7 @@ SPREAD_CACHE_TTL = float(os.getenv("SPREAD_CACHE_TTL", "5"))
 SPREAD_ORDER_BOOK_LIMIT = int(os.getenv("SPREAD_ORDER_BOOK_LIMIT", "5"))
 
 # Live gate defaults.
-LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "2.5"))
+LIVE_RR_MIN = float(os.getenv("LIVE_RR_MIN", "3.0"))
 LIVE_TARGET_RR = float(os.getenv("LIVE_TARGET_RR", "3.5"))
 LIVE_VOL_MIN = float(os.getenv("LIVE_VOL_MIN", "0.0015"))
 LIVE_VOL_MAX = float(os.getenv("LIVE_VOL_MAX", "0.03"))
@@ -129,8 +129,8 @@ WS_DEGRADED_GRACE_SECONDS = float(os.getenv("WS_DEGRADED_GRACE_SECONDS", "15"))
 WS_FULL_STALE_BLOCK_SECONDS = float(os.getenv("WS_FULL_STALE_BLOCK_SECONDS", "600"))
 
 # Sweep memory: keep a confirmed reclaim sweep valid for a few candles.
-SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "10"))
-SWEEP_MEMORY_WINDOW = int(os.getenv("SWEEP_MEMORY_WINDOW", "5"))
+SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "7"))
+SWEEP_MEMORY_WINDOW = int(os.getenv("SWEEP_MEMORY_WINDOW", "2"))
 SWEEP_REQUIRE_RECLAIM = os.getenv("SWEEP_REQUIRE_RECLAIM", "true").lower() == "true"
 
 # Telegram runtime alerting.
@@ -146,7 +146,7 @@ TELEGRAM_SEND_RECOVERY_ALERT = os.getenv("TELEGRAM_SEND_RECOVERY_ALERT", "true")
 TELEGRAM_ALERT_CURRENT_ONLY = os.getenv("TELEGRAM_ALERT_CURRENT_ONLY", "true").lower() == "true"
 TELEGRAM_CLEAR_RESOLVED_KEYS = os.getenv("TELEGRAM_CLEAR_RESOLVED_KEYS", "true").lower() == "true"
 TELEGRAM_CANDIDATE_ALERT_ENABLED = os.getenv("TELEGRAM_CANDIDATE_ALERT_ENABLED", "true").lower() == "true"
-TELEGRAM_CANDIDATE_MIN_SCORE = float(os.getenv("TELEGRAM_CANDIDATE_MIN_SCORE", "87"))
+TELEGRAM_CANDIDATE_MIN_SCORE = float(os.getenv("TELEGRAM_CANDIDATE_MIN_SCORE", "82"))
 TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS", "900"))
 TELEGRAM_CANDIDATE_ALERT_TOP_N = int(os.getenv("TELEGRAM_CANDIDATE_ALERT_TOP_N", "3"))
 TELEGRAM_ENTRY_ALERT_SIMPLE = os.getenv("TELEGRAM_ENTRY_ALERT_SIMPLE", "true").lower() == "true"
@@ -155,7 +155,7 @@ TELEGRAM_ENTRY_ALERT_SIMPLE = os.getenv("TELEGRAM_ENTRY_ALERT_SIMPLE", "true").l
 ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()
 ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "30"))
 ENTRY_LIMIT_POLL_INTERVAL = float(os.getenv("ENTRY_LIMIT_POLL_INTERVAL", "0.50"))
-ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "2"))
+ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "1"))
 ENTRY_MARKET_FALLBACK = os.getenv("ENTRY_MARKET_FALLBACK", "false").lower() == "true"
 ENTRY_LIMIT_OFFSET_TOP = float(os.getenv("ENTRY_LIMIT_OFFSET_TOP", "0.0001"))
 ENTRY_LIMIT_OFFSET_MID = float(os.getenv("ENTRY_LIMIT_OFFSET_MID", "0.0002"))
@@ -189,14 +189,16 @@ SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
 SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
 SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
 SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
-PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.45"))
-META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.35"))
-ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0.20"))
+
+# Redistribusi default jika ENV kosong
+PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.60"))
+META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.40"))
+ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0.0"))
 
 # Profit management.
 PARTIAL_TP_ENABLED = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
 PARTIAL_TP_R1_RATIO = float(os.getenv("PARTIAL_TP_R1_RATIO", "0.40"))
-SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.009"))
+SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.015"))
 SMART_TRAIL_ACTIVE_PCT = float(os.getenv("SMART_TRAIL_ACTIVE_PCT", "0.018"))
 SMART_TRAIL_LOCK_RATIO = float(os.getenv("SMART_TRAIL_LOCK_RATIO", "0.70"))
 STATE_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("STATE_SAVE_MIN_INTERVAL_SECONDS", "30"))

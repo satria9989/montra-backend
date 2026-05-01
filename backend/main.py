@@ -47,7 +47,7 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10" if VALIDATION_MODE else "30"
 SCAN_INTERVAL_TOP = int(os.getenv("SCAN_INTERVAL_TOP", "30"))
 SCAN_INTERVAL_MID = int(os.getenv("SCAN_INTERVAL_MID", "45"))
 SCAN_INTERVAL_MID_AGGRESSIVE = int(os.getenv("SCAN_INTERVAL_MID_AGGRESSIVE", os.getenv("SCAN_INTERVAL_MID", "45")))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "46" if VALIDATION_MODE else "65"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "85" if VALIDATION_MODE else "85"))
 
 # safety core tetap dijaga, tapi live-safe lebih ketat
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2" if VALIDATION_MODE else "3"))
@@ -124,7 +124,7 @@ EMERGENCY_CLOSE_VERIFY_DELAY = float(os.getenv("EMERGENCY_CLOSE_VERIFY_DELAY", "
 ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "LIMIT") or "LIMIT").strip().upper()
 ENTRY_LIMIT_TTL_SECONDS = float(os.getenv("ENTRY_LIMIT_TTL_SECONDS", "30"))
 ENTRY_LIMIT_POLL_INTERVAL = float(os.getenv("ENTRY_LIMIT_POLL_INTERVAL", "0.50"))
-ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "2"))
+ENTRY_LIMIT_MAX_REPRICE = int(os.getenv("ENTRY_LIMIT_MAX_REPRICE", "1"))
 ENTRY_MARKET_FALLBACK = os.getenv("ENTRY_MARKET_FALLBACK", "false").lower() == "true"
 ENTRY_LIMIT_OFFSET_TOP = float(os.getenv("ENTRY_LIMIT_OFFSET_TOP", "0.0001"))
 ENTRY_LIMIT_OFFSET_MID = float(os.getenv("ENTRY_LIMIT_OFFSET_MID", "0.0002"))
@@ -168,12 +168,6 @@ SPREAD_WARN_MULTIPLIER = float(os.getenv("SPREAD_WARN_MULTIPLIER", "0.8"))
 SPREAD_CACHE_TTL = float(os.getenv("SPREAD_CACHE_TTL", "5"))
 SPREAD_ORDER_BOOK_LIMIT = int(os.getenv("SPREAD_ORDER_BOOK_LIMIT", "5"))
 
-# ===== SWEEP MEMORY / ALERTING =====
-# Sweep memory keeps a confirmed liquidity sweep valid for a few candles instead
-# of requiring the current candle only. Reclaim=true avoids treating clean breakouts
-# as reversal sweeps.
-SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "10"))
-SWEEP_MEMORY_WINDOW = int(os.getenv("SWEEP_MEMORY_WINDOW", "5"))
 SWEEP_REQUIRE_RECLAIM = os.getenv("SWEEP_REQUIRE_RECLAIM", "true").lower() == "true"
 
 TELEGRAM_ALERTS_ENABLED = os.getenv("TELEGRAM_ALERTS_ENABLED", "true").lower() == "true"
@@ -215,14 +209,26 @@ SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
 SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
 SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
 SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
-PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.45"))
-META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.35"))
-ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0.20"))
+
+# [FIX 4] Redistribusi bobot ML ke Pre dan Meta jika ML mati.
+ENABLE_ML = os.getenv("ENABLE_ML", "false").lower() == "true"
+if not ENABLE_ML:
+    PRE_SCORE_WEIGHT = 0.60
+    META_SCORE_WEIGHT = 0.40
+    ML_SCORE_WEIGHT = 0.0
+else:
+    PRE_SCORE_WEIGHT = float(os.getenv("PRE_SCORE_WEIGHT", "0.45"))
+    META_SCORE_WEIGHT = float(os.getenv("META_SCORE_WEIGHT", "0.35"))
+    ML_SCORE_WEIGHT = float(os.getenv("ML_SCORE_WEIGHT", "0"))
+
+# [FIX 6] Sweep Memory Window dikompresi agar sinyal tidak basi (stale).
+SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "7"))
+SWEEP_MEMORY_WINDOW = int(os.getenv("SWEEP_MEMORY_WINDOW", "2"))
 
 # ===== PROFIT MANAGEMENT =====
 PARTIAL_TP_ENABLED = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
 PARTIAL_TP_R1_RATIO = float(os.getenv("PARTIAL_TP_R1_RATIO", "0.40"))
-SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.009"))
+SMART_TRAIL_BE_TRIGGER_PCT = float(os.getenv("SMART_TRAIL_BE_TRIGGER_PCT", "0.015"))
 SMART_TRAIL_ACTIVE_PCT = float(os.getenv("SMART_TRAIL_ACTIVE_PCT", "0.018"))
 SMART_TRAIL_LOCK_RATIO = float(os.getenv("SMART_TRAIL_LOCK_RATIO", "0.70"))
 STATE_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("STATE_SAVE_MIN_INTERVAL_SECONDS", "30"))
@@ -1185,11 +1191,11 @@ def tier_score_floor(symbol):
     if VALIDATION_MODE:
         return MIN_SCORE if tier != "LOW" else max(MIN_SCORE, 50)
     if tier == "TOP":
-        return max(MIN_SCORE, 65)
+        return max(MIN_SCORE, 80)
     if tier == "MID":
-        return max(MIN_SCORE, 65)
+        return max(MIN_SCORE, 85)
     if tier == "MID_AGGRESSIVE":
-        return max(MIN_SCORE, 67)
+        return max(MIN_SCORE, 85)
     return 999
 
 def tier_score_bonus(symbol):
@@ -1526,18 +1532,9 @@ def find_last_order_block(ohlcv, side, lookback=None):
                 "bottom": opened,
             }
 
-    fallback_idx = max(0, len(ohlcv) - 4)
-    candle = ohlcv[fallback_idx]
-    return {
-        "index": fallback_idx,
-        "source": "fallback_minus_4",
-        "open": _candle_open(candle),
-        "high": _candle_high(candle),
-        "low": _candle_low(candle),
-        "close": _candle_close(candle),
-        "top": _candle_high(candle),
-        "bottom": _candle_low(candle),
-    }
+    # [FIX 1] AUDIT INSTITUSI: Tidak ada OB valid = Tidak ada trade. 
+    # SL di area acak hanya menjadi likuiditas bagi Market Maker.
+    return None
 
 def _directional_fvg_target(side, entry, structure):
     if not structure:
@@ -1659,7 +1656,7 @@ def get_fng_score_bias(side, fng_ctx=None):
 def composite_pre_score(symbol, side, entry, sl, tp, structure, pair_regime, vol, sweep_high=False, sweep_low=False, fng_ctx=None):
     side = str(side or "").upper().strip()
     structure = structure or {}
-    score = 58.0
+    score = 85.0
 
     grade = structure.get("grade")
     if grade == "STRONG":
@@ -4241,6 +4238,9 @@ def get_total_equity():
 def safety_check():
     global KILL_SWITCH, DAILY_START_EQUITY, LAST_DAY, daily_loss, START_EQUITY
 
+    # [FIX 7] Hardcode Maximum Daily Loss Institusi: $5 USD Flat.
+    MAX_DAILY_LOSS_USD = 5.0 
+
     now_day = time.strftime("%Y-%m-%d")
     eq = get_total_equity()
 
@@ -4250,13 +4250,11 @@ def safety_check():
 
     if START_EQUITY is None or START_EQUITY <= 0:
         START_EQUITY = eq
-        print("🧠 START_EQUITY initialized from safety_check:", START_EQUITY)
         save_runtime_state()
         return True
 
     if DAILY_START_EQUITY is None or DAILY_START_EQUITY <= 0:
         DAILY_START_EQUITY = eq
-        print("🧠 DAILY_START_EQUITY initialized from safety_check:", DAILY_START_EQUITY)
         save_runtime_state()
         return True
 
@@ -4268,26 +4266,18 @@ def safety_check():
         reset_pairs()
         save_runtime_state()
 
-    dd = ((START_EQUITY - eq) / START_EQUITY) * 100
-    if dd < 0:
-        dd = 0
+    # Hitung total PnL Mengambang (Unrealized)
+    total_unrealized = sum(ACCOUNT_PROFIT.values()) if ACCOUNT_PROFIT else 0.0
+    
+    # Total loss harian (Realized loss yang sudah di-cache + PnL mengambang yang negatif)
+    current_unrealized_loss = abs(total_unrealized) if total_unrealized < 0 else 0.0
+    total_daily_exposure = daily_loss + current_unrealized_loss
 
-    if dd >= MAX_DRAWDOWN_PCT:
+    if total_daily_exposure >= MAX_DAILY_LOSS_USD:
         if not KILL_SWITCH:
             KILL_SWITCH = True
             save_runtime_state()
-            send_telegram(f"🛑 MAX DD HIT: {dd:.2f}% → BOT STOP")
-        return False
-
-    daily_loss_pct = ((DAILY_START_EQUITY - eq) / DAILY_START_EQUITY) * 100
-    if daily_loss_pct < 0:
-        daily_loss_pct = 0
-
-    if daily_loss_pct >= DAILY_LOSS_PCT:
-        if not KILL_SWITCH:
-            KILL_SWITCH = True
-            save_runtime_state()
-            send_telegram(f"🛑 DAILY LOSS HIT: {daily_loss_pct:.2f}% → BOT STOP")
+            send_telegram(f"🛑 CIRCUIT BREAKER HIT: Loss + Unrealized (${total_daily_exposure:.2f}) melebihi limit harian (${MAX_DAILY_LOSS_USD}). Bot di-lock.")
         return False
 
     return True
@@ -5049,7 +5039,29 @@ def should_execute_trade(signal):
 
     if not safety_check():
         return False, "SAFETY_BLOCK"
+    # [FIX 5] Manual News Gate: Blacklist jam berita berdampak tinggi (Tier-1)
+    now_utc = time.gmtime()
+    hour, minute = now_utc.tm_hour, now_utc.tm_min
+    # Contoh blokade waktu CPI/NFP (sekitar 12:30 - 13:30 UTC / 19:30 - 20:30 WIB)
+    # atau FOMC (sekitar 18:00 - 19:30 UTC / 01:00 - 02:30 WIB)
+    is_news_window = (
+        (hour == 12 and minute >= 15) or (hour == 13 and minute <= 45) or  # NFP/CPI
+        (hour == 18 and minute >= 0) or (hour == 19 and minute <= 30)      # FOMC
+    )
+    if is_news_window and active_news_block():
+        return False, "HIGH_IMPACT_NEWS_WINDOW"
 
+    # [FIX 3] 4H Regime Hard Gate per pair. Institusi tidak entry melawan impulse 4H.
+    regime_4h = get_regime_tf(symbol, "4h")
+    if regime_4h == "SIDEWAYS":
+        return False, "4H_REGIME_SIDEWAYS"
+        
+    if regime_4h == "BULL" and side != "BUY":
+        return False, f"4H_REGIME_BULL_MISMATCH (Signal: {side})"
+        
+    if regime_4h == "BEAR" and side != "SELL":
+        return False, f"4H_REGIME_BEAR_MISMATCH (Signal: {side})"
+       
     if symbol in disabled_pairs:
         return False, "DISABLED_PAIR"
 
@@ -7390,8 +7402,9 @@ def auto_trader():
                     send_auto_entry_telegram(signal, result=result, weight=w, order_ok=order_ok)
                     print("AUTO EXEC:", result)
 
-                    if signal["score"] >= 90:
-                        scale_in(symbol, signal["type"], signal["sl"], signal["tp"])
+                    # [FIX 2] Scale-in otomatis dinonaktifkan. 
+                    # Scale-in tanpa gate posisi berisiko double-drawdown.
+                    pass
 
                 except Exception as e:
                     print("Pair error:", symbol, e)
