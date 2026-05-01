@@ -7,6 +7,57 @@ import json
 from dotenv import load_dotenv
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 
+import datetime
+
+# [FIX 5] INSTITUTIONAL NEWS ENGINE CACHE
+# Radar akan menyimpan jadwal news untuk mengurangi beban API
+NEWS_CACHE = {"timestamp": 0, "events": []}
+
+def is_high_impact_news_window():
+    """
+    Menarik data dari kalender ekonomi (Forex Factory API).
+    Hanya memantau "High Impact" untuk "USD" (karena menggerakkan BTC).
+    Memblokir entry 30 menit SEBELUM dan SESUDAH rilis berita.
+    """
+    global NEWS_CACHE
+    current_time = time.time()
+
+    # Refresh data kalender setiap 6 jam
+    if current_time - NEWS_CACHE["timestamp"] > 21600:
+        try:
+            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                usd_high_events = []
+                for item in data:
+                    # Filter mutlak: Hanya event USD dengan Impact Tinggi (Merah)
+                    if item.get("country") == "USD" and item.get("impact") == "High":
+                        date_str = item.get("date") # Format ISO
+                        try:
+                            # Konversi waktu event ke UNIX Timestamp
+                            dt = datetime.datetime.fromisoformat(date_str)
+                            usd_high_events.append(dt.timestamp())
+                        except Exception:
+                            pass
+                
+                NEWS_CACHE["events"] = usd_high_events
+                NEWS_CACHE["timestamp"] = current_time
+                print(f"📅 [NEWS ENGINE] Radar aktif. {len(usd_high_events)} badai USD (Tier-1) terdeteksi minggu ini.")
+        except Exception as e:
+            print(f"⚠️ [NEWS ENGINE] Gagal fetch kalender: {e}")
+
+    # HARD GATE: Blokir 30 menit (1800 detik) sebelum dan sesudah rilis
+    NEWS_BLOCK_SECONDS = 1800 
+    
+    for event_ts in NEWS_CACHE["events"]:
+        if abs(current_time - event_ts) <= NEWS_BLOCK_SECONDS:
+            return True # Berada di dalam "Kill Zone" berita
+
+    return False
+
 load_dotenv()
 
 # ===== CONFIG & ENV CHECK =====
@@ -5039,17 +5090,16 @@ def should_execute_trade(signal):
 
     if not safety_check():
         return False, "SAFETY_BLOCK"
-    # [FIX 5] Manual News Gate: Blacklist jam berita berdampak tinggi (Tier-1)
-    now_utc = time.gmtime()
-    hour, minute = now_utc.tm_hour, now_utc.tm_min
-    # Contoh blokade waktu CPI/NFP (sekitar 12:30 - 13:30 UTC / 19:30 - 20:30 WIB)
-    # atau FOMC (sekitar 18:00 - 19:30 UTC / 01:00 - 02:30 WIB)
-    is_news_window = (
-        (hour == 12 and minute >= 15) or (hour == 13 and minute <= 45) or  # NFP/CPI
-        (hour == 18 and minute >= 0) or (hour == 19 and minute <= 30)      # FOMC
-    )
-    if is_news_window and active_news_block():
-        return False, "HIGH_IMPACT_NEWS_WINDOW"
+
+    # [FIX 5] EKSEKUSI NEWS ENGINE
+    # Jika kita berada di jendela 30 menit High Impact News, batalkan semua entry.
+    if is_high_impact_news_window():
+        return False, "HIGH_IMPACT_NEWS_KILLZONE"
+
+    # (Lanjutkan ke pengecekan 4H regime atau score dari revisi sebelumnya)
+    # [FIX 3] 4H Regime Hard Gate per pair.
+    regime_4h = get_regime_tf(symbol, "4h")
+    # ...
 
     # [FIX 3] 4H Regime Hard Gate per pair. Institusi tidak entry melawan impulse 4H.
     regime_4h = get_regime_tf(symbol, "4h")
