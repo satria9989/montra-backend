@@ -5495,17 +5495,20 @@ def should_execute_trade(signal):
 
     if not safety_check():
         return False, "SAFETY_BLOCK"
-    # [FIX 5] Manual News Gate: Blacklist jam berita berdampak tinggi (Tier-1)
-    now_utc = time.gmtime()
-    hour, minute = now_utc.tm_hour, now_utc.tm_min
-    # Contoh blokade waktu CPI/NFP (sekitar 12:30 - 13:30 UTC / 19:30 - 20:30 WIB)
-    # atau FOMC (sekitar 18:00 - 19:30 UTC / 01:00 - 02:30 WIB)
-    is_news_window = (
-        (hour == 12 and minute >= 15) or (hour == 13 and minute <= 45) or  # NFP/CPI
-        (hour == 18 and minute >= 0) or (hour == 19 and minute <= 30)      # FOMC
-    )
-    if is_news_window and active_news_block():
-        return False, "HIGH_IMPACT_NEWS_WINDOW"
+
+    # === MONTRA: NEWS_GATE_HOOK_SHOULD_EXECUTE START ===
+    news_state = get_institutional_news_state(symbol)
+    signal["news_state"] = news_state
+    if news_state.get("applies_to_symbol") and news_state.get("block_decision"):
+        ev_phase = news_state.get("phase", "UNKNOWN")
+        ev_tier = news_state.get("tier", "UNKNOWN")
+        return False, f"NEWS_GATE_{ev_tier}_{ev_phase}"
+    news_score_penalty = int(news_state.get("score_penalty", 0) or 0)
+    if news_score_penalty > 0:
+        adjusted_score = float(signal.get("score", 0) or 0) - news_score_penalty
+        if adjusted_score < tier_score_floor(symbol):
+            return False, f"NEWS_POST_PENALTY_BELOW_FLOOR_{int(adjusted_score)}"
+    # === MONTRA: NEWS_GATE_HOOK_SHOULD_EXECUTE END ===
 
     # [FIX 3] 4H Regime Hard Gate per pair. Institusi tidak entry melawan impulse 4H.
     regime_4h = get_regime_tf(symbol, "4h")
@@ -6559,6 +6562,29 @@ def debug_spread_symbol(symbol: str, force: bool = Query(default=True)):
     return get_live_spread(binance, sym, tier, force=force)
 
 
+# === MONTRA: NEWS_ENGINE_DEBUG_ENDPOINTS START ===
+@app.get("/debug/news_state")
+def debug_news_state(symbol: str = Query(default="BTCUSDT")):
+    return get_institutional_news_state(symbol=symbol)
+
+
+@app.get("/debug/news_calendar")
+def debug_news_calendar(limit: int = Query(default=20, ge=1, le=200)):
+    refresh_institutional_news_cache()
+    events = INSTITUTIONAL_NEWS_CACHE.get("events", []) or []
+    sliced = events[:limit]
+    return {
+        "source": INSTITUTIONAL_NEWS_CACHE.get("source"),
+        "last_refresh_ts": INSTITUTIONAL_NEWS_CACHE.get("last_refresh_ts"),
+        "next_refresh_ts": INSTITUTIONAL_NEWS_CACHE.get("next_refresh_ts"),
+        "fetch_error": INSTITUTIONAL_NEWS_CACHE.get("fetch_error"),
+        "fetch_attempts": INSTITUTIONAL_NEWS_CACHE.get("fetch_attempts", 0),
+        "event_count_total": len(events),
+        "events": sliced,
+    }
+# === MONTRA: NEWS_ENGINE_DEBUG_ENDPOINTS END ===
+
+
 @app.get("/debug/decision-board")
 def debug_decision_board():
     candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
@@ -7230,6 +7256,46 @@ def auto_trader():
             # === VOL SPIKE DETECTION ===
             if vol > 0.015:
                 print("⚠️ VOL SPIKE → MARKET CHAOS")
+
+            # === MONTRA: NEWS_GATE_HOOK_AUTOTRADER START ===
+            news_engine_global = get_institutional_news_state(symbol="_SYSTEM_")
+            if news_engine_global.get("block_decision") and news_engine_global.get("scope") == "GLOBAL_CRYPTO":
+                ev = news_engine_global.get("active_event") or {}
+                ev_title = ev.get("title", "UNKNOWN_EVENT")
+                ev_phase = news_engine_global.get("phase", "UNKNOWN")
+                ev_tier = news_engine_global.get("tier", "UNKNOWN")
+                detail = {
+                    "tier": ev_tier,
+                    "phase": ev_phase,
+                    "title": ev_title,
+                    "minutes_to_event": news_engine_global.get("minutes_to_event"),
+                    "minutes_since_event": news_engine_global.get("minutes_since_event"),
+                    "scope": news_engine_global.get("scope"),
+                    "source": news_engine_global.get("source"),
+                }
+                set_final_execution(
+                    "BLOCKED",
+                    reason=f"NEWS_TIER1_BLOCK_{ev_phase}",
+                    stage="news_gate",
+                    detail=detail,
+                )
+                print(f"📰 INSTITUTIONAL NEWS BLOCK tier={ev_tier} phase={ev_phase} title={ev_title[:60]}")
+                if NEWS_TIER1_TELEGRAM_ALERT and ev_phase == "PRE" and ev_tier == "TIER_1_RED":
+                    try:
+                        alert_key = f"news_pre_{ev.get('id', ev_title)[:64]}"
+                        alert_msg = (
+                            f"📰 NEWS PRE WINDOW\n"
+                            f"Event: {ev_title}\n"
+                            f"Tier: {ev_tier}\n"
+                            f"T-{news_engine_global.get('minutes_to_event')}m\n"
+                            f"Source: {news_engine_global.get('source')}"
+                        )
+                        send_telegram_alert(alert_key, alert_msg)
+                    except Exception as alert_exc:
+                        print("news telegram alert error:", alert_exc)
+                time.sleep(min(SCAN_INTERVAL, 30))
+                continue
+            # === MONTRA: NEWS_GATE_HOOK_AUTOTRADER END ===
 
             # === NEWS FILTER ===
             news_impact = get_market_news()
