@@ -262,6 +262,38 @@ INSTITUTIONAL_NEWS_CACHE = {
 INSTITUTIONAL_NEWS_LOCK = threading.RLock()
 # === MONTRA: NEWS_ENGINE_CONSTANTS END ===
 
+# === MONTRA: ANTI_TRAP_CONSTANTS START ===
+ANTI_TRAP_MODE = (os.getenv("ANTI_TRAP_MODE", "enforce") or "enforce").strip().lower()
+
+ANTI_TRAP_EQHL_ENABLED = os.getenv("ANTI_TRAP_EQHL_ENABLED", "true").lower() == "true"
+ANTI_TRAP_EQHL_TOLERANCE = float(os.getenv("ANTI_TRAP_EQHL_TOLERANCE", "0.0005"))
+ANTI_TRAP_EQHL_LOOKBACK = int(os.getenv("ANTI_TRAP_EQHL_LOOKBACK", "20"))
+ANTI_TRAP_EQHL_SWEEP_LOOKBACK = int(os.getenv("ANTI_TRAP_EQHL_SWEEP_LOOKBACK", "5"))
+ANTI_TRAP_EQHL_SWING_LEFT = int(os.getenv("ANTI_TRAP_EQHL_SWING_LEFT", "2"))
+ANTI_TRAP_EQHL_SWING_RIGHT = int(os.getenv("ANTI_TRAP_EQHL_SWING_RIGHT", "2"))
+ANTI_TRAP_EQHL_BONUS = int(os.getenv("ANTI_TRAP_EQHL_BONUS", "5"))
+
+ANTI_TRAP_WICK_ENABLED = os.getenv("ANTI_TRAP_WICK_ENABLED", "true").lower() == "true"
+ANTI_TRAP_WICK_RATIO_MAX = float(os.getenv("ANTI_TRAP_WICK_RATIO_MAX", "1.8"))
+ANTI_TRAP_WICK_REQUIRE_BOS = os.getenv("ANTI_TRAP_WICK_REQUIRE_BOS", "true").lower() == "true"
+ANTI_TRAP_BOS_LOOKBACK = int(os.getenv("ANTI_TRAP_BOS_LOOKBACK", "5"))
+ANTI_TRAP_WICK_BONUS = int(os.getenv("ANTI_TRAP_WICK_BONUS", "4"))
+
+ANTI_TRAP_SESSION_MAP_ENABLED = os.getenv("ANTI_TRAP_SESSION_MAP_ENABLED", "true").lower() == "true"
+ANTI_TRAP_SESSION_TP_BONUS = int(os.getenv("ANTI_TRAP_SESSION_TP_BONUS", "6"))
+ANTI_TRAP_SESSION_TP_PENALTY = int(os.getenv("ANTI_TRAP_SESSION_TP_PENALTY", "5"))
+ANTI_TRAP_SESSION_OVERSHOOT_THRESHOLD = float(os.getenv("ANTI_TRAP_SESSION_OVERSHOOT_THRESHOLD", "0.005"))
+ANTI_TRAP_SESSION_TTL_MIN = int(os.getenv("ANTI_TRAP_SESSION_TTL_MIN", "60"))
+
+ANTI_TRAP_CLUSTER_ENABLED = os.getenv("ANTI_TRAP_CLUSTER_ENABLED", "true").lower() == "true"
+ANTI_TRAP_CLUSTER_LOOKBACK = int(os.getenv("ANTI_TRAP_CLUSTER_LOOKBACK", "80"))
+ANTI_TRAP_CLUSTER_Z_THRESHOLD = float(os.getenv("ANTI_TRAP_CLUSTER_Z_THRESHOLD", "1.5"))
+ANTI_TRAP_CLUSTER_TOLERANCE = float(os.getenv("ANTI_TRAP_CLUSTER_TOLERANCE", "0.001"))
+ANTI_TRAP_CLUSTER_BONUS = int(os.getenv("ANTI_TRAP_CLUSTER_BONUS", "5"))
+
+SESSION_LIQUIDITY_CACHE = {}
+# === MONTRA: ANTI_TRAP_CONSTANTS END ===
+
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
 STRUCTURE_FVG_LOOKBACK = int(os.getenv("STRUCTURE_FVG_LOOKBACK", "8"))
@@ -1876,6 +1908,437 @@ def detect_sweep_memory(ohlcv, lookback=None, memory_window=None, require_reclai
                 "time": ts,
             }
     return out
+
+
+# === MONTRA: ANTI_TRAP_DETECTORS START ===
+def _ohlcv_field(candle, idx, default=0.0):
+    try:
+        return float(candle[idx])
+    except Exception:
+        return float(default)
+
+
+def _identify_swing_points(ohlcv, swing_left, swing_right, kind):
+    points = []
+    n = len(ohlcv)
+    if n < swing_left + swing_right + 1:
+        return points
+    for i in range(swing_left, n - swing_right):
+        center = ohlcv[i]
+        center_price = _ohlcv_field(center, 2 if kind == "high" else 3)
+        is_swing = True
+        for j in range(1, swing_left + 1):
+            ref = _ohlcv_field(ohlcv[i - j], 2 if kind == "high" else 3)
+            if kind == "high" and ref >= center_price:
+                is_swing = False; break
+            if kind == "low" and ref <= center_price:
+                is_swing = False; break
+        if not is_swing:
+            continue
+        for j in range(1, swing_right + 1):
+            ref = _ohlcv_field(ohlcv[i + j], 2 if kind == "high" else 3)
+            if kind == "high" and ref >= center_price:
+                is_swing = False; break
+            if kind == "low" and ref <= center_price:
+                is_swing = False; break
+        if is_swing:
+            points.append({"index": i, "price": center_price, "ts": _ohlcv_field(center, 0)})
+    return points
+
+
+def _cluster_swing_points(points, tolerance):
+    clusters = []
+    used = set()
+    for i, p in enumerate(points):
+        if i in used:
+            continue
+        cluster = [p]
+        used.add(i)
+        for j in range(i + 1, len(points)):
+            if j in used:
+                continue
+            ref_price = p["price"]
+            if abs(points[j]["price"] - ref_price) / max(ref_price, 1e-9) <= tolerance:
+                if abs(points[j]["index"] - cluster[-1]["index"]) >= 3:
+                    cluster.append(points[j])
+                    used.add(j)
+        if len(cluster) >= 2:
+            avg_price = sum(c["price"] for c in cluster) / len(cluster)
+            clusters.append({
+                "price": avg_price,
+                "count": len(cluster),
+                "points": cluster,
+                "last_index": max(c["index"] for c in cluster),
+            })
+    return clusters
+
+
+def _check_cluster_swept(cluster, ohlcv, kind, sweep_lookback):
+    n = len(ohlcv)
+    last_index = cluster.get("last_index", 0)
+    sweep_window_start = max(last_index + 1, n - sweep_lookback)
+    cluster_price = cluster["price"]
+    swept = False
+    swept_at_ts = None
+    for i in range(sweep_window_start, n):
+        candle = ohlcv[i]
+        high = _ohlcv_field(candle, 2)
+        low = _ohlcv_field(candle, 3)
+        close = _ohlcv_field(candle, 4)
+        ts = _ohlcv_field(candle, 0)
+        if kind == "high" and high > cluster_price and close < cluster_price:
+            swept = True; swept_at_ts = ts
+        elif kind == "low" and low < cluster_price and close > cluster_price:
+            swept = True; swept_at_ts = ts
+        if swept:
+            break
+    return swept, swept_at_ts
+
+
+def detect_eqh_eql(ohlcv, lookback=None, swing_left=None, swing_right=None, tolerance=None, sweep_lookback=None):
+    lookback = lookback or ANTI_TRAP_EQHL_LOOKBACK
+    swing_left = swing_left or ANTI_TRAP_EQHL_SWING_LEFT
+    swing_right = swing_right or ANTI_TRAP_EQHL_SWING_RIGHT
+    tolerance = tolerance if tolerance is not None else ANTI_TRAP_EQHL_TOLERANCE
+    sweep_lookback = sweep_lookback or ANTI_TRAP_EQHL_SWEEP_LOOKBACK
+
+    if not ohlcv or len(ohlcv) < lookback:
+        return {"eqh_clusters": [], "eql_clusters": []}
+
+    window = ohlcv[-lookback:]
+    high_swings = _identify_swing_points(window, swing_left, swing_right, "high")
+    low_swings = _identify_swing_points(window, swing_left, swing_right, "low")
+    eqh = _cluster_swing_points(high_swings, tolerance)
+    eql = _cluster_swing_points(low_swings, tolerance)
+    for c in eqh:
+        swept, ts = _check_cluster_swept(c, window, "high", sweep_lookback)
+        c["swept"] = swept; c["swept_at_ts"] = ts
+    for c in eql:
+        swept, ts = _check_cluster_swept(c, window, "low", sweep_lookback)
+        c["swept"] = swept; c["swept_at_ts"] = ts
+    return {"eqh_clusters": eqh, "eql_clusters": eql}
+
+
+def compute_candle_wick_metrics(candle):
+    o = _ohlcv_field(candle, 1)
+    h = _ohlcv_field(candle, 2)
+    l = _ohlcv_field(candle, 3)
+    c = _ohlcv_field(candle, 4)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    total_range = max(h - l, 1e-9)
+    body_safe = max(body, 1e-9)
+    return {
+        "open": o, "high": h, "low": l, "close": c,
+        "body": body, "upper_wick": upper_wick, "lower_wick": lower_wick,
+        "total_range": total_range,
+        "upper_wick_ratio": upper_wick / body_safe,
+        "lower_wick_ratio": lower_wick / body_safe,
+        "is_bullish": c > o, "is_bearish": c < o,
+    }
+
+
+def detect_bos(ohlcv, side, lookback=None):
+    lookback = lookback or ANTI_TRAP_BOS_LOOKBACK
+    if not ohlcv or len(ohlcv) < lookback + 2:
+        return False
+    last_close = _ohlcv_field(ohlcv[-1], 4)
+    window_for_swing = ohlcv[-(lookback + 5):-1]
+    if side == "BUY":
+        swing_high = max((_ohlcv_field(c, 2) for c in window_for_swing), default=0)
+        return last_close > swing_high
+    if side == "SELL":
+        swing_low = min((_ohlcv_field(c, 3) for c in window_for_swing), default=float("inf"))
+        return last_close < swing_low
+    return False
+
+
+def compute_session_liquidity_map(symbol, ohlcv, ttl_min=None):
+    ttl_min = ttl_min or ANTI_TRAP_SESSION_TTL_MIN
+    cached = SESSION_LIQUIDITY_CACHE.get(symbol)
+    now = time.time()
+    if cached and (now - cached.get("ts", 0)) < ttl_min * 60:
+        return cached
+
+    if not ohlcv or len(ohlcv) < 8:
+        empty = {"ts": now, "asia_high": None, "asia_low": None,
+                 "london_kz_low": None, "ny_kz_high": None,
+                 "prev_day_high": None, "prev_day_low": None}
+        SESSION_LIQUIDITY_CACHE[symbol] = empty
+        return empty
+
+    asia_highs, asia_lows = [], []
+    london_lows = []
+    ny_highs = []
+    prev_day_highs, prev_day_lows = [], []
+    today_str = time.strftime("%Y-%m-%d", time.gmtime(now))
+    yesterday_ts = now - 86400
+    yesterday_str = time.strftime("%Y-%m-%d", time.gmtime(yesterday_ts))
+
+    for candle in ohlcv:
+        ts_ms = _ohlcv_field(candle, 0)
+        ts_sec = ts_ms / 1000.0 if ts_ms > 1e12 else ts_ms
+        struct = time.gmtime(ts_sec)
+        date_str = time.strftime("%Y-%m-%d", struct)
+        hour = struct.tm_hour
+        h = _ohlcv_field(candle, 2); l = _ohlcv_field(candle, 3)
+        if date_str == today_str:
+            if 0 <= hour < 8:
+                asia_highs.append(h); asia_lows.append(l)
+            if 7 <= hour < 9:
+                london_lows.append(l)
+            if 13 <= hour < 16:
+                ny_highs.append(h)
+        elif date_str == yesterday_str:
+            prev_day_highs.append(h); prev_day_lows.append(l)
+
+    result = {
+        "ts": now,
+        "asia_high": max(asia_highs) if asia_highs else None,
+        "asia_low": min(asia_lows) if asia_lows else None,
+        "london_kz_low": min(london_lows) if london_lows else None,
+        "ny_kz_high": max(ny_highs) if ny_highs else None,
+        "prev_day_high": max(prev_day_highs) if prev_day_highs else None,
+        "prev_day_low": min(prev_day_lows) if prev_day_lows else None,
+    }
+    SESSION_LIQUIDITY_CACHE[symbol] = result
+    return result
+
+
+def detect_liquidation_clusters(ohlcv, lookback=None, z_threshold=None, tolerance=None):
+    lookback = lookback or ANTI_TRAP_CLUSTER_LOOKBACK
+    z_threshold = z_threshold if z_threshold is not None else ANTI_TRAP_CLUSTER_Z_THRESHOLD
+    tolerance = tolerance if tolerance is not None else ANTI_TRAP_CLUSTER_TOLERANCE
+
+    if not ohlcv or len(ohlcv) < lookback:
+        return {"high_clusters": [], "low_clusters": []}
+
+    window = ohlcv[-lookback:]
+    volumes = [_ohlcv_field(c, 5) for c in window]
+    n = len(volumes)
+    if n < 10:
+        return {"high_clusters": [], "low_clusters": []}
+    mean_vol = sum(volumes) / n
+    var_vol = sum((v - mean_vol) ** 2 for v in volumes) / n
+    std_vol = var_vol ** 0.5 if var_vol > 0 else 1.0
+
+    high_pivots, low_pivots = [], []
+    for i in range(2, n - 2):
+        candle = window[i]
+        h = _ohlcv_field(candle, 2); l = _ohlcv_field(candle, 3)
+        v = volumes[i]; z = (v - mean_vol) / max(std_vol, 1e-9)
+        if z < z_threshold:
+            continue
+        is_high_pivot = (h > _ohlcv_field(window[i - 1], 2) and h > _ohlcv_field(window[i + 1], 2))
+        is_low_pivot = (l < _ohlcv_field(window[i - 1], 3) and l < _ohlcv_field(window[i + 1], 3))
+        if is_high_pivot:
+            high_pivots.append({"index": i, "price": h, "z": z})
+        if is_low_pivot:
+            low_pivots.append({"index": i, "price": l, "z": z})
+
+    def _cluster_pivots(pivots):
+        clusters = []
+        used = set()
+        for i, p in enumerate(pivots):
+            if i in used:
+                continue
+            group = [p]; used.add(i)
+            for j in range(i + 1, len(pivots)):
+                if j in used:
+                    continue
+                if abs(pivots[j]["price"] - p["price"]) / max(p["price"], 1e-9) <= tolerance:
+                    group.append(pivots[j]); used.add(j)
+            avg = sum(g["price"] for g in group) / len(group)
+            zmax = max(g["z"] for g in group)
+            clusters.append({"price": avg, "z_max": zmax, "candle_count": len(group)})
+        return clusters
+
+    return {"high_clusters": _cluster_pivots(high_pivots), "low_clusters": _cluster_pivots(low_pivots)}
+# === MONTRA: ANTI_TRAP_DETECTORS END ===
+
+
+# === MONTRA: ANTI_TRAP_EVALUATORS START ===
+def evaluate_eqhl_gate(symbol, side, signal, ohlcv):
+    if not ANTI_TRAP_EQHL_ENABLED:
+        return True, "DISABLED", 0, {}
+    detail = detect_eqh_eql(ohlcv)
+    eqh = detail.get("eqh_clusters", [])
+    eql = detail.get("eql_clusters", [])
+    bonus = 0
+    decision = "ALLOW"; reason = "OK"
+
+    if side == "BUY":
+        for c in eqh:
+            if c.get("swept"):
+                decision = "BLOCK"
+                reason = "EQHL_BUY_TRAP_AFTER_EQH_SWEEP"
+                break
+        if decision == "ALLOW":
+            tp = float(signal.get("tp") or 0)
+            for c in eqh:
+                if not c.get("swept") and tp > 0:
+                    if abs(tp - c["price"]) / max(c["price"], 1e-9) < 0.003:
+                        bonus = ANTI_TRAP_EQHL_BONUS
+                        reason = "TP_TARGETS_EQH_LIQUIDITY"
+                        break
+    elif side == "SELL":
+        for c in eql:
+            if c.get("swept"):
+                decision = "BLOCK"
+                reason = "EQHL_SELL_TRAP_AFTER_EQL_SWEEP"
+                break
+        if decision == "ALLOW":
+            tp = float(signal.get("tp") or 0)
+            for c in eql:
+                if not c.get("swept") and tp > 0:
+                    if abs(tp - c["price"]) / max(c["price"], 1e-9) < 0.003:
+                        bonus = ANTI_TRAP_EQHL_BONUS
+                        reason = "TP_TARGETS_EQL_LIQUIDITY"
+                        break
+
+    allow = decision != "BLOCK"
+    return allow, reason, bonus, {"detail": detail, "decision": decision, "reason": reason, "bonus": bonus}
+
+
+def evaluate_wick_gate(symbol, side, ohlcv):
+    if not ANTI_TRAP_WICK_ENABLED:
+        return True, "DISABLED", 0, {}
+    if not ohlcv or len(ohlcv) < 3:
+        return True, "INSUFFICIENT_DATA", 0, {}
+    last_metrics = compute_candle_wick_metrics(ohlcv[-1])
+    bos = detect_bos(ohlcv, side)
+    bonus = 0
+    decision = "ALLOW"; reason = "OK"
+
+    if side == "BUY":
+        if last_metrics["upper_wick_ratio"] > ANTI_TRAP_WICK_RATIO_MAX:
+            if ANTI_TRAP_WICK_REQUIRE_BOS and not bos:
+                decision = "BLOCK"
+                reason = "WICK_AGAINST_BUY_NO_BOS"
+        if last_metrics["lower_wick_ratio"] > ANTI_TRAP_WICK_RATIO_MAX and last_metrics["is_bullish"]:
+            bonus = ANTI_TRAP_WICK_BONUS
+            reason = "LOWER_WICK_RECLAIM_SUPPORTS_BUY" if decision == "ALLOW" else reason
+    elif side == "SELL":
+        if last_metrics["lower_wick_ratio"] > ANTI_TRAP_WICK_RATIO_MAX:
+            if ANTI_TRAP_WICK_REQUIRE_BOS and not bos:
+                decision = "BLOCK"
+                reason = "WICK_AGAINST_SELL_NO_BOS"
+        if last_metrics["upper_wick_ratio"] > ANTI_TRAP_WICK_RATIO_MAX and last_metrics["is_bearish"]:
+            bonus = ANTI_TRAP_WICK_BONUS
+            reason = "UPPER_WICK_RECLAIM_SUPPORTS_SELL" if decision == "ALLOW" else reason
+
+    allow = decision != "BLOCK"
+    return allow, reason, bonus, {
+        "metrics": last_metrics, "bos": bos,
+        "decision": decision, "reason": reason, "bonus": bonus,
+    }
+
+
+def evaluate_session_alignment(side, entry, tp, liquidity_map):
+    if not ANTI_TRAP_SESSION_MAP_ENABLED or not liquidity_map:
+        return 0, "DISABLED_OR_EMPTY", None
+
+    candidates = []
+    if side == "BUY":
+        for name in ("ny_kz_high", "asia_high", "prev_day_high"):
+            v = liquidity_map.get(name)
+            if v and v > entry:
+                candidates.append({"name": name, "price": v})
+    elif side == "SELL":
+        for name in ("london_kz_low", "asia_low", "prev_day_low"):
+            v = liquidity_map.get(name)
+            if v and v < entry:
+                candidates.append({"name": name, "price": v})
+
+    if not candidates or tp <= 0 or entry <= 0:
+        return 0, "NO_LIQUIDITY_REFERENCE", None
+
+    if side == "BUY":
+        sorted_pools = sorted(candidates, key=lambda x: x["price"])
+        nearest = sorted_pools[0]
+    else:
+        sorted_pools = sorted(candidates, key=lambda x: -x["price"])
+        nearest = sorted_pools[0]
+
+    pool_price = nearest["price"]
+    risk_reward_distance = abs(tp - entry)
+    pool_distance = abs(pool_price - entry)
+
+    if (side == "BUY" and tp >= pool_price - 0.0015 * pool_price) or (side == "SELL" and tp <= pool_price + 0.0015 * pool_price):
+        if (side == "BUY" and tp > pool_price * (1 + ANTI_TRAP_SESSION_OVERSHOOT_THRESHOLD)) or \
+           (side == "SELL" and tp < pool_price * (1 - ANTI_TRAP_SESSION_OVERSHOOT_THRESHOLD)):
+            return -ANTI_TRAP_SESSION_TP_PENALTY, "OVERSHOOT_LIQUIDITY", nearest
+        return ANTI_TRAP_SESSION_TP_BONUS, "AT_LIQUIDITY", nearest
+
+    if pool_distance > 0 and risk_reward_distance < 0.4 * pool_distance:
+        return 0, "BEFORE_LIQUIDITY", nearest
+
+    return 0, "MISALIGNED", nearest
+
+
+def evaluate_cluster_alignment(side, entry, tp, clusters):
+    if not ANTI_TRAP_CLUSTER_ENABLED or not clusters:
+        return 0, False, None
+    pool_list = clusters.get("high_clusters", []) if side == "BUY" else clusters.get("low_clusters", [])
+    if not pool_list or tp <= 0:
+        return 0, False, None
+    best = None; best_distance = None
+    for c in pool_list:
+        cprice = c.get("price", 0)
+        if cprice <= 0:
+            continue
+        if side == "BUY" and cprice <= entry:
+            continue
+        if side == "SELL" and cprice >= entry:
+            continue
+        d = abs(tp - cprice) / max(cprice, 1e-9)
+        if best is None or d < best_distance:
+            best = c; best_distance = d
+    if best is None:
+        return 0, False, None
+    if best_distance is not None and best_distance < 0.003:
+        return ANTI_TRAP_CLUSTER_BONUS, True, best
+    return 0, False, best
+
+
+def evaluate_anti_trap_gates(signal, ohlcv, session_map=None):
+    side = signal.get("type")
+    symbol = signal.get("symbol", "")
+    entry = float(signal.get("entry") or 0)
+    tp = float(signal.get("tp") or 0)
+
+    eqhl_allow, eqhl_reason, eqhl_bonus, eqhl_detail = evaluate_eqhl_gate(symbol, side, signal, ohlcv)
+    wick_allow, wick_reason, wick_bonus, wick_detail = evaluate_wick_gate(symbol, side, ohlcv)
+    if session_map is None and symbol:
+        session_map = compute_session_liquidity_map(symbol, ohlcv)
+    session_mod, session_reason, session_pool = evaluate_session_alignment(side, entry, tp, session_map or {})
+    clusters = detect_liquidation_clusters(ohlcv)
+    cluster_bonus, cluster_aligned, cluster_pool = evaluate_cluster_alignment(side, entry, tp, clusters)
+
+    score_modifier = (eqhl_bonus or 0) + (wick_bonus or 0) + (session_mod or 0) + (cluster_bonus or 0)
+
+    hard_block = False
+    block_reason = None
+    if ANTI_TRAP_MODE == "enforce":
+        if not eqhl_allow:
+            hard_block = True; block_reason = eqhl_reason
+        elif not wick_allow:
+            hard_block = True; block_reason = wick_reason
+    else:
+        score_modifier = 0
+
+    return {
+        "mode": ANTI_TRAP_MODE,
+        "eqhl": {"allow": eqhl_allow, "reason": eqhl_reason, "bonus": eqhl_bonus, "detail": eqhl_detail},
+        "wick": {"allow": wick_allow, "reason": wick_reason, "bonus": wick_bonus, "detail": wick_detail},
+        "session": {"score_modifier": session_mod, "alignment": session_reason, "pool": session_pool},
+        "cluster": {"bonus": cluster_bonus, "aligned": cluster_aligned, "pool": cluster_pool},
+        "hard_block": hard_block,
+        "block_reason": block_reason,
+        "score_modifier": int(score_modifier),
+    }
+# === MONTRA: ANTI_TRAP_EVALUATORS END ===
 
 
 def add_execution_decision(stage, symbol, status, detail=None):
