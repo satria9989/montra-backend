@@ -6047,6 +6047,30 @@ def should_execute_trade(signal):
         if pair_regime == "BEAR" and side != "SELL":
             return False, "PAIR_REGIME_BEAR_MISMATCH"
 
+    # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE START ===
+    if ANTI_TRAP_MODE in ("enforce", "shadow"):
+        try:
+            trap_ohlcv = get_ohlcv_cached(symbol)
+        except Exception:
+            trap_ohlcv = None
+        if trap_ohlcv and len(trap_ohlcv) >= 20:
+            trap_session_map = SESSION_LIQUIDITY_CACHE.get(symbol)
+            try:
+                trap_eval = evaluate_anti_trap_gates(signal, trap_ohlcv, trap_session_map)
+            except Exception as trap_exc:
+                print(f"anti_trap eval error {symbol}: {trap_exc}")
+                trap_eval = None
+            if trap_eval is not None:
+                signal["anti_trap"] = trap_eval
+                if trap_eval.get("hard_block"):
+                    return False, trap_eval.get("block_reason") or "ANTI_TRAP_HARD_BLOCK"
+                trap_modifier = int(trap_eval.get("score_modifier", 0) or 0)
+                if trap_modifier:
+                    adjusted_score = float(signal.get("score", 0) or 0) + trap_modifier
+                    if adjusted_score < tier_score_floor(symbol):
+                        return False, f"ANTI_TRAP_SCORE_BELOW_FLOOR_{int(adjusted_score)}"
+    # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE END ===
+
     slot_ok, slot_reason, slot_detail = can_open_new_trade(symbol, force=True)
     signal["risk_slots"] = slot_detail
     if not slot_ok:
@@ -7070,6 +7094,49 @@ def debug_news_calendar(limit: int = Query(default=20, ge=1, le=200)):
 # === MONTRA: NEWS_ENGINE_DEBUG_ENDPOINTS END ===
 
 
+# === MONTRA: ANTI_TRAP_DEBUG_ENDPOINTS START ===
+@app.get("/debug/anti_trap/{symbol}")
+def debug_anti_trap(symbol: str):
+    symbol_up = (symbol or "").upper()
+    ohlcv = get_ohlcv_cached(symbol_up)
+    if not ohlcv:
+        return {"error": "no_ohlcv_cached", "symbol": symbol_up}
+
+    session_map = SESSION_LIQUIDITY_CACHE.get(symbol_up)
+    if not session_map:
+        session_map = compute_session_liquidity_map(symbol_up, ohlcv)
+
+    last_close = float(ohlcv[-1][4])
+    fake_buy = {
+        "type": "BUY", "symbol": symbol_up, "score": 85,
+        "entry": last_close, "tp": last_close * 1.012, "sl": last_close * 0.995,
+    }
+    fake_sell = {
+        "type": "SELL", "symbol": symbol_up, "score": 85,
+        "entry": last_close, "tp": last_close * 0.988, "sl": last_close * 1.005,
+    }
+
+    return {
+        "symbol": symbol_up,
+        "mode": ANTI_TRAP_MODE,
+        "gates_enabled": {
+            "eqhl": ANTI_TRAP_EQHL_ENABLED,
+            "wick": ANTI_TRAP_WICK_ENABLED,
+            "session": ANTI_TRAP_SESSION_MAP_ENABLED,
+            "cluster": ANTI_TRAP_CLUSTER_ENABLED,
+        },
+        "session_map": session_map,
+        "eqhl_raw": detect_eqh_eql(ohlcv),
+        "wick_metrics_last": compute_candle_wick_metrics(ohlcv[-1]),
+        "bos_buy": detect_bos(ohlcv, "BUY"),
+        "bos_sell": detect_bos(ohlcv, "SELL"),
+        "clusters_raw": detect_liquidation_clusters(ohlcv),
+        "buy_eval": evaluate_anti_trap_gates(fake_buy, ohlcv, session_map),
+        "sell_eval": evaluate_anti_trap_gates(fake_sell, ohlcv, session_map),
+    }
+# === MONTRA: ANTI_TRAP_DEBUG_ENDPOINTS END ===
+
+
 @app.get("/debug/decision-board")
 def debug_decision_board():
     candidate_rows = sorted(candidate_list_live, key=lambda x: x.get("score", 0), reverse=True)
@@ -7732,6 +7799,17 @@ def auto_trader():
 
             # 🔥 NEW: perbarui alokasi portofolio berdasarkan AI memory
             update_portfolio_allocation()
+
+            # === MONTRA: ANTI_TRAP_SESSION_REFRESH START ===
+            if ANTI_TRAP_SESSION_MAP_ENABLED:
+                for _trap_sym in PAIRS:
+                    try:
+                        _trap_ohlcv = get_ohlcv_cached(_trap_sym)
+                        if _trap_ohlcv and len(_trap_ohlcv) >= 20:
+                            compute_session_liquidity_map(_trap_sym, _trap_ohlcv)
+                    except Exception as _trap_exc:
+                        print(f"session map refresh error {_trap_sym}: {_trap_exc}")
+            # === MONTRA: ANTI_TRAP_SESSION_REFRESH END ===
 
             regime = get_multi_tf_regime("BTCUSDT")
             vol = get_volatility("BTCUSDT")
