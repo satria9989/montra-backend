@@ -2654,7 +2654,7 @@ def get_market_news():
 # === MONTRA: NEWS_ENGINE_PROVIDERS START ===
 def _fetch_economic_calendar_fmp(api_key=None, timeout=None):
     if not api_key:
-        raise ValueError("fmp_api_key_missing")
+        raise ValueError("fmp_api_key_missing_or_empty_env")
     timeout = timeout or NEWS_FETCH_TIMEOUT
     from_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))
     to_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 86400))
@@ -2662,23 +2662,33 @@ def _fetch_economic_calendar_fmp(api_key=None, timeout=None):
         "https://financialmodelingprep.com/api/v3/economic_calendar"
         f"?from={from_dt}&to={to_dt}&apikey={api_key}"
     )
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get(url, timeout=timeout)
+    except Exception as exc:
+        raise ValueError(f"fmp_network_error: {exc}")
+    if resp.status_code != 200:
+        body_snippet = (resp.text or "")[:300].replace("\n", " ")
+        if resp.status_code == 401:
+            raise ValueError(f"fmp_unauthorized_check_api_key: {body_snippet}")
+        if resp.status_code == 403:
+            raise ValueError(f"fmp_forbidden_tier_or_endpoint_restricted: {body_snippet}")
+        if resp.status_code == 429:
+            raise ValueError(f"fmp_rate_limit_exceeded: {body_snippet}")
+        raise ValueError(f"fmp_http_{resp.status_code}: {body_snippet}")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        body_snippet = (resp.text or "")[:300].replace("\n", " ")
+        raise ValueError(f"fmp_json_decode_error: {exc} body={body_snippet}")
+    if isinstance(data, dict) and ("Error Message" in data or "error" in data):
+        raise ValueError(f"fmp_api_error: {str(data)[:300]}")
     if not isinstance(data, list):
-        raise ValueError(f"fmp_unexpected_response: {type(data)}")
+        raise ValueError(f"fmp_unexpected_response_type: {type(data).__name__}")
     return data
 
 
 def _fetch_economic_calendar_tradingeconomics(timeout=None):
-    timeout = timeout or NEWS_FETCH_TIMEOUT
-    url = "https://api.tradingeconomics.com/calendar?c=guest:guest&format=json"
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, list):
-        raise ValueError(f"tradingeconomics_unexpected_response: {type(data)}")
-    return data
+    raise ValueError("tradingeconomics_guest_endpoint_deprecated_410_gone")
 
 
 def _load_economic_calendar_manual_fallback():
@@ -2843,6 +2853,7 @@ def refresh_institutional_news_cache(force=False):
         raw_events = []
         used_source = None
         fetch_error = None
+        provider_errors = {}
 
         provider_order = [NEWS_ENGINE_PROVIDER, "tradingeconomics", "manual"]
         seen = set()
@@ -2868,13 +2879,17 @@ def refresh_institutional_news_cache(force=False):
                     if raw_events:
                         break
             except Exception as exc:
-                fetch_error = f"{provider}: {exc}"
+                err_msg = str(exc)
+                provider_errors[provider] = err_msg
+                fetch_error = f"{provider}: {err_msg}"
                 continue
 
         if not raw_events:
             INSTITUTIONAL_NEWS_CACHE["fetch_attempts"] = INSTITUTIONAL_NEWS_CACHE.get("fetch_attempts", 0) + 1
             INSTITUTIONAL_NEWS_CACHE["fetch_error"] = fetch_error or "no_events"
+            INSTITUTIONAL_NEWS_CACHE["provider_errors"] = provider_errors
             INSTITUTIONAL_NEWS_CACHE["next_refresh_ts"] = now + NEWS_REFRESH_INTERVAL
+            print(f"📰 NEWS REFRESH FAILED provider_errors={provider_errors}")
             return INSTITUTIONAL_NEWS_CACHE
 
         normalized = []
@@ -2898,6 +2913,7 @@ def refresh_institutional_news_cache(force=False):
             "source": used_source,
             "fetch_error": None,
             "fetch_attempts": 0,
+            "provider_errors": provider_errors,
         }
         print(f"📰 NEWS REFRESH ok source={used_source} events={len(filtered)}")
     return INSTITUTIONAL_NEWS_CACHE
@@ -7041,7 +7057,12 @@ def debug_news_calendar(limit: int = Query(default=20, ge=1, le=200)):
         "last_refresh_ts": INSTITUTIONAL_NEWS_CACHE.get("last_refresh_ts"),
         "next_refresh_ts": INSTITUTIONAL_NEWS_CACHE.get("next_refresh_ts"),
         "fetch_error": INSTITUTIONAL_NEWS_CACHE.get("fetch_error"),
+        "provider_errors": INSTITUTIONAL_NEWS_CACHE.get("provider_errors", {}),
         "fetch_attempts": INSTITUTIONAL_NEWS_CACHE.get("fetch_attempts", 0),
+        "fmp_api_key_present": bool(FMP_API_KEY),
+        "fmp_api_key_length": len(FMP_API_KEY) if FMP_API_KEY else 0,
+        "news_engine_enabled": NEWS_ENGINE_ENABLED,
+        "news_engine_provider": NEWS_ENGINE_PROVIDER,
         "event_count_total": len(events),
         "events": sliced,
     }

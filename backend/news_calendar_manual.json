@@ -1,0 +1,88 @@
+{
+  "_comment": "Manual economic calendar fallback for MONTRA news engine. Update this file weekly with upcoming Tier-1 events. Source recommendations: forexfactory.com, investing.com, federalreserve.gov. All times in UTC. Field 'date' format must be ISO8601 with Z suffix.",
+  "_last_updated": "2026-05-02",
+  "_next_review_due": "2026-05-09",
+  "events": [
+    {
+      "date": "2026-05-13T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Consumer Price Index YoY",
+      "impact": "High",
+      "previous": "3.3%",
+      "estimate": ""
+    },
+    {
+      "date": "2026-05-13T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Core CPI YoY",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-05-14T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Producer Price Index YoY",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-05-14T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Initial Jobless Claims",
+      "impact": "Medium",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-05-15T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Retail Sales MoM",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-06-05T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Non-Farm Payrolls",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-06-05T12:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "Unemployment Rate",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    },
+    {
+      "date": "2026-06-17T18:00:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "FOMC Statement Interest Rate Decision",
+      "impact": "High",
+      "previous": "3.50-3.75%",
+      "estimate": ""
+    },
+    {
+      "date": "2026-06-17T18:30:00Z",
+      "country": "US",
+      "currency": "USD",
+      "event": "FOMC Press Conference Powell Speech",
+      "impact": "High",
+      "previous": "",
+      "estimate": ""
+    }
+  ]
+}
