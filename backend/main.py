@@ -7,57 +7,6 @@ import json
 from dotenv import load_dotenv
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 
-import datetime
-
-# [FIX 5] INSTITUTIONAL NEWS ENGINE CACHE
-# Radar akan menyimpan jadwal news untuk mengurangi beban API
-NEWS_CACHE = {"timestamp": 0, "events": []}
-
-def is_high_impact_news_window():
-    """
-    Menarik data dari kalender ekonomi (Forex Factory API).
-    Hanya memantau "High Impact" untuk "USD" (karena menggerakkan BTC).
-    Memblokir entry 30 menit SEBELUM dan SESUDAH rilis berita.
-    """
-    global NEWS_CACHE
-    current_time = time.time()
-
-    # Refresh data kalender setiap 6 jam
-    if current_time - NEWS_CACHE["timestamp"] > 21600:
-        try:
-            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                usd_high_events = []
-                for item in data:
-                    # Filter mutlak: Hanya event USD dengan Impact Tinggi (Merah)
-                    if item.get("country") == "USD" and item.get("impact") == "High":
-                        date_str = item.get("date") # Format ISO
-                        try:
-                            # Konversi waktu event ke UNIX Timestamp
-                            dt = datetime.datetime.fromisoformat(date_str)
-                            usd_high_events.append(dt.timestamp())
-                        except Exception:
-                            pass
-                
-                NEWS_CACHE["events"] = usd_high_events
-                NEWS_CACHE["timestamp"] = current_time
-                print(f"📅 [NEWS ENGINE] Radar aktif. {len(usd_high_events)} badai USD (Tier-1) terdeteksi minggu ini.")
-        except Exception as e:
-            print(f"⚠️ [NEWS ENGINE] Gagal fetch kalender: {e}")
-
-    # HARD GATE: Blokir 30 menit (1800 detik) sebelum dan sesudah rilis
-    NEWS_BLOCK_SECONDS = 1800 
-    
-    for event_ts in NEWS_CACHE["events"]:
-        if abs(current_time - event_ts) <= NEWS_BLOCK_SECONDS:
-            return True # Berada di dalam "Kill Zone" berita
-
-    return False
-
 load_dotenv()
 
 # ===== CONFIG & ENV CHECK =====
@@ -242,6 +191,76 @@ TELEGRAM_CANDIDATE_MIN_SCORE = float(os.getenv("TELEGRAM_CANDIDATE_MIN_SCORE", "
 TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_CANDIDATE_ALERT_COOLDOWN_SECONDS", "900"))
 TELEGRAM_CANDIDATE_ALERT_TOP_N = int(os.getenv("TELEGRAM_CANDIDATE_ALERT_TOP_N", "3"))
 TELEGRAM_ENTRY_ALERT_SIMPLE = os.getenv("TELEGRAM_ENTRY_ALERT_SIMPLE", "true").lower() == "true"
+
+# === MONTRA: NEWS_ENGINE_CONSTANTS START ===
+NEWS_ENGINE_ENABLED = os.getenv("NEWS_ENGINE_ENABLED", "true").lower() == "true"
+NEWS_ENGINE_PROVIDER = (os.getenv("NEWS_ENGINE_PROVIDER", "fmp") or "fmp").strip().lower()
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
+NEWS_CRYPTO_AUGMENT_ENABLED = os.getenv("NEWS_CRYPTO_AUGMENT_ENABLED", "false").lower() == "true"
+NEWS_REFRESH_INTERVAL = int(os.getenv("NEWS_REFRESH_INTERVAL", "1800"))
+NEWS_FETCH_TIMEOUT = float(os.getenv("NEWS_FETCH_TIMEOUT", "4"))
+NEWS_MANUAL_FALLBACK_PATH = os.getenv("NEWS_MANUAL_FALLBACK_PATH", "news_calendar_manual.json")
+
+NEWS_PRE_EVENT_BLOCK_MIN = int(os.getenv("NEWS_PRE_EVENT_BLOCK_MIN", "30"))
+NEWS_EVENT_WINDOW_MIN = int(os.getenv("NEWS_EVENT_WINDOW_MIN", "15"))
+NEWS_POST_EVENT_PENALTY_MIN = int(os.getenv("NEWS_POST_EVENT_PENALTY_MIN", "30"))
+NEWS_TIER2_PRE_BLOCK_MIN = int(os.getenv("NEWS_TIER2_PRE_BLOCK_MIN", "15"))
+NEWS_TIER2_POST_PENALTY_MIN = int(os.getenv("NEWS_TIER2_POST_PENALTY_MIN", "15"))
+
+NEWS_TIER1_HARD_BLOCK = os.getenv("NEWS_TIER1_HARD_BLOCK", "true").lower() == "true"
+NEWS_TIER2_HARD_BLOCK = os.getenv("NEWS_TIER2_HARD_BLOCK", "true").lower() == "true"
+NEWS_TIER1_POST_PENALTY = int(os.getenv("NEWS_TIER1_POST_PENALTY", "8"))
+NEWS_TIER2_POST_PENALTY = int(os.getenv("NEWS_TIER2_POST_PENALTY", "4"))
+NEWS_TIER1_TELEGRAM_ALERT = os.getenv("NEWS_TIER1_TELEGRAM_ALERT", "true").lower() == "true"
+
+NEWS_TIER1_KEYWORDS = (
+    "consumer price index", "core cpi", "cpi y/y", "cpi yoy",
+    "non-farm payrolls", "non farm payrolls", "nonfarm payrolls", "nfp",
+    "unemployment rate",
+    "fomc statement", "fomc economic projections", "fomc press conference",
+    "fomc minutes", "interest rate decision",
+    "fed chair", "powell speech", "powell speaks", "fed chair speaks",
+    "ecb interest rate", "ecb press conference", "ecb monetary policy",
+    "boj policy rate", "bank of japan policy rate",
+    "gdp advance", "gdp growth rate", "gdp q",
+    "ppi y/y", "ppi yoy", "producer price index",
+    "sec etf", "spot etf decision",
+)
+
+NEWS_TIER2_KEYWORDS = (
+    "retail sales", "ism manufacturing", "ism services", "ism non-manufacturing",
+    "jolts", "core pce", "pce price index",
+    "initial jobless claims", "continuing jobless claims",
+    "trade balance", "boe interest rate", "bank of england rate",
+    "china manufacturing pmi", "china services pmi",
+    "german zew", "german ifo",
+)
+
+NEWS_TIER3_KEYWORDS = (
+    "housing starts", "building permits", "consumer confidence",
+    "michigan sentiment", "philly fed", "empire state",
+)
+
+NEWS_SCOPE_GLOBAL_KEYWORDS = (
+    "fomc", "non-farm", "nfp", "cpi", "core cpi", "powell", "fed chair",
+    "interest rate decision", "ppi", "unemployment rate",
+)
+
+NEWS_SCOPE_EU_KEYWORDS = ("ecb", "boe", "bank of england")
+NEWS_SCOPE_ASIA_KEYWORDS = ("boj", "bank of japan", "china manufacturing", "china services")
+NEWS_SCOPE_BTC_KEYWORDS = ("sec etf", "spot etf", "bitcoin etf", "ethereum etf")
+
+INSTITUTIONAL_NEWS_CACHE = {
+    "last_refresh_ts": 0,
+    "next_refresh_ts": 0,
+    "events": [],
+    "source": None,
+    "fetch_error": None,
+    "fetch_attempts": 0,
+}
+INSTITUTIONAL_NEWS_LOCK = threading.RLock()
+# === MONTRA: NEWS_ENGINE_CONSTANTS END ===
 
 # ===== STRUCTURE ENGINE V3 =====
 STRUCTURE_SWING_LOOKBACK = int(os.getenv("STRUCTURE_SWING_LOOKBACK", "14"))
@@ -2167,6 +2186,392 @@ def get_market_news():
             "error": str(exc),
         }
         return "NORMAL"
+
+
+# === MONTRA: NEWS_ENGINE_PROVIDERS START ===
+def _fetch_economic_calendar_fmp(api_key=None, timeout=None):
+    if not api_key:
+        raise ValueError("fmp_api_key_missing")
+    timeout = timeout or NEWS_FETCH_TIMEOUT
+    from_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))
+    to_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 86400))
+    url = (
+        "https://financialmodelingprep.com/api/v3/economic_calendar"
+        f"?from={from_dt}&to={to_dt}&apikey={api_key}"
+    )
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise ValueError(f"fmp_unexpected_response: {type(data)}")
+    return data
+
+
+def _fetch_economic_calendar_tradingeconomics(timeout=None):
+    timeout = timeout or NEWS_FETCH_TIMEOUT
+    url = "https://api.tradingeconomics.com/calendar?c=guest:guest&format=json"
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise ValueError(f"tradingeconomics_unexpected_response: {type(data)}")
+    return data
+
+
+def _load_economic_calendar_manual_fallback():
+    path = NEWS_MANUAL_FALLBACK_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        events = payload.get("events", [])
+        if not isinstance(events, list):
+            return []
+        return events
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        print(f"manual fallback load error: {exc}")
+        return []
+
+
+def _parse_event_timestamp(raw):
+    if not raw:
+        return 0
+    try:
+        if isinstance(raw, (int, float)):
+            return int(raw if raw < 1e12 else raw / 1000)
+        s = str(raw).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        if "T" in s:
+            from datetime import datetime
+            dt = datetime.fromisoformat(s)
+            return int(dt.timestamp())
+        from datetime import datetime
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _normalize_calendar_event(raw_event, source):
+    title = (
+        raw_event.get("event")
+        or raw_event.get("Event")
+        or raw_event.get("title")
+        or ""
+    )
+    country = (
+        raw_event.get("country")
+        or raw_event.get("Country")
+        or raw_event.get("CountryCode")
+        or ""
+    ).upper()
+    currency = (
+        raw_event.get("currency")
+        or raw_event.get("Currency")
+        or ""
+    ).upper()
+    raw_impact = (
+        raw_event.get("impact")
+        or raw_event.get("Importance")
+        or raw_event.get("importance")
+        or ""
+    )
+    if isinstance(raw_impact, (int, float)):
+        raw_impact = {1: "Low", 2: "Medium", 3: "High"}.get(int(raw_impact), "Low")
+    raw_impact = str(raw_impact).capitalize()
+
+    date_field = (
+        raw_event.get("date")
+        or raw_event.get("Date")
+        or raw_event.get("datetime")
+        or raw_event.get("dateUtc")
+    )
+    ts = _parse_event_timestamp(date_field)
+    if ts == 0:
+        return None
+
+    tier, category, scope = classify_news_impact(title, country, raw_impact)
+
+    return {
+        "id": f"{source}_{ts}_{title.replace(' ', '_')[:32]}",
+        "ts_utc": ts,
+        "date_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+        "country": country,
+        "currency": currency,
+        "title": title,
+        "raw_impact": raw_impact,
+        "tier": tier,
+        "category": category,
+        "scope": scope,
+        "previous": raw_event.get("previous") or raw_event.get("Previous"),
+        "estimate": raw_event.get("estimate") or raw_event.get("Forecast") or raw_event.get("forecast"),
+        "actual": raw_event.get("actual") or raw_event.get("Actual"),
+        "source": source,
+    }
+# === MONTRA: NEWS_ENGINE_PROVIDERS END ===
+
+
+# === MONTRA: NEWS_ENGINE_CORE START ===
+def classify_news_impact(event_title, country, raw_impact):
+    title_low = (event_title or "").lower()
+    country_up = (country or "").upper()
+
+    is_us_or_global = country_up in ("US", "USD", "UNITED STATES", "EUR", "EU", "EMU", "EUROPEAN MONETARY UNION", "")
+    is_eu = country_up in ("EU", "EUR", "EMU", "DE", "GERMANY", "FR", "FRANCE", "EUROPEAN MONETARY UNION")
+    is_asia = country_up in ("JP", "JPY", "JAPAN", "CN", "CNY", "CHINA")
+
+    tier_1 = any(kw in title_low for kw in NEWS_TIER1_KEYWORDS)
+    tier_2 = any(kw in title_low for kw in NEWS_TIER2_KEYWORDS)
+    tier_3 = any(kw in title_low for kw in NEWS_TIER3_KEYWORDS)
+
+    raw_high = str(raw_impact or "").lower() == "high"
+    raw_med = str(raw_impact or "").lower() == "medium"
+
+    if tier_1 and (is_us_or_global or is_eu or is_asia):
+        tier = "TIER_1_RED"
+    elif tier_2 and (is_us_or_global or is_eu or is_asia):
+        tier = "TIER_2_ORANGE"
+    elif raw_high and (is_us_or_global or is_eu):
+        tier = "TIER_2_ORANGE"
+    elif tier_3 or raw_med:
+        tier = "TIER_3_YELLOW"
+    else:
+        tier = "TIER_NONE"
+
+    if any(k in title_low for k in ("cpi", "ppi", "core pce", "pce price")):
+        category = "INFLATION"
+    elif any(k in title_low for k in ("payrolls", "unemployment", "jobless", "jolts", "employment")):
+        category = "EMPLOYMENT"
+    elif any(k in title_low for k in ("interest rate", "fomc", "ecb", "boj", "boe", "fed chair", "powell")):
+        category = "RATE"
+    elif "gdp" in title_low:
+        category = "GDP"
+    elif any(k in title_low for k in ("etf", "sec ", "halving")):
+        category = "CRYPTO_SPECIFIC"
+    else:
+        category = "OTHER"
+
+    if any(k in title_low for k in NEWS_SCOPE_BTC_KEYWORDS):
+        scope = "BTC_HEAVY"
+    elif any(k in title_low for k in NEWS_SCOPE_GLOBAL_KEYWORDS) and is_us_or_global:
+        scope = "GLOBAL_CRYPTO"
+    elif any(k in title_low for k in NEWS_SCOPE_EU_KEYWORDS) or is_eu:
+        scope = "EU_LIMITED"
+    elif any(k in title_low for k in NEWS_SCOPE_ASIA_KEYWORDS) or is_asia:
+        scope = "ASIA_LIMITED"
+    else:
+        scope = "NONE"
+
+    return tier, category, scope
+
+
+def refresh_institutional_news_cache(force=False):
+    global INSTITUTIONAL_NEWS_CACHE
+    if not NEWS_ENGINE_ENABLED:
+        return INSTITUTIONAL_NEWS_CACHE
+
+    now = time.time()
+    with INSTITUTIONAL_NEWS_LOCK:
+        if not force and now < INSTITUTIONAL_NEWS_CACHE.get("next_refresh_ts", 0):
+            return INSTITUTIONAL_NEWS_CACHE
+
+        raw_events = []
+        used_source = None
+        fetch_error = None
+
+        provider_order = [NEWS_ENGINE_PROVIDER, "tradingeconomics", "manual"]
+        seen = set()
+        provider_chain = []
+        for p in provider_order:
+            if p not in seen:
+                provider_chain.append(p)
+                seen.add(p)
+
+        for provider in provider_chain:
+            try:
+                if provider == "fmp":
+                    raw_events = _fetch_economic_calendar_fmp(api_key=FMP_API_KEY)
+                    used_source = "fmp"
+                    break
+                elif provider == "tradingeconomics":
+                    raw_events = _fetch_economic_calendar_tradingeconomics()
+                    used_source = "tradingeconomics"
+                    break
+                elif provider == "manual":
+                    raw_events = _load_economic_calendar_manual_fallback()
+                    used_source = "manual_fallback"
+                    if raw_events:
+                        break
+            except Exception as exc:
+                fetch_error = f"{provider}: {exc}"
+                continue
+
+        if not raw_events:
+            INSTITUTIONAL_NEWS_CACHE["fetch_attempts"] = INSTITUTIONAL_NEWS_CACHE.get("fetch_attempts", 0) + 1
+            INSTITUTIONAL_NEWS_CACHE["fetch_error"] = fetch_error or "no_events"
+            INSTITUTIONAL_NEWS_CACHE["next_refresh_ts"] = now + NEWS_REFRESH_INTERVAL
+            return INSTITUTIONAL_NEWS_CACHE
+
+        normalized = []
+        for raw in raw_events:
+            try:
+                norm = _normalize_calendar_event(raw, used_source or "unknown")
+                if norm and norm["ts_utc"] > 0:
+                    normalized.append(norm)
+            except Exception:
+                continue
+
+        cutoff_low = now - 3600
+        cutoff_high = now + 86400
+        filtered = [e for e in normalized if cutoff_low <= e["ts_utc"] <= cutoff_high]
+        filtered.sort(key=lambda e: e["ts_utc"])
+
+        INSTITUTIONAL_NEWS_CACHE = {
+            "last_refresh_ts": now,
+            "next_refresh_ts": now + NEWS_REFRESH_INTERVAL,
+            "events": filtered,
+            "source": used_source,
+            "fetch_error": None,
+            "fetch_attempts": 0,
+        }
+        print(f"📰 NEWS REFRESH ok source={used_source} events={len(filtered)}")
+    return INSTITUTIONAL_NEWS_CACHE
+
+
+def get_event_phase(event, now_ts=None):
+    now_ts = now_ts or time.time()
+    ts = event.get("ts_utc", 0)
+    if ts <= 0:
+        return "CLEAR"
+    diff_min = (now_ts - ts) / 60.0
+    tier = event.get("tier", "TIER_NONE")
+
+    if tier == "TIER_1_RED":
+        if -NEWS_PRE_EVENT_BLOCK_MIN <= diff_min < 0:
+            return "PRE"
+        if 0 <= diff_min < NEWS_EVENT_WINDOW_MIN:
+            return "EVENT"
+        if NEWS_EVENT_WINDOW_MIN <= diff_min < NEWS_EVENT_WINDOW_MIN + NEWS_POST_EVENT_PENALTY_MIN:
+            return "POST"
+        return "CLEAR"
+
+    if tier == "TIER_2_ORANGE":
+        if -NEWS_TIER2_PRE_BLOCK_MIN <= diff_min < 0:
+            return "PRE"
+        if 0 <= diff_min < NEWS_EVENT_WINDOW_MIN:
+            return "EVENT"
+        if NEWS_EVENT_WINDOW_MIN <= diff_min < NEWS_EVENT_WINDOW_MIN + NEWS_TIER2_POST_PENALTY_MIN:
+            return "POST"
+        return "CLEAR"
+
+    return "CLEAR"
+
+
+def news_applies_to_symbol(event, symbol):
+    scope = event.get("scope", "NONE")
+    sym_up = (symbol or "").upper()
+
+    if scope == "GLOBAL_CRYPTO":
+        return True, 1.0
+    if scope == "BTC_HEAVY":
+        if sym_up in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+            return True, 1.0
+        return True, 0.5
+    if scope == "EU_LIMITED":
+        return True, 0.5
+    if scope == "ASIA_LIMITED":
+        if sym_up in ("HYPEUSDT", "WIFUSDT", "1000PEPEUSDT", "SUIUSDT"):
+            return True, 1.0
+        return True, 0.25
+    return False, 0.0
+
+
+def get_institutional_news_state(symbol="_SYSTEM_", now_ts=None):
+    now_ts = now_ts or time.time()
+    if not NEWS_ENGINE_ENABLED:
+        return {
+            "active_event": None, "phase": "CLEAR", "tier": "TIER_NONE",
+            "scope": "NONE", "block_decision": False, "score_penalty": 0,
+            "minutes_to_event": None, "minutes_since_event": None,
+            "applies_to_symbol": False, "severity_modifier": 0.0,
+            "source": "disabled", "cache_age_seconds": 0,
+        }
+
+    refresh_institutional_news_cache()
+
+    events = INSTITUTIONAL_NEWS_CACHE.get("events", []) or []
+    candidate = None
+    candidate_phase = "CLEAR"
+    candidate_applies = False
+    candidate_severity = 0.0
+
+    for ev in events:
+        phase = get_event_phase(ev, now_ts)
+        if phase == "CLEAR":
+            continue
+        applies, severity = news_applies_to_symbol(ev, symbol)
+        if not applies:
+            continue
+        rank = {"PRE": 3, "EVENT": 4, "POST": 1}.get(phase, 0)
+        cand_rank = {"PRE": 3, "EVENT": 4, "POST": 1}.get(candidate_phase, 0)
+        if candidate is None or rank > cand_rank:
+            candidate = ev
+            candidate_phase = phase
+            candidate_applies = applies
+            candidate_severity = severity
+
+    if candidate is None:
+        return {
+            "active_event": None, "phase": "CLEAR", "tier": "TIER_NONE",
+            "scope": "NONE", "block_decision": False, "score_penalty": 0,
+            "minutes_to_event": None, "minutes_since_event": None,
+            "applies_to_symbol": False, "severity_modifier": 0.0,
+            "source": INSTITUTIONAL_NEWS_CACHE.get("source") or "empty",
+            "cache_age_seconds": int(now_ts - INSTITUTIONAL_NEWS_CACHE.get("last_refresh_ts", now_ts)),
+        }
+
+    tier = candidate.get("tier", "TIER_NONE")
+    block = False
+    penalty = 0
+    if candidate_phase in ("PRE", "EVENT"):
+        if tier == "TIER_1_RED" and NEWS_TIER1_HARD_BLOCK:
+            block = True
+        elif tier == "TIER_2_ORANGE" and NEWS_TIER2_HARD_BLOCK:
+            block = True
+    elif candidate_phase == "POST":
+        if tier == "TIER_1_RED":
+            penalty = NEWS_TIER1_POST_PENALTY
+        elif tier == "TIER_2_ORANGE":
+            penalty = NEWS_TIER2_POST_PENALTY
+
+    if candidate_severity < 1.0:
+        if candidate_severity < 0.5 and block:
+            block = False
+            penalty = max(penalty, NEWS_TIER2_POST_PENALTY)
+
+    diff_sec = candidate.get("ts_utc", 0) - now_ts
+    if diff_sec > 0:
+        minutes_to_event = int(diff_sec / 60)
+        minutes_since_event = None
+    else:
+        minutes_to_event = None
+        minutes_since_event = int(-diff_sec / 60)
+
+    return {
+        "active_event": candidate, "phase": candidate_phase,
+        "tier": tier, "scope": candidate.get("scope", "NONE"),
+        "block_decision": block, "score_penalty": penalty,
+        "minutes_to_event": minutes_to_event,
+        "minutes_since_event": minutes_since_event,
+        "applies_to_symbol": candidate_applies,
+        "severity_modifier": candidate_severity,
+        "source": INSTITUTIONAL_NEWS_CACHE.get("source") or "empty",
+        "cache_age_seconds": int(now_ts - INSTITUTIONAL_NEWS_CACHE.get("last_refresh_ts", now_ts)),
+    }
+# === MONTRA: NEWS_ENGINE_CORE END ===
+
 
 def save_ai_memory():
     if not firebase_ready():
@@ -5090,16 +5495,17 @@ def should_execute_trade(signal):
 
     if not safety_check():
         return False, "SAFETY_BLOCK"
-
-    # [FIX 5] EKSEKUSI NEWS ENGINE
-    # Jika kita berada di jendela 30 menit High Impact News, batalkan semua entry.
-    if is_high_impact_news_window():
-        return False, "HIGH_IMPACT_NEWS_KILLZONE"
-
-    # (Lanjutkan ke pengecekan 4H regime atau score dari revisi sebelumnya)
-    # [FIX 3] 4H Regime Hard Gate per pair.
-    regime_4h = get_regime_tf(symbol, "4h")
-    # ...
+    # [FIX 5] Manual News Gate: Blacklist jam berita berdampak tinggi (Tier-1)
+    now_utc = time.gmtime()
+    hour, minute = now_utc.tm_hour, now_utc.tm_min
+    # Contoh blokade waktu CPI/NFP (sekitar 12:30 - 13:30 UTC / 19:30 - 20:30 WIB)
+    # atau FOMC (sekitar 18:00 - 19:30 UTC / 01:00 - 02:30 WIB)
+    is_news_window = (
+        (hour == 12 and minute >= 15) or (hour == 13 and minute <= 45) or  # NFP/CPI
+        (hour == 18 and minute >= 0) or (hour == 19 and minute <= 30)      # FOMC
+    )
+    if is_news_window and active_news_block():
+        return False, "HIGH_IMPACT_NEWS_WINDOW"
 
     # [FIX 3] 4H Regime Hard Gate per pair. Institusi tidak entry melawan impulse 4H.
     regime_4h = get_regime_tf(symbol, "4h")
@@ -7552,6 +7958,19 @@ def start_background_tasks():
     threading.Thread(target=smart_trailing, daemon=True).start()
     threading.Thread(target=monitor_positions_for_memory_update, daemon=True).start()
     threading.Thread(target=start_bot, daemon=True).start()
+
+    # === MONTRA: NEWS_ENGINE_BACKGROUND_REFRESH START ===
+    if NEWS_ENGINE_ENABLED:
+        def _news_refresh_loop():
+            while True:
+                try:
+                    refresh_institutional_news_cache()
+                except Exception as exc:
+                    print("news refresh loop error:", exc)
+                time.sleep(NEWS_REFRESH_INTERVAL)
+        threading.Thread(target=_news_refresh_loop, daemon=True).start()
+        print("📰 News engine refresh thread started")
+    # === MONTRA: NEWS_ENGINE_BACKGROUND_REFRESH END ===
 
 @app.on_event("startup")
 def on_startup():
