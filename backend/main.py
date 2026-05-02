@@ -213,6 +213,7 @@ NEWS_TIER2_HARD_BLOCK = os.getenv("NEWS_TIER2_HARD_BLOCK", "true").lower() == "t
 NEWS_TIER1_POST_PENALTY = int(os.getenv("NEWS_TIER1_POST_PENALTY", "8"))
 NEWS_TIER2_POST_PENALTY = int(os.getenv("NEWS_TIER2_POST_PENALTY", "4"))
 NEWS_TIER1_TELEGRAM_ALERT = os.getenv("NEWS_TIER1_TELEGRAM_ALERT", "true").lower() == "true"
+NEWS_CACHE_HORIZON_DAYS = int(os.getenv("NEWS_CACHE_HORIZON_DAYS", "14"))
 
 NEWS_TIER1_KEYWORDS = (
     "consumer price index", "core cpi", "cpi y/y", "cpi yoy",
@@ -2657,9 +2658,9 @@ def _fetch_economic_calendar_fmp(api_key=None, timeout=None):
         raise ValueError("fmp_api_key_missing_or_empty_env")
     timeout = timeout or NEWS_FETCH_TIMEOUT
     from_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))
-    to_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 86400))
+    to_dt = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 86400 * 14))
     url = (
-        "https://financialmodelingprep.com/api/v3/economic_calendar"
+        "https://financialmodelingprep.com/stable/economic-calendar"
         f"?from={from_dt}&to={to_dt}&apikey={api_key}"
     )
     try:
@@ -2902,7 +2903,7 @@ def refresh_institutional_news_cache(force=False):
                 continue
 
         cutoff_low = now - 3600
-        cutoff_high = now + 86400
+        cutoff_high = now + (86400 * max(1, NEWS_CACHE_HORIZON_DAYS))
         filtered = [e for e in normalized if cutoff_low <= e["ts_utc"] <= cutoff_high]
         filtered.sort(key=lambda e: e["ts_utc"])
 
