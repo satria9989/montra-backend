@@ -6050,7 +6050,7 @@ def should_execute_trade(signal):
     # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE START ===
     if ANTI_TRAP_MODE in ("enforce", "shadow"):
         try:
-            trap_ohlcv = get_ohlcv_cached(symbol)
+            trap_ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
         except Exception:
             trap_ohlcv = None
         if trap_ohlcv and len(trap_ohlcv) >= 20:
@@ -7098,42 +7098,57 @@ def debug_news_calendar(limit: int = Query(default=20, ge=1, le=200)):
 @app.get("/debug/anti_trap/{symbol}")
 def debug_anti_trap(symbol: str):
     symbol_up = (symbol or "").upper()
-    ohlcv = get_ohlcv_cached(symbol_up)
-    if not ohlcv:
-        return {"error": "no_ohlcv_cached", "symbol": symbol_up}
+    try:
+        ohlcv = fetch_futures_klines_cached(symbol_up, interval="15m", limit=100)
+    except Exception as exc:
+        return {"error": "klines_fetch_error", "symbol": symbol_up, "detail": str(exc)}
+    if not ohlcv or len(ohlcv) < 20:
+        return {"error": "insufficient_ohlcv", "symbol": symbol_up, "candles_received": len(ohlcv) if ohlcv else 0}
 
-    session_map = SESSION_LIQUIDITY_CACHE.get(symbol_up)
-    if not session_map:
-        session_map = compute_session_liquidity_map(symbol_up, ohlcv)
+    try:
+        session_map = SESSION_LIQUIDITY_CACHE.get(symbol_up)
+        if not session_map:
+            session_map = compute_session_liquidity_map(symbol_up, ohlcv)
 
-    last_close = float(ohlcv[-1][4])
-    fake_buy = {
-        "type": "BUY", "symbol": symbol_up, "score": 85,
-        "entry": last_close, "tp": last_close * 1.012, "sl": last_close * 0.995,
-    }
-    fake_sell = {
-        "type": "SELL", "symbol": symbol_up, "score": 85,
-        "entry": last_close, "tp": last_close * 0.988, "sl": last_close * 1.005,
-    }
+        last_close = float(ohlcv[-1][4])
+        fake_buy = {
+            "type": "BUY", "symbol": symbol_up, "score": 85,
+            "entry": last_close, "tp": last_close * 1.012, "sl": last_close * 0.995,
+        }
+        fake_sell = {
+            "type": "SELL", "symbol": symbol_up, "score": 85,
+            "entry": last_close, "tp": last_close * 0.988, "sl": last_close * 1.005,
+        }
 
-    return {
-        "symbol": symbol_up,
-        "mode": ANTI_TRAP_MODE,
-        "gates_enabled": {
-            "eqhl": ANTI_TRAP_EQHL_ENABLED,
-            "wick": ANTI_TRAP_WICK_ENABLED,
-            "session": ANTI_TRAP_SESSION_MAP_ENABLED,
-            "cluster": ANTI_TRAP_CLUSTER_ENABLED,
-        },
-        "session_map": session_map,
-        "eqhl_raw": detect_eqh_eql(ohlcv),
-        "wick_metrics_last": compute_candle_wick_metrics(ohlcv[-1]),
-        "bos_buy": detect_bos(ohlcv, "BUY"),
-        "bos_sell": detect_bos(ohlcv, "SELL"),
-        "clusters_raw": detect_liquidation_clusters(ohlcv),
-        "buy_eval": evaluate_anti_trap_gates(fake_buy, ohlcv, session_map),
-        "sell_eval": evaluate_anti_trap_gates(fake_sell, ohlcv, session_map),
-    }
+        return {
+            "symbol": symbol_up,
+            "mode": ANTI_TRAP_MODE,
+            "candles_received": len(ohlcv),
+            "last_close": last_close,
+            "gates_enabled": {
+                "eqhl": ANTI_TRAP_EQHL_ENABLED,
+                "wick": ANTI_TRAP_WICK_ENABLED,
+                "session": ANTI_TRAP_SESSION_MAP_ENABLED,
+                "cluster": ANTI_TRAP_CLUSTER_ENABLED,
+            },
+            "session_map": session_map,
+            "eqhl_raw": detect_eqh_eql(ohlcv),
+            "wick_metrics_last": compute_candle_wick_metrics(ohlcv[-1]),
+            "bos_buy": detect_bos(ohlcv, "BUY"),
+            "bos_sell": detect_bos(ohlcv, "SELL"),
+            "clusters_raw": detect_liquidation_clusters(ohlcv),
+            "buy_eval": evaluate_anti_trap_gates(fake_buy, ohlcv, session_map),
+            "sell_eval": evaluate_anti_trap_gates(fake_sell, ohlcv, session_map),
+        }
+    except Exception as exc:
+        import traceback
+        return {
+            "error": "anti_trap_evaluation_error",
+            "symbol": symbol_up,
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": traceback.format_exc().splitlines()[-10:],
+        }
 # === MONTRA: ANTI_TRAP_DEBUG_ENDPOINTS END ===
 
 
@@ -7804,7 +7819,7 @@ def auto_trader():
             if ANTI_TRAP_SESSION_MAP_ENABLED:
                 for _trap_sym in PAIRS:
                     try:
-                        _trap_ohlcv = get_ohlcv_cached(_trap_sym)
+                        _trap_ohlcv = fetch_futures_klines_cached(_trap_sym, interval="15m", limit=100)
                         if _trap_ohlcv and len(_trap_ohlcv) >= 20:
                             compute_session_liquidity_map(_trap_sym, _trap_ohlcv)
                     except Exception as _trap_exc:
