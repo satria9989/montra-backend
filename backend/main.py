@@ -6050,7 +6050,7 @@ def should_execute_trade(signal):
     # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE START ===
     if ANTI_TRAP_MODE in ("enforce", "shadow"):
         try:
-            trap_ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=100)
+            trap_ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=50)
         except Exception:
             trap_ohlcv = None
         if trap_ohlcv and len(trap_ohlcv) >= 20:
@@ -7817,13 +7817,21 @@ def auto_trader():
 
             # === MONTRA: ANTI_TRAP_SESSION_REFRESH START ===
             if ANTI_TRAP_SESSION_MAP_ENABLED:
-                for _trap_sym in PAIRS:
-                    try:
-                        _trap_ohlcv = fetch_futures_klines_cached(_trap_sym, interval="15m", limit=100)
-                        if _trap_ohlcv and len(_trap_ohlcv) >= 20:
-                            compute_session_liquidity_map(_trap_sym, _trap_ohlcv)
-                    except Exception as _trap_exc:
-                        print(f"session map refresh error {_trap_sym}: {_trap_exc}")
+                _now = time.time()
+                _last_session_refresh = SESSION_LIQUIDITY_CACHE.get("__last_bulk_refresh__", 0)
+                _session_refresh_interval = ANTI_TRAP_SESSION_TTL_MIN * 60
+                if _now - _last_session_refresh >= _session_refresh_interval:
+                    SESSION_LIQUIDITY_CACHE["__last_bulk_refresh__"] = _now
+                    for _trap_sym in PAIRS:
+                        try:
+                            if SESSION_LIQUIDITY_CACHE.get(_trap_sym) and \
+                               (_now - SESSION_LIQUIDITY_CACHE[_trap_sym].get("ts", 0)) < _session_refresh_interval:
+                                continue
+                            _trap_ohlcv = fetch_futures_klines_cached(_trap_sym, interval="15m", limit=100)
+                            if _trap_ohlcv and len(_trap_ohlcv) >= 20:
+                                compute_session_liquidity_map(_trap_sym, _trap_ohlcv)
+                        except Exception as _trap_exc:
+                            print(f"session map refresh error {_trap_sym}: {_trap_exc}")
             # === MONTRA: ANTI_TRAP_SESSION_REFRESH END ===
 
             regime = get_multi_tf_regime("BTCUSDT")
