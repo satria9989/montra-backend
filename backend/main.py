@@ -6049,10 +6049,14 @@ def should_execute_trade(signal):
 
     # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE START ===
     if ANTI_TRAP_MODE in ("enforce", "shadow"):
-        try:
-            trap_ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=50)
-        except Exception:
-            trap_ohlcv = None
+        # Reuse ohlcv dari signal jika sudah di-attach di scan loop, fallback ke fetch_futures_klines_cached
+        # Ini menghindari double-fetch klines yang sama dalam satu cycle scan
+        trap_ohlcv = signal.get("ohlcv_15m") or signal.get("ohlcv")
+        if not trap_ohlcv:
+            try:
+                trap_ohlcv = fetch_futures_klines_cached(symbol, interval="15m", limit=50)
+            except Exception:
+                trap_ohlcv = None
         if trap_ohlcv and len(trap_ohlcv) >= 20:
             trap_session_map = SESSION_LIQUIDITY_CACHE.get(symbol)
             try:
