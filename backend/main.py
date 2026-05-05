@@ -6062,6 +6062,22 @@ def should_execute_trade(signal):
                 trap_eval = None
             if trap_eval is not None:
                 signal["anti_trap"] = trap_eval
+
+                # Shadow visibility: log trap pattern yang akan ter-block jika enforce
+                if ANTI_TRAP_MODE == "shadow":
+                    eqhl_reason = trap_eval.get("eqhl", {}).get("reason", "OK")
+                    wick_reason = trap_eval.get("wick", {}).get("reason", "OK")
+                    eqhl_allow = trap_eval.get("eqhl", {}).get("allow", True)
+                    wick_allow = trap_eval.get("wick", {}).get("allow", True)
+                    if not eqhl_allow:
+                        print(f"🔍 SHADOW BLOCK [EQHL] {symbol} {signal.get('type')} reason={eqhl_reason} score={signal.get('score')}")
+                    if not wick_allow:
+                        print(f"🔍 SHADOW BLOCK [WICK] {symbol} {signal.get('type')} reason={wick_reason} score={signal.get('score')}")
+                    session_mod = trap_eval.get("session", {}).get("score_modifier", 0)
+                    cluster_bonus = trap_eval.get("cluster", {}).get("bonus", 0)
+                    if session_mod != 0 or cluster_bonus != 0:
+                        print(f"🔍 SHADOW SCORE [{symbol} {signal.get('type')}] session={session_mod:+d} cluster={cluster_bonus:+d}")
+
                 if trap_eval.get("hard_block"):
                     return False, trap_eval.get("block_reason") or "ANTI_TRAP_HARD_BLOCK"
                 trap_modifier = int(trap_eval.get("score_modifier", 0) or 0)
