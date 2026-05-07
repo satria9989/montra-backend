@@ -387,6 +387,7 @@ ACCOUNTS = [
 from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from groq import Groq
 from binance.client import Client
 from binance.enums import *
 
@@ -454,6 +455,96 @@ app.add_middleware(
 
 # 🔥 OPENAI CLIENT
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+
+# === MONTRA: AI_VALIDATOR_DUAL START ===
+# 🔥 GROQ CLIENT (Llama 3.1 8B Instant - free tier 14400 RPD)
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+AI_VALIDATOR_MODE = os.getenv("AI_VALIDATOR_MODE", "cost_optimization").lower()
+
+# Stats counters untuk visibility (in-memory, reset on restart)
+AI_VALIDATOR_STATS = {
+    "groq_success": 0,
+    "groq_fail": 0,
+    "openai_fallback": 0,
+    "openai_fail": 0,
+    "total_calls": 0,
+}
+
+def _call_groq_validator(prompt: str) -> str:
+    """Call Groq Llama 3.1 8B Instant for trade validation. Returns response text or raises exception."""
+    if groq_client is None:
+        raise RuntimeError("groq_client_not_configured")
+    res = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=50,
+        temperature=0.0,
+    )
+    return res.choices[0].message.content.strip()
+
+def _call_openai_validator(prompt: str) -> str:
+    """Call OpenAI gpt-4o-mini for trade validation. Returns response text or raises exception."""
+    if client is None:
+        raise RuntimeError("openai_client_not_configured")
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=50,
+        temperature=0.0,
+    )
+    return res.choices[0].message.content.strip()
+
+def ai_validate_trade(prompt: str) -> dict:
+    """
+    Cost-optimized AI validator: Groq primary, OpenAI fallback.
+    Returns: {"result": str, "source": "groq"|"openai"|"error", "error": str|None}
+    """
+    AI_VALIDATOR_STATS["total_calls"] += 1
+    mode = AI_VALIDATOR_MODE
+
+    if mode == "openai_only":
+        try:
+            result = _call_openai_validator(prompt)
+            return {"result": result, "source": "openai", "error": None}
+        except Exception as e:
+            AI_VALIDATOR_STATS["openai_fail"] += 1
+            return {"result": "NO TRADE\nConfidence: 0%", "source": "error", "error": str(e)}
+
+    if mode == "groq_only":
+        try:
+            result = _call_groq_validator(prompt)
+            AI_VALIDATOR_STATS["groq_success"] += 1
+            return {"result": result, "source": "groq", "error": None}
+        except Exception as e:
+            AI_VALIDATOR_STATS["groq_fail"] += 1
+            return {"result": "NO TRADE\nConfidence: 0%", "source": "error", "error": str(e)}
+
+    # Default mode: cost_optimization (Groq primary, OpenAI fallback)
+    try:
+        result = _call_groq_validator(prompt)
+        AI_VALIDATOR_STATS["groq_success"] += 1
+        print(f"🤖 AI_VALIDATOR groq OK")
+        return {"result": result, "source": "groq", "error": None}
+    except Exception as groq_exc:
+        AI_VALIDATOR_STATS["groq_fail"] += 1
+        groq_err_msg = str(groq_exc)[:120]
+        print(f"⚠️ AI_VALIDATOR groq fail → openai fallback: {groq_err_msg}")
+        try:
+            result = _call_openai_validator(prompt)
+            AI_VALIDATOR_STATS["openai_fallback"] += 1
+            print(f"🤖 AI_VALIDATOR openai OK (fallback)")
+            return {"result": result, "source": "openai", "error": None}
+        except Exception as openai_exc:
+            AI_VALIDATOR_STATS["openai_fail"] += 1
+            openai_err_msg = str(openai_exc)[:120]
+            print(f"❌ AI_VALIDATOR both failed | groq={groq_err_msg} | openai={openai_err_msg}")
+            return {
+                "result": "NO TRADE\nConfidence: 0%",
+                "source": "error",
+                "error": f"groq:{groq_err_msg} | openai:{openai_err_msg}",
+            }
+# === MONTRA: AI_VALIDATOR_DUAL END ===
 
 BINANCE_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "10000"))
 BINANCE_TIME_SYNC_INTERVAL = int(os.getenv("BINANCE_TIME_SYNC_INTERVAL", "900"))
@@ -6498,11 +6589,12 @@ Answer format ONLY:
 VALID or NO TRADE
 Confidence: XX%
 """.strip()
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return {"result": res.choices[0].message.content.strip()}
+        res = ai_validate_trade(prompt)
+        return {
+            "result": res["result"],
+            "ai_source": res["source"],
+            "error": res.get("error"),
+        }
     except Exception as e:
         return {"result": "NO TRADE\nConfidence: 0%", "error": str(e)}
 
@@ -7112,6 +7204,25 @@ def debug_news_calendar(limit: int = Query(default=20, ge=1, le=200)):
         "events": sliced,
     }
 # === MONTRA: NEWS_ENGINE_DEBUG_ENDPOINTS END ===
+
+
+# === MONTRA: AI_VALIDATOR_DEBUG_ENDPOINT START ===
+@app.get("/debug/ai_validator")
+def debug_ai_validator():
+    total = AI_VALIDATOR_STATS["total_calls"]
+    groq_ok = AI_VALIDATOR_STATS["groq_success"]
+    openai_used = AI_VALIDATOR_STATS["openai_fallback"]
+    return {
+        "mode": AI_VALIDATOR_MODE,
+        "groq_model": GROQ_MODEL,
+        "groq_configured": groq_client is not None,
+        "openai_configured": client is not None,
+        "stats": AI_VALIDATOR_STATS,
+        "groq_success_rate": round(groq_ok / total * 100, 2) if total > 0 else None,
+        "openai_fallback_rate": round(openai_used / total * 100, 2) if total > 0 else None,
+        "estimated_openai_cost_usd": round(openai_used * 0.00015, 6),
+    }
+# === MONTRA: AI_VALIDATOR_DEBUG_ENDPOINT END ===
 
 
 # === MONTRA: ANTI_TRAP_DEBUG_ENDPOINTS START ===

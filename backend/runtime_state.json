@@ -1,14 +1,586 @@
 {
   "kill_switch": false,
   "start_equity": 57.13228443,
-  "daily_start_equity": 83.63396589,
-  "last_day": "2026-05-05",
-  "daily_loss": 0,
+  "daily_start_equity": 82.85895115,
+  "last_day": "2026-05-06",
+  "daily_loss": 1.4278,
   "consecutive_loss": 2,
-  "current_risk": 0.013999999999999999,
+  "current_risk": 0.0130438,
   "cooldowns": {},
-  "locked_symbols": [],
-  "trade_snapshots": {},
+  "locked_symbols": [
+    "ADAUSDT",
+    "BNBUSDT"
+  ],
+  "trade_snapshots": {
+    "BNBUSDT": {
+      "opened_at": "2026-05-06 21:09:07",
+      "source": "auto_trader",
+      "signal": {
+        "symbol": "BNBUSDT",
+        "type": "BUY",
+        "entry": 646.28,
+        "sl": 643.08,
+        "tp": 657.45,
+        "score": 94.0,
+        "pair_regime": "BULL",
+        "sweep_high": false,
+        "sweep_low": true,
+        "sweep_memory": {
+          "sweep_high": false,
+          "sweep_low": true,
+          "raw_sweep_high": false,
+          "raw_sweep_low": true,
+          "high": null,
+          "low": {
+            "age_candles": 0,
+            "level": 646.05,
+            "wick_price": 643.92,
+            "close": 646.25,
+            "reclaimed": true,
+            "time": 1778076000000
+          },
+          "lookback": 7,
+          "memory_window": 2,
+          "require_reclaim": true
+        },
+        "rr": 3.49,
+        "structure_grade": "MEDIUM",
+        "pre_score": 100,
+        "fng_value": 46,
+        "fng_classification": "NEUTRAL",
+        "fng_bias": 0,
+        "sl_source": "last_bearish_before_break",
+        "sl_buffer": 0.83552857,
+        "atr": 3.79785714,
+        "tp_source": "rr_target",
+        "entry_text": "646.28",
+        "sl_text": "643.08",
+        "tp_text": "657.45",
+        "price_precision": {
+          "entry": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 646.28,
+            "value": 646.28,
+            "text": "646.28",
+            "tickSize": 0.01,
+            "tick_text": "0.010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 3,
+            "rounding": "HALF_UP",
+            "leg": "ENTRY"
+          },
+          "sl": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 643.08,
+            "value": 643.08,
+            "text": "643.08",
+            "tickSize": 0.01,
+            "tick_text": "0.010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 3,
+            "rounding": "HALF_UP",
+            "leg": "SL"
+          },
+          "tp": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 657.45,
+            "value": 657.45,
+            "text": "657.45",
+            "tickSize": 0.01,
+            "tick_text": "0.010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 3,
+            "rounding": "HALF_UP",
+            "leg": "TP"
+          }
+        },
+        "news_state": {
+          "active_event": null,
+          "phase": "CLEAR",
+          "tier": "TIER_NONE",
+          "scope": "NONE",
+          "block_decision": false,
+          "score_penalty": 0,
+          "minutes_to_event": null,
+          "minutes_since_event": null,
+          "applies_to_symbol": false,
+          "severity_modifier": 0.0,
+          "source": "fmp",
+          "cache_age_seconds": 440
+        },
+        "execution_quality": {
+          "entry": 646.28,
+          "sl": 643.08,
+          "tp": 657.45,
+          "entry_text": "646.28",
+          "sl_text": "643.08",
+          "tp_text": "657.45",
+          "price_precision": {
+            "entry": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 646.28,
+              "value": 646.28,
+              "text": "646.28",
+              "tickSize": 0.01,
+              "tick_text": "0.010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 3,
+              "rounding": "HALF_UP",
+              "leg": "ENTRY"
+            },
+            "sl": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 643.08,
+              "value": 643.08,
+              "text": "643.08",
+              "tickSize": 0.01,
+              "tick_text": "0.010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 3,
+              "rounding": "HALF_UP",
+              "leg": "SL"
+            },
+            "tp": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 657.45,
+              "value": 657.45,
+              "text": "657.45",
+              "tickSize": 0.01,
+              "tick_text": "0.010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 3,
+              "rounding": "HALF_UP",
+              "leg": "TP"
+            }
+          },
+          "min_stop_distance_pct": 0.004,
+          "min_tp_distance_pct": 0.005,
+          "fee_buffer_rr": 0.3,
+          "stop_distance_pct": 0.004951,
+          "tp_distance_pct": 0.017284,
+          "raw_rr": 3.4906,
+          "effective_rr": 3.1906,
+          "spread_pct": null
+        },
+        "spread_gate": {
+          "symbol": "BNBUSDT",
+          "tier": "TOP",
+          "ok": true,
+          "reason": "OK",
+          "best_bid": 646.35,
+          "best_ask": 646.36,
+          "mid": 646.355,
+          "spread_abs": 0.009999999999990905,
+          "spread_pct": 1.547137409007574e-05,
+          "threshold_pct": 0.0008,
+          "warn_pct": 0.00064,
+          "threshold_source": "tier",
+          "cache": "miss",
+          "limit": 5,
+          "ts": 1778076546.6343975
+        },
+        "anti_trap": {
+          "mode": "shadow",
+          "eqhl": {
+            "allow": true,
+            "reason": "OK",
+            "bonus": 0,
+            "detail": {
+              "detail": {
+                "eqh_clusters": [],
+                "eql_clusters": []
+              },
+              "decision": "ALLOW",
+              "reason": "OK",
+              "bonus": 0
+            }
+          },
+          "wick": {
+            "allow": true,
+            "reason": "OK",
+            "bonus": 0,
+            "detail": {
+              "metrics": {
+                "open": 647.91,
+                "high": 647.93,
+                "low": 643.92,
+                "close": 646.25,
+                "body": 1.6599999999999682,
+                "upper_wick": 0.01999999999998181,
+                "lower_wick": 2.330000000000041,
+                "total_range": 4.009999999999991,
+                "upper_wick_ratio": 0.01204819277107361,
+                "lower_wick_ratio": 1.403614457831377,
+                "is_bullish": false,
+                "is_bearish": true
+              },
+              "bos": false,
+              "decision": "ALLOW",
+              "reason": "OK",
+              "bonus": 0
+            }
+          },
+          "session": {
+            "score_modifier": 6,
+            "alignment": "AT_LIQUIDITY",
+            "pool": {
+              "name": "ny_kz_high",
+              "price": 657.64
+            }
+          },
+          "cluster": {
+            "bonus": 0,
+            "aligned": false,
+            "pool": null
+          },
+          "hard_block": false,
+          "block_reason": null,
+          "score_modifier": 0
+        },
+        "risk_slots": {
+          "max_open_trades": 2,
+          "open_count": 1,
+          "reserved_count": 0,
+          "used_slots": 1,
+          "available_slots": 1,
+          "open_symbols": [
+            "TONUSDT"
+          ],
+          "reserved_symbols": [],
+          "reserved_rows": {},
+          "symbol": "BNBUSDT",
+          "force_refresh": true,
+          "ts": 1778076546.7288425
+        }
+      },
+      "score": 94.0,
+      "side": "BUY",
+      "sl": 643.08,
+      "tp": 657.45,
+      "entry": 646.28,
+      "regime": "BULL",
+      "pair_regime": "BULL",
+      "pair_tier": "TOP",
+      "vol": 0.003504128637871762,
+      "news_impact": "NORMAL",
+      "news_reverse": false,
+      "portfolio_weight": 0.04433497536945813,
+      "btc_strength": -0.3741679541197175,
+      "alt_strength": -0.25003858620157504,
+      "fvg_up": true,
+      "fvg_down": true,
+      "sweep_high": false,
+      "sweep_low": true,
+      "sweep_memory": {
+        "sweep_high": false,
+        "sweep_low": true,
+        "raw_sweep_high": false,
+        "raw_sweep_low": true,
+        "high": null,
+        "low": {
+          "age_candles": 0,
+          "level": 646.05,
+          "wick_price": 643.92,
+          "close": 646.25,
+          "reclaimed": true,
+          "time": 1778076000000
+        },
+        "lookback": 7,
+        "memory_window": 2,
+        "require_reclaim": true
+      }
+    },
+    "ADAUSDT": {
+      "opened_at": "2026-05-06 21:22:24",
+      "source": "auto_trader",
+      "signal": {
+        "symbol": "ADAUSDT",
+        "type": "BUY",
+        "entry": 0.2655,
+        "sl": 0.2624,
+        "tp": 0.2764,
+        "score": 96.0,
+        "pair_regime": "BULL",
+        "sweep_high": false,
+        "sweep_low": true,
+        "sweep_memory": {
+          "sweep_high": false,
+          "sweep_low": true,
+          "raw_sweep_high": false,
+          "raw_sweep_low": true,
+          "high": null,
+          "low": {
+            "age_candles": 1,
+            "level": 0.2636,
+            "wick_price": 0.2628,
+            "close": 0.2648,
+            "reclaimed": true,
+            "time": 1778076000000
+          },
+          "lookback": 7,
+          "memory_window": 2,
+          "require_reclaim": true
+        },
+        "rr": 3.52,
+        "structure_grade": "MEDIUM",
+        "pre_score": 100,
+        "fng_value": 46,
+        "fng_classification": "NEUTRAL",
+        "fng_bias": 0,
+        "sl_source": "last_bearish_before_break",
+        "sl_buffer": 0.00041957,
+        "atr": 0.00190714,
+        "tp_source": "rr_target",
+        "entry_text": "0.2655",
+        "sl_text": "0.2624",
+        "tp_text": "0.2764",
+        "price_precision": {
+          "entry": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.2655,
+            "value": 0.2655,
+            "text": "0.2655",
+            "tickSize": 0.0001,
+            "tick_text": "0.00010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 5,
+            "rounding": "HALF_UP",
+            "leg": "ENTRY"
+          },
+          "sl": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.2624,
+            "value": 0.2624,
+            "text": "0.2624",
+            "tickSize": 0.0001,
+            "tick_text": "0.00010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 5,
+            "rounding": "HALF_UP",
+            "leg": "SL"
+          },
+          "tp": {
+            "ok": true,
+            "reason": "OK",
+            "raw": 0.2764,
+            "value": 0.2764,
+            "text": "0.2764",
+            "tickSize": 0.0001,
+            "tick_text": "0.00010",
+            "tick_source": "exchange_tickSize+pricePrecision_checked",
+            "pricePrecision": 5,
+            "rounding": "HALF_UP",
+            "leg": "TP"
+          }
+        },
+        "news_state": {
+          "active_event": null,
+          "phase": "CLEAR",
+          "tier": "TIER_NONE",
+          "scope": "NONE",
+          "block_decision": false,
+          "score_penalty": 0,
+          "minutes_to_event": null,
+          "minutes_since_event": null,
+          "applies_to_symbol": false,
+          "severity_modifier": 0.0,
+          "source": "fmp",
+          "cache_age_seconds": 1237
+        },
+        "execution_quality": {
+          "entry": 0.2655,
+          "sl": 0.2624,
+          "tp": 0.2764,
+          "entry_text": "0.2655",
+          "sl_text": "0.2624",
+          "tp_text": "0.2764",
+          "price_precision": {
+            "entry": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.2655,
+              "value": 0.2655,
+              "text": "0.2655",
+              "tickSize": 0.0001,
+              "tick_text": "0.00010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "ENTRY"
+            },
+            "sl": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.2624,
+              "value": 0.2624,
+              "text": "0.2624",
+              "tickSize": 0.0001,
+              "tick_text": "0.00010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "SL"
+            },
+            "tp": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 0.2764,
+              "value": 0.2764,
+              "text": "0.2764",
+              "tickSize": 0.0001,
+              "tick_text": "0.00010",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "TP"
+            }
+          },
+          "min_stop_distance_pct": 0.004,
+          "min_tp_distance_pct": 0.005,
+          "fee_buffer_rr": 0.3,
+          "stop_distance_pct": 0.011676,
+          "tp_distance_pct": 0.041055,
+          "raw_rr": 3.5161,
+          "effective_rr": 3.2161,
+          "spread_pct": null
+        },
+        "spread_gate": {
+          "symbol": "ADAUSDT",
+          "tier": "MID",
+          "ok": true,
+          "reason": "OK",
+          "best_bid": 0.2653,
+          "best_ask": 0.2654,
+          "mid": 0.26535,
+          "spread_abs": 0.0001000000000000445,
+          "spread_pct": 0.0003768607499530601,
+          "threshold_pct": 0.0012,
+          "warn_pct": 0.0009599999999999999,
+          "threshold_source": "tier",
+          "cache": "miss",
+          "limit": 5,
+          "ts": 1778077343.6144361
+        },
+        "anti_trap": {
+          "mode": "shadow",
+          "eqhl": {
+            "allow": true,
+            "reason": "OK",
+            "bonus": 0,
+            "detail": {
+              "detail": {
+                "eqh_clusters": [],
+                "eql_clusters": []
+              },
+              "decision": "ALLOW",
+              "reason": "OK",
+              "bonus": 0
+            }
+          },
+          "wick": {
+            "allow": true,
+            "reason": "OK",
+            "bonus": 0,
+            "detail": {
+              "metrics": {
+                "open": 0.2649,
+                "high": 0.2656,
+                "low": 0.2643,
+                "close": 0.2656,
+                "body": 0.0006999999999999784,
+                "upper_wick": 0.0,
+                "lower_wick": 0.0006000000000000449,
+                "total_range": 0.0013000000000000234,
+                "upper_wick_ratio": 0.0,
+                "lower_wick_ratio": 0.8571428571429478,
+                "is_bullish": true,
+                "is_bearish": false
+              },
+              "bos": false,
+              "decision": "ALLOW",
+              "reason": "OK",
+              "bonus": 0
+            }
+          },
+          "session": {
+            "score_modifier": -5,
+            "alignment": "OVERSHOOT_LIQUIDITY",
+            "pool": {
+              "name": "prev_day_high",
+              "price": 0.2657
+            }
+          },
+          "cluster": {
+            "bonus": 0,
+            "aligned": false,
+            "pool": null
+          },
+          "hard_block": false,
+          "block_reason": null,
+          "score_modifier": 0
+        },
+        "risk_slots": {
+          "max_open_trades": 2,
+          "open_count": 1,
+          "reserved_count": 0,
+          "used_slots": 1,
+          "available_slots": 1,
+          "open_symbols": [
+            "BNBUSDT"
+          ],
+          "reserved_symbols": [],
+          "reserved_rows": {},
+          "symbol": "ADAUSDT",
+          "force_refresh": true,
+          "ts": 1778077343.7122421
+        }
+      },
+      "score": 96.0,
+      "side": "BUY",
+      "sl": 0.2624,
+      "tp": 0.2764,
+      "entry": 0.2655,
+      "regime": "BULL",
+      "pair_regime": "BULL",
+      "pair_tier": "MID",
+      "vol": 0.003545550333557429,
+      "news_impact": "NORMAL",
+      "news_reverse": false,
+      "portfolio_weight": 0.043478260869565216,
+      "btc_strength": -0.15571953820765197,
+      "alt_strength": 0.15088645794040417,
+      "fvg_up": false,
+      "fvg_down": true,
+      "sweep_high": false,
+      "sweep_low": true,
+      "sweep_memory": {
+        "sweep_high": false,
+        "sweep_low": true,
+        "raw_sweep_high": false,
+        "raw_sweep_low": true,
+        "high": null,
+        "low": {
+          "age_candles": 1,
+          "level": 0.2636,
+          "wick_price": 0.2628,
+          "close": 0.2648,
+          "reclaimed": true,
+          "time": 1778076000000
+        },
+        "lookback": 7,
+        "memory_window": 2,
+        "require_reclaim": true
+      }
+    }
+  },
   "trade_replay_log": [
     {
       "symbol": "AVAXUSDT",
@@ -4637,6 +5209,680 @@
           "inferred_close_source": "MARKET_REDUCE_CLOSE"
         }
       }
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "opened_at": "2026-05-06 16:34:20",
+      "closed_at": "2026-05-06 16:34:28",
+      "snapshot": {
+        "opened_at": "2026-05-06 16:34:20",
+        "source": "auto_trader",
+        "signal": {
+          "symbol": "HYPEUSDT",
+          "type": "BUY",
+          "entry": 43.963,
+          "sl": 43.612,
+          "tp": 45.193,
+          "score": 92.0,
+          "pair_regime": "BULL",
+          "sweep_high": false,
+          "sweep_low": true,
+          "sweep_memory": {
+            "sweep_high": false,
+            "sweep_low": true,
+            "raw_sweep_high": false,
+            "raw_sweep_low": true,
+            "high": null,
+            "low": {
+              "age_candles": 1,
+              "level": 43.859,
+              "wick_price": 43.663,
+              "close": 43.867,
+              "reclaimed": true,
+              "time": 1778058900000
+            },
+            "lookback": 7,
+            "memory_window": 2,
+            "require_reclaim": true
+          },
+          "rr": 3.5,
+          "structure_grade": "MEDIUM",
+          "pre_score": 100,
+          "fng_value": 46,
+          "fng_classification": "NEUTRAL",
+          "fng_bias": 0,
+          "sl_source": "last_bearish_before_break",
+          "sl_buffer": 0.05088286,
+          "atr": 0.23128571,
+          "tp_source": "rr_target",
+          "entry_text": "43.963",
+          "sl_text": "43.612",
+          "tp_text": "45.193",
+          "price_precision": {
+            "entry": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 43.963,
+              "value": 43.963,
+              "text": "43.963",
+              "tickSize": 0.001,
+              "tick_text": "0.00100",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "ENTRY"
+            },
+            "sl": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 43.612,
+              "value": 43.612,
+              "text": "43.612",
+              "tickSize": 0.001,
+              "tick_text": "0.00100",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "SL"
+            },
+            "tp": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 45.193,
+              "value": 45.193,
+              "text": "45.193",
+              "tickSize": 0.001,
+              "tick_text": "0.00100",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 5,
+              "rounding": "HALF_UP",
+              "leg": "TP"
+            }
+          },
+          "news_state": {
+            "active_event": null,
+            "phase": "CLEAR",
+            "tier": "TIER_NONE",
+            "scope": "NONE",
+            "block_decision": false,
+            "score_penalty": 0,
+            "minutes_to_event": null,
+            "minutes_since_event": null,
+            "applies_to_symbol": false,
+            "severity_modifier": 0.0,
+            "source": "fmp",
+            "cache_age_seconds": 1269
+          },
+          "execution_quality": {
+            "entry": 43.963,
+            "sl": 43.612,
+            "tp": 45.193,
+            "entry_text": "43.963",
+            "sl_text": "43.612",
+            "tp_text": "45.193",
+            "price_precision": {
+              "entry": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 43.963,
+                "value": 43.963,
+                "text": "43.963",
+                "tickSize": 0.001,
+                "tick_text": "0.00100",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 5,
+                "rounding": "HALF_UP",
+                "leg": "ENTRY"
+              },
+              "sl": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 43.612,
+                "value": 43.612,
+                "text": "43.612",
+                "tickSize": 0.001,
+                "tick_text": "0.00100",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 5,
+                "rounding": "HALF_UP",
+                "leg": "SL"
+              },
+              "tp": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 45.193,
+                "value": 45.193,
+                "text": "45.193",
+                "tickSize": 0.001,
+                "tick_text": "0.00100",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 5,
+                "rounding": "HALF_UP",
+                "leg": "TP"
+              }
+            },
+            "min_stop_distance_pct": 0.004,
+            "min_tp_distance_pct": 0.005,
+            "fee_buffer_rr": 0.3,
+            "stop_distance_pct": 0.007984,
+            "tp_distance_pct": 0.027978,
+            "raw_rr": 3.5043,
+            "effective_rr": 3.2043,
+            "spread_pct": null
+          },
+          "spread_gate": {
+            "symbol": "HYPEUSDT",
+            "tier": "MID_AGGRESSIVE",
+            "ok": true,
+            "reason": "OK",
+            "best_bid": 43.938,
+            "best_ask": 43.939,
+            "mid": 43.938500000000005,
+            "spread_abs": 0.0009999999999976694,
+            "spread_pct": 2.2759083719236418e-05,
+            "threshold_pct": 0.0018,
+            "warn_pct": 0.00144,
+            "threshold_source": "pair_override",
+            "cache": "miss",
+            "limit": 5,
+            "ts": 1778060059.7606928
+          },
+          "anti_trap": {
+            "mode": "shadow",
+            "eqhl": {
+              "allow": true,
+              "reason": "OK",
+              "bonus": 0,
+              "detail": {
+                "detail": {
+                  "eqh_clusters": [],
+                  "eql_clusters": []
+                },
+                "decision": "ALLOW",
+                "reason": "OK",
+                "bonus": 0
+              }
+            },
+            "wick": {
+              "allow": true,
+              "reason": "OK",
+              "bonus": 0,
+              "detail": {
+                "metrics": {
+                  "open": 43.867,
+                  "high": 43.98,
+                  "low": 43.805,
+                  "close": 43.96,
+                  "body": 0.09300000000000352,
+                  "upper_wick": 0.01999999999999602,
+                  "lower_wick": 0.06199999999999761,
+                  "total_range": 0.17499999999999716,
+                  "upper_wick_ratio": 0.2150537634408093,
+                  "lower_wick_ratio": 0.6666666666666158,
+                  "is_bullish": true,
+                  "is_bearish": false
+                },
+                "bos": false,
+                "decision": "ALLOW",
+                "reason": "OK",
+                "bonus": 0
+              }
+            },
+            "session": {
+              "score_modifier": -5,
+              "alignment": "OVERSHOOT_LIQUIDITY",
+              "pool": {
+                "name": "asia_high",
+                "price": 44.43
+              }
+            },
+            "cluster": {
+              "bonus": 0,
+              "aligned": false,
+              "pool": null
+            },
+            "hard_block": false,
+            "block_reason": null,
+            "score_modifier": 0
+          },
+          "risk_slots": {
+            "max_open_trades": 2,
+            "open_count": 1,
+            "reserved_count": 0,
+            "used_slots": 1,
+            "available_slots": 1,
+            "open_symbols": [
+              "BTCUSDT"
+            ],
+            "reserved_symbols": [],
+            "reserved_rows": {},
+            "symbol": "HYPEUSDT",
+            "force_refresh": true,
+            "ts": 1778060059.8547974
+          }
+        },
+        "score": 92.0,
+        "side": "BUY",
+        "sl": 43.612,
+        "tp": 45.193,
+        "entry": 43.963,
+        "regime": "BULL",
+        "pair_regime": "BULL",
+        "pair_tier": "MID_AGGRESSIVE",
+        "vol": 0.002340195453690399,
+        "news_impact": "NORMAL",
+        "news_reverse": false,
+        "portfolio_weight": 0.052825552825552825,
+        "btc_strength": 0.0234421930171532,
+        "alt_strength": -0.8551829956225412,
+        "fvg_up": false,
+        "fvg_down": true,
+        "sweep_high": false,
+        "sweep_low": true,
+        "sweep_memory": {
+          "sweep_high": false,
+          "sweep_low": true,
+          "raw_sweep_high": false,
+          "raw_sweep_low": true,
+          "high": null,
+          "low": {
+            "age_candles": 1,
+            "level": 43.859,
+            "wick_price": 43.663,
+            "close": 43.867,
+            "reclaimed": true,
+            "time": 1778058900000
+          },
+          "lookback": 7,
+          "memory_window": 2,
+          "require_reclaim": true
+        }
+      },
+      "close_info": {
+        "result": "UNKNOWN",
+        "pnl": 0.0,
+        "regime": "BULL",
+        "vol": 0.002340195453690399,
+        "entry_score": 92.0,
+        "note": "snapshot_missing_from_exchange",
+        "close_audit": {
+          "symbol": "HYPEUSDT",
+          "side": "BUY",
+          "expected_close_side": "SELL",
+          "opened_ms": 1778060060000,
+          "start_ms": 1778060060000,
+          "lookback_minutes": 60,
+          "last_state": {},
+          "snapshot_entry": 43.963,
+          "snapshot_sl": 43.612,
+          "snapshot_tp": 45.193,
+          "recent_trade_count": 1,
+          "close_trade_count": 0,
+          "close_order_ids": [],
+          "close_trades": [],
+          "realized_pnl_from_close_rows": 0,
+          "matching_orders": [],
+          "matching_order_count": 0,
+          "inferred_close_source": "NO_RECENT_CLOSE_TRADE_FOUND"
+        }
+      }
+    },
+    {
+      "symbol": "TONUSDT",
+      "opened_at": "2026-05-06 21:05:45",
+      "closed_at": "2026-05-06 21:10:09",
+      "snapshot": {
+        "opened_at": "2026-05-06 21:05:45",
+        "source": "auto_trader",
+        "signal": {
+          "symbol": "TONUSDT",
+          "type": "BUY",
+          "entry": 2.311,
+          "sl": 2.2436,
+          "tp": 2.5469,
+          "score": 94.0,
+          "pair_regime": "BULL",
+          "sweep_high": false,
+          "sweep_low": true,
+          "sweep_memory": {
+            "sweep_high": false,
+            "sweep_low": true,
+            "raw_sweep_high": false,
+            "raw_sweep_low": true,
+            "high": null,
+            "low": {
+              "age_candles": 0,
+              "level": 2.3013,
+              "wick_price": 2.3,
+              "close": 2.3122,
+              "reclaimed": true,
+              "time": 1778076000000
+            },
+            "lookback": 7,
+            "memory_window": 2,
+            "require_reclaim": true
+          },
+          "rr": 3.5,
+          "structure_grade": "MEDIUM",
+          "pre_score": 100,
+          "fng_value": 46,
+          "fng_classification": "NEUTRAL",
+          "fng_bias": 0,
+          "sl_source": "last_bearish_before_break",
+          "sl_buffer": 0.01861043,
+          "atr": 0.08459286,
+          "tp_source": "rr_target",
+          "entry_text": "2.3110",
+          "sl_text": "2.2436",
+          "tp_text": "2.5469",
+          "price_precision": {
+            "entry": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 2.311,
+              "value": 2.311,
+              "text": "2.3110",
+              "tickSize": 0.0001,
+              "tick_text": "0.0001000",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 7,
+              "rounding": "HALF_UP",
+              "leg": "ENTRY"
+            },
+            "sl": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 2.2436,
+              "value": 2.2436,
+              "text": "2.2436",
+              "tickSize": 0.0001,
+              "tick_text": "0.0001000",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 7,
+              "rounding": "HALF_UP",
+              "leg": "SL"
+            },
+            "tp": {
+              "ok": true,
+              "reason": "OK",
+              "raw": 2.5469,
+              "value": 2.5469,
+              "text": "2.5469",
+              "tickSize": 0.0001,
+              "tick_text": "0.0001000",
+              "tick_source": "exchange_tickSize+pricePrecision_checked",
+              "pricePrecision": 7,
+              "rounding": "HALF_UP",
+              "leg": "TP"
+            }
+          },
+          "news_state": {
+            "active_event": null,
+            "phase": "CLEAR",
+            "tier": "TIER_NONE",
+            "scope": "NONE",
+            "block_decision": false,
+            "score_penalty": 0,
+            "minutes_to_event": null,
+            "minutes_since_event": null,
+            "applies_to_symbol": false,
+            "severity_modifier": 0.0,
+            "source": "fmp",
+            "cache_age_seconds": 238
+          },
+          "execution_quality": {
+            "entry": 2.311,
+            "sl": 2.2436,
+            "tp": 2.5469,
+            "entry_text": "2.3110",
+            "sl_text": "2.2436",
+            "tp_text": "2.5469",
+            "price_precision": {
+              "entry": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 2.311,
+                "value": 2.311,
+                "text": "2.3110",
+                "tickSize": 0.0001,
+                "tick_text": "0.0001000",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 7,
+                "rounding": "HALF_UP",
+                "leg": "ENTRY"
+              },
+              "sl": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 2.2436,
+                "value": 2.2436,
+                "text": "2.2436",
+                "tickSize": 0.0001,
+                "tick_text": "0.0001000",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 7,
+                "rounding": "HALF_UP",
+                "leg": "SL"
+              },
+              "tp": {
+                "ok": true,
+                "reason": "OK",
+                "raw": 2.5469,
+                "value": 2.5469,
+                "text": "2.5469",
+                "tickSize": 0.0001,
+                "tick_text": "0.0001000",
+                "tick_source": "exchange_tickSize+pricePrecision_checked",
+                "pricePrecision": 7,
+                "rounding": "HALF_UP",
+                "leg": "TP"
+              }
+            },
+            "min_stop_distance_pct": 0.004,
+            "min_tp_distance_pct": 0.005,
+            "fee_buffer_rr": 0.3,
+            "stop_distance_pct": 0.029165,
+            "tp_distance_pct": 0.102077,
+            "raw_rr": 3.5,
+            "effective_rr": 3.2,
+            "spread_pct": null
+          },
+          "spread_gate": {
+            "symbol": "TONUSDT",
+            "tier": "MID",
+            "ok": true,
+            "reason": "OK",
+            "best_bid": 2.307,
+            "best_ask": 2.3071,
+            "mid": 2.3070500000000003,
+            "spread_abs": 0.00010000000000021103,
+            "spread_pct": 4.33453978024798e-05,
+            "threshold_pct": 0.0012,
+            "warn_pct": 0.0009599999999999999,
+            "threshold_source": "tier",
+            "cache": "miss",
+            "limit": 5,
+            "ts": 1778076344.669423
+          },
+          "anti_trap": {
+            "mode": "shadow",
+            "eqhl": {
+              "allow": true,
+              "reason": "OK",
+              "bonus": 0,
+              "detail": {
+                "detail": {
+                  "eqh_clusters": [],
+                  "eql_clusters": []
+                },
+                "decision": "ALLOW",
+                "reason": "OK",
+                "bonus": 0
+              }
+            },
+            "wick": {
+              "allow": true,
+              "reason": "OK",
+              "bonus": 0,
+              "detail": {
+                "metrics": {
+                  "open": 2.3719,
+                  "high": 2.3894,
+                  "low": 2.3,
+                  "close": 2.3137,
+                  "body": 0.05820000000000025,
+                  "upper_wick": 0.01750000000000007,
+                  "lower_wick": 0.013700000000000045,
+                  "total_range": 0.08940000000000037,
+                  "upper_wick_ratio": 0.30068728522336763,
+                  "lower_wick_ratio": 0.2353951890034362,
+                  "is_bullish": false,
+                  "is_bearish": true
+                },
+                "bos": false,
+                "decision": "ALLOW",
+                "reason": "OK",
+                "bonus": 0
+              }
+            },
+            "session": {
+              "score_modifier": -5,
+              "alignment": "OVERSHOOT_LIQUIDITY",
+              "pool": {
+                "name": "ny_kz_high",
+                "price": 2.4941
+              }
+            },
+            "cluster": {
+              "bonus": 0,
+              "aligned": false,
+              "pool": null
+            },
+            "hard_block": false,
+            "block_reason": null,
+            "score_modifier": 0
+          },
+          "risk_slots": {
+            "max_open_trades": 2,
+            "open_count": 0,
+            "reserved_count": 0,
+            "used_slots": 0,
+            "available_slots": 2,
+            "open_symbols": [],
+            "reserved_symbols": [],
+            "reserved_rows": {},
+            "symbol": "TONUSDT",
+            "force_refresh": true,
+            "ts": 1778076344.7640135
+          }
+        },
+        "score": 94.0,
+        "side": "BUY",
+        "sl": 2.2436,
+        "tp": 2.5469,
+        "entry": 2.311,
+        "regime": "BULL",
+        "pair_regime": "BULL",
+        "pair_tier": "MID",
+        "vol": 0.0033734098628665173,
+        "news_impact": "NORMAL",
+        "news_reverse": false,
+        "portfolio_weight": 0.059113300492610835,
+        "btc_strength": -0.3774759222799078,
+        "alt_strength": -2.7953453073614987,
+        "fvg_up": true,
+        "fvg_down": true,
+        "sweep_high": false,
+        "sweep_low": true,
+        "sweep_memory": {
+          "sweep_high": false,
+          "sweep_low": true,
+          "raw_sweep_high": false,
+          "raw_sweep_low": true,
+          "high": null,
+          "low": {
+            "age_candles": 0,
+            "level": 2.3013,
+            "wick_price": 2.3,
+            "close": 2.3122,
+            "reclaimed": true,
+            "time": 1778076000000
+          },
+          "lookback": 7,
+          "memory_window": 2,
+          "require_reclaim": true
+        }
+      },
+      "close_info": {
+        "result": "LOSS",
+        "pnl": -1.3888,
+        "regime": "BULL",
+        "vol": 0.003504128637871762,
+        "entry_score": 94.0,
+        "close_audit": {
+          "symbol": "TONUSDT",
+          "side": "BUY",
+          "expected_close_side": "SELL",
+          "opened_ms": 1778076345000,
+          "start_ms": 1778076345000,
+          "lookback_minutes": 60,
+          "last_state": {
+            "side": "BUY",
+            "size": 21.7,
+            "entry": 2.3062,
+            "unrealized": -0.43545173,
+            "leverage": 0.0
+          },
+          "snapshot_entry": 2.311,
+          "snapshot_sl": 2.2436,
+          "snapshot_tp": 2.5469,
+          "recent_trade_count": 3,
+          "close_trade_count": 1,
+          "close_order_ids": [
+            8567814868
+          ],
+          "close_trades": [
+            {
+              "time": 1778076572079,
+              "side": "SELL",
+              "price": 2.2422,
+              "qty": 21.7,
+              "quoteQty": 48.65574,
+              "realizedPnl": -1.3888,
+              "commission": 0.02432787,
+              "commissionAsset": "USDT",
+              "orderId": 8567814868,
+              "buyer": false,
+              "maker": false,
+              "positionSide": "BOTH"
+            }
+          ],
+          "realized_pnl_from_close_rows": -1.3888,
+          "matching_orders": [
+            {
+              "orderId": 8567814868,
+              "clientOrderId": "x-Cb7ytekJcb33820e221c0119cdd465",
+              "symbol": "TONUSDT",
+              "side": "SELL",
+              "type": "MARKET",
+              "origType": "MARKET",
+              "status": "FILLED",
+              "price": "0",
+              "avgPrice": "2.24220000",
+              "stopPrice": "0",
+              "origQty": "21.7",
+              "executedQty": "21.7",
+              "reduceOnly": true,
+              "closePosition": true,
+              "updateTime": 1778076572079,
+              "time": 1778076572079,
+              "workingType": "MARK_PRICE"
+            }
+          ],
+          "matching_order_count": 1,
+          "inferred_close_source": "MARKET_REDUCE_CLOSE"
+        }
+      }
     }
   ],
   "trade_history": [
@@ -4783,34 +6029,87 @@
       "vol": 0.0025795639130944377,
       "score": 92.0,
       "note": null
+    },
+    {
+      "symbol": "LTCUSDT",
+      "result": "WIN",
+      "pnl": 0.8869900000000001,
+      "regime": "BULL",
+      "vol": 0.002099602400350725,
+      "score": 50,
+      "note": null
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "result": "WIN",
+      "pnl": 0.16013999999999998,
+      "regime": "BULL",
+      "vol": 0.0032868623240774005,
+      "score": 50,
+      "note": null
+    },
+    {
+      "symbol": "BTCUSDT",
+      "result": "LOSS",
+      "pnl": -0.039,
+      "regime": "BULL",
+      "vol": 0.0032711070462555156,
+      "score": 50,
+      "note": null
+    },
+    {
+      "symbol": "TONUSDT",
+      "result": "LOSS",
+      "pnl": -1.3888,
+      "regime": "BULL",
+      "vol": 0.003504128637871762,
+      "score": 94.0,
+      "note": null
     }
   ],
-  "last_position_state": {},
+  "last_position_state": {
+    "ADAUSDT": {
+      "side": "BUY",
+      "size": 189.0,
+      "entry": 0.2655,
+      "unrealized": 0.3987333,
+      "leverage": 0.0
+    },
+    "BNBUSDT": {
+      "side": "BUY",
+      "size": 0.1,
+      "entry": 646.42,
+      "unrealized": 0.37290137,
+      "leverage": 0.0
+    }
+  },
   "position_entry_score": {
     "TRXUSDT": 67,
-    "DOGEUSDT": 94.0
+    "DOGEUSDT": 94.0,
+    "BNBUSDT": 94.0,
+    "ADAUSDT": 96.0
   },
   "portfolio_alloc": {
-    "BTCUSDT": 0.0599250936329588,
-    "ETHUSDT": 0.05118601747815231,
-    "SOLUSDT": 0.05368289637952559,
-    "BNBUSDT": 0.0449438202247191,
-    "XRPUSDT": 0.05368289637952559,
-    "DOGEUSDT": 0.03620474406991261,
-    "LINKUSDT": 0.04369538077403246,
-    "AVAXUSDT": 0.04369538077403246,
-    "NEARUSDT": 0.04369538077403246,
-    "ARBUSDT": 0.0449438202247191,
-    "AAVEUSDT": 0.05368289637952559,
-    "ADAUSDT": 0.04369538077403246,
-    "LTCUSDT": 0.04369538077403246,
-    "TRXUSDT": 0.04369538077403246,
-    "TONUSDT": 0.0686641697877653,
-    "WLDUSDT": 0.0686641697877653,
-    "HYPEUSDT": 0.05368289637952559,
-    "SUIUSDT": 0.04369538077403246,
-    "WIFUSDT": 0.05368289637952559,
-    "1000PEPEUSDT": 0.05118601747815231
+    "BTCUSDT": 0.05093167701863354,
+    "ETHUSDT": 0.05093167701863354,
+    "SOLUSDT": 0.05341614906832298,
+    "BNBUSDT": 0.04472049689440994,
+    "XRPUSDT": 0.05341614906832298,
+    "DOGEUSDT": 0.03602484472049689,
+    "LINKUSDT": 0.043478260869565216,
+    "AVAXUSDT": 0.043478260869565216,
+    "NEARUSDT": 0.043478260869565216,
+    "ARBUSDT": 0.04472049689440994,
+    "AAVEUSDT": 0.05341614906832298,
+    "ADAUSDT": 0.043478260869565216,
+    "LTCUSDT": 0.06832298136645963,
+    "TRXUSDT": 0.043478260869565216,
+    "TONUSDT": 0.05093167701863354,
+    "WLDUSDT": 0.06832298136645963,
+    "HYPEUSDT": 0.05962732919254658,
+    "SUIUSDT": 0.043478260869565216,
+    "WIFUSDT": 0.05341614906832298,
+    "1000PEPEUSDT": 0.05093167701863354
   },
-  "updated_at": "2026-05-05 19:42:06"
+  "updated_at": "2026-05-06 23:17:05"
 }
