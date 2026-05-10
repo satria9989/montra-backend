@@ -2783,6 +2783,135 @@ def _fetch_economic_calendar_tradingeconomics(timeout=None):
     raise ValueError("tradingeconomics_guest_endpoint_deprecated_410_gone")
 
 
+# === MONTRA: NEWS_PROVIDER_FOREXFACTORY START ===
+def _fetch_economic_calendar_forexfactory(timeout=None):
+    """Fetch dari ForexFactory weekly JSON. Free, no API key.
+    Rate limit 2 download per 5 menit per IP - cache wajib di caller."""
+    timeout = timeout or NEWS_FETCH_TIMEOUT
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MONTRA-bot/1.0)"}
+    try:
+        resp = requests.get(url, timeout=timeout, headers=headers)
+    except Exception as exc:
+        raise ValueError(f"forexfactory_network_error: {exc}")
+    if resp.status_code != 200:
+        body_snippet = (resp.text or "")[:300].replace("\n", " ")
+        if resp.status_code == 429 or "Request Denied" in (resp.text or ""):
+            raise ValueError(f"forexfactory_rate_limit_2per5min: {body_snippet}")
+        raise ValueError(f"forexfactory_http_{resp.status_code}: {body_snippet}")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        body_snippet = (resp.text or "")[:300].replace("\n", " ")
+        raise ValueError(f"forexfactory_json_decode_error: {exc} body={body_snippet}")
+    if not isinstance(data, list):
+        raise ValueError(f"forexfactory_unexpected_response_type: {type(data).__name__}")
+
+    # Normalize ke schema FMP-compatible: title, country, date, impact, forecast, previous
+    normalized = []
+    for ev in data:
+        if not isinstance(ev, dict):
+            continue
+        try:
+            title = str(ev.get("title") or ev.get("event") or "").strip()
+            country = str(ev.get("country") or "").strip().upper()
+            date_str = ev.get("date") or ev.get("datetime") or ""
+            impact_raw = str(ev.get("impact") or "").strip()
+            if not title or not country or not date_str:
+                continue
+            # ForexFactory impact: "High" / "Medium" / "Low" / "Holiday"
+            if impact_raw.lower() == "holiday":
+                continue
+            impact_map = {"high": "High", "medium": "Medium", "low": "Low"}
+            impact_norm = impact_map.get(impact_raw.lower(), "Low")
+            normalized.append({
+                "event": title,
+                "country": country,
+                "date": date_str,
+                "impact": impact_norm,
+                "currency": ev.get("currency") or "",
+                "forecast": ev.get("forecast"),
+                "previous": ev.get("previous"),
+                "actual": ev.get("actual"),
+                "_provider": "forexfactory",
+            })
+        except Exception:
+            continue
+    return normalized
+# === MONTRA: NEWS_PROVIDER_FOREXFACTORY END ===
+
+
+# === MONTRA: NEWS_PROVIDER_FRED START ===
+# US release IDs critical untuk crypto trading bot - hardcoded berdasarkan riset
+# Source: https://fred.stlouisfed.org/docs/api/fred/release.html
+FRED_RELEASE_IDS = {
+    10: ("Employment Situation (NFP)", "USD", "High"),
+    11: ("Consumer Price Index (CPI)", "USD", "High"),
+    151: ("Producer Price Index (PPI)", "USD", "High"),
+    53: ("Gross Domestic Product (GDP)", "USD", "High"),
+    175: ("Retail Sales", "USD", "High"),
+    21: ("Personal Income & Outlays (PCE)", "USD", "High"),
+    14: ("Industrial Production", "USD", "Medium"),
+    229: ("Consumer Confidence", "USD", "Medium"),
+    82: ("ISM Manufacturing PMI", "USD", "Medium"),
+    101: ("Federal Open Market Committee (FOMC)", "USD", "High"),
+}
+
+
+def _fetch_economic_calendar_fred(api_key=None, timeout=None):
+    """Fetch jadwal release ekonomi US dari FRED. Free dengan API key.
+    Coverage: CPI, NFP, PPI, GDP, Retail Sales, PCE, FOMC, dll."""
+    if not api_key:
+        raise ValueError("fred_api_key_missing_or_empty_env")
+    timeout = timeout or NEWS_FETCH_TIMEOUT
+    realtime_start = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))
+    realtime_end = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 86400 * 14))
+
+    normalized = []
+    failed_releases = []
+    for release_id, (event_name, currency, impact) in FRED_RELEASE_IDS.items():
+        url = (
+            f"https://api.stlouisfed.org/fred/release/dates"
+            f"?release_id={release_id}"
+            f"&api_key={api_key}&file_type=json"
+            f"&realtime_start={realtime_start}"
+            f"&realtime_end={realtime_end}"
+            f"&include_release_dates_with_no_data=true"
+        )
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                failed_releases.append(f"{release_id}:{resp.status_code}")
+                continue
+            data = resp.json()
+            release_dates = data.get("release_dates", [])
+            for rd in release_dates:
+                date_str = rd.get("date")
+                if not date_str:
+                    continue
+                # FRED date adalah "YYYY-MM-DD" tanpa jam, default 12:30 UTC (kira-kira US data release time 8:30 ET)
+                normalized.append({
+                    "event": event_name,
+                    "country": "US",
+                    "date": f"{date_str}T12:30:00Z",
+                    "impact": impact,
+                    "currency": currency,
+                    "forecast": None,
+                    "previous": None,
+                    "actual": None,
+                    "_provider": "fred",
+                    "_release_id": release_id,
+                })
+        except Exception as exc:
+            failed_releases.append(f"{release_id}:{type(exc).__name__}")
+            continue
+
+    if not normalized and failed_releases:
+        raise ValueError(f"fred_all_releases_failed: {failed_releases[:5]}")
+    return normalized
+# === MONTRA: NEWS_PROVIDER_FRED END ===
+
+
 def _load_economic_calendar_manual_fallback():
     path = NEWS_MANUAL_FALLBACK_PATH
     try:
@@ -2947,13 +3076,23 @@ def refresh_institutional_news_cache(force=False):
         fetch_error = None
         provider_errors = {}
 
-        provider_order = [NEWS_ENGINE_PROVIDER, "tradingeconomics", "manual"]
-        seen = set()
-        provider_chain = []
-        for p in provider_order:
-            if p not in seen:
-                provider_chain.append(p)
-                seen.add(p)
+        # === MONTRA: NEWS_PROVIDER_CHAIN_AUTO START ===
+        # Mode auto: ForexFactory → FRED → FMP → tradingeconomics → manual
+        # Mode lain (fmp, forexfactory, fred): pakai single provider lalu fallback ke manual
+        provider_mode = NEWS_ENGINE_PROVIDER
+        if provider_mode == "auto":
+            provider_chain = ["forexfactory", "fred", "fmp", "tradingeconomics", "manual"]
+        elif provider_mode in ("forexfactory", "fred", "fmp"):
+            provider_chain = [provider_mode, "manual"]
+        else:
+            provider_order = [NEWS_ENGINE_PROVIDER, "tradingeconomics", "manual"]
+            seen = set()
+            provider_chain = []
+            for p in provider_order:
+                if p not in seen:
+                    provider_chain.append(p)
+                    seen.add(p)
+        # === MONTRA: NEWS_PROVIDER_CHAIN_AUTO END ===
 
         for provider in provider_chain:
             try:
@@ -2961,6 +3100,17 @@ def refresh_institutional_news_cache(force=False):
                     raw_events = _fetch_economic_calendar_fmp(api_key=FMP_API_KEY)
                     used_source = "fmp"
                     break
+                elif provider == "forexfactory":
+                    raw_events = _fetch_economic_calendar_forexfactory()
+                    used_source = "forexfactory"
+                    if raw_events:
+                        break
+                elif provider == "fred":
+                    fred_key = os.getenv("FRED_API_KEY", "").strip()
+                    raw_events = _fetch_economic_calendar_fred(api_key=fred_key)
+                    used_source = "fred"
+                    if raw_events:
+                        break
                 elif provider == "tradingeconomics":
                     raw_events = _fetch_economic_calendar_tradingeconomics()
                     used_source = "tradingeconomics"
