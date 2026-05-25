@@ -653,15 +653,24 @@ def _ai_validate_signal_auto(signal: dict) -> dict:
     pair_regime = signal.get("pair_regime") or "UNKNOWN"
 
     prompt = (
-        "You are an institutional trade reviewer. Detect trap patterns.\n"
+        "You are a senior risk reviewer giving a final sign-off on a trade.\n"
+        "IMPORTANT CONTEXT: this signal has ALREADY passed strict mechanical "
+        "filters — minimum score 87, risk/reward >= 3.0, confirmed liquidity "
+        "sweep, valid market structure, 4H regime alignment, and a 4-detector "
+        "anti-trap engine. Most signals that reach you are STRUCTURALLY VALID. "
+        "Your job is NOT to find reasons to reject. Default to TRADE. Only "
+        "return NO TRADE when there is a CLEAR, STRONG, SPECIFIC red flag that "
+        "the mechanical filters could have missed (e.g. obvious counter-trend "
+        "entry into strong momentum, or anti-trap context already flagging a "
+        "problem). A merely average setup is still a TRADE.\n\n"
         f"Signal: {side} {symbol} @ {price} | score={score} | RR={rr}\n"
         f"4H regime={regime_4h} | pair_regime={pair_regime}\n"
         f"Anti-trap context: eqhl={eqhl_reason} | wick={wick_reason} | "
         f"session_mod={session_mod} | cluster_bonus={cluster_bonus}\n"
-        "Common traps: EQH/EQL retail breakout chase, wick-against-signal "
-        "without BOS confirmation, session-liquidity misalignment, "
-        "late-cycle continuation in exhausted regime, signal scored high "
-        "but structure is retail-trap.\n"
+        "(eqhl/wick = OK means that detector found no problem.)\n\n"
+        "Confidence = how certain you are in YOUR decision (not how risky the "
+        "trade is). Use the full 0-100 range honestly. A clean setup with no "
+        "red flag is TRADE with HIGH confidence, not NO TRADE.\n"
         "Respond in EXACTLY this format (no extra text, no markdown):\n"
         "DECISION: TRADE or NO TRADE\n"
         "Confidence: <0-100>%\n"
@@ -739,6 +748,15 @@ def _ai_validate_signal_auto(signal: dict) -> dict:
         "reason": reason,
         "cached": False,
     }
+
+    # Log EVERY decision (allow + block) in one greppable line so observation
+    # data is complete. grep "AI_AUTOPATH_DECISION" montra.log captures both
+    # sides — block-only logging in the gate hid all the allows.
+    print(
+        f"📋 AI_AUTOPATH_DECISION {symbol} {side} score={score} "
+        f"allow={allow} conf={confidence} reason={reason} src={source}",
+        flush=True,
+    )
 
     with _AI_AUTOPATH_CACHE_LOCK:
         _AI_AUTOPATH_CACHE[cache_key] = (now_ts, dict(decision))
