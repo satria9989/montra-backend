@@ -752,8 +752,9 @@ def _ai_validate_signal_auto(signal: dict) -> dict:
     # Log EVERY decision (allow + block) in one greppable line so observation
     # data is complete. grep "AI_AUTOPATH_DECISION" montra.log captures both
     # sides — block-only logging in the gate hid all the allows.
+    _ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     print(
-        f"📋 AI_AUTOPATH_DECISION {symbol} {side} score={score} "
+        f"📋 AI_AUTOPATH_DECISION [{_ts_utc} UTC] {symbol} {side} score={score} "
         f"allow={allow} conf={confidence} reason={reason} src={source}",
         flush=True,
     )
