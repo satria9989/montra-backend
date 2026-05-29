@@ -308,6 +308,11 @@ SMART_OB_LOOKBACK = int(os.getenv("SMART_OB_LOOKBACK", "14"))
 SMART_OB_EXCLUDE_RECENT_CANDLES = int(os.getenv("SMART_OB_EXCLUDE_RECENT_CANDLES", "1"))
 SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
 SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
+# Hard minimum SL distance as fraction of entry. 0.0 = disabled (structural SL only).
+# Stop-hunt analysis (25-29 May) showed structural SL ~0.4-0.7% from entry gets
+# swept by normal retrace before price runs to TP. Set e.g. 0.015 to floor SL at
+# 1.5% from entry, pushing it beyond the typical hunt zone. Widens TP too (RR kept).
+SMART_SL_MIN_DISTANCE_PCT = float(os.getenv("SMART_SL_MIN_DISTANCE_PCT", "0.0"))
 SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
 SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
 
@@ -2018,6 +2023,23 @@ def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_ta
             sl = recent_high + sl_buffer
         risk = sl - entry
         tp_rr = entry - (risk * rr_target)
+
+    # Minimum SL distance floor (widen-only). If structural SL sits closer than
+    # SMART_SL_MIN_DISTANCE_PCT, push it out and recompute risk + TP (RR preserved).
+    if SMART_SL_MIN_DISTANCE_PCT > 0:
+        min_sl_dist = abs(entry) * SMART_SL_MIN_DISTANCE_PCT
+        if side == "BUY":
+            floored_sl = entry - min_sl_dist
+            if floored_sl < sl:          # further from entry → use floor
+                sl = floored_sl
+                risk = entry - sl
+                tp_rr = entry + (risk * rr_target)
+        else:
+            floored_sl = entry + min_sl_dist
+            if floored_sl > sl:          # further from entry → use floor
+                sl = floored_sl
+                risk = sl - entry
+                tp_rr = entry - (risk * rr_target)
 
     if risk <= 0:
         return {"ok": False, "reason": "INVALID_RISK_DISTANCE", "side": side, "entry": entry, "sl": sl, "ob": ob, "atr": atr}
