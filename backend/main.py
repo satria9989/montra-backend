@@ -13,6 +13,8 @@ load_dotenv()
 # ===== CONFIG & ENV CHECK =====
 from config import *
 
+print("🔥 FIREBASE_URL:", os.getenv("FIREBASE_URL"))
+
 # 🔒 SAFE STARTUP CHECK
 if not BINANCE_API_KEY or not BINANCE_SECRET:
     print("⚠️ BINANCE API NOT SET → trading client disabled")
@@ -308,11 +310,6 @@ SMART_OB_LOOKBACK = int(os.getenv("SMART_OB_LOOKBACK", "14"))
 SMART_OB_EXCLUDE_RECENT_CANDLES = int(os.getenv("SMART_OB_EXCLUDE_RECENT_CANDLES", "1"))
 SMART_SL_ATR_PERIOD = int(os.getenv("SMART_SL_ATR_PERIOD", "14"))
 SMART_SL_ATR_BUFFER_MULT = float(os.getenv("SMART_SL_ATR_BUFFER_MULT", "0.22"))
-# Hard minimum SL distance as fraction of entry. 0.0 = disabled (structural SL only).
-# Stop-hunt analysis (25-29 May) showed structural SL ~0.4-0.7% from entry gets
-# swept by normal retrace before price runs to TP. Set e.g. 0.015 to floor SL at
-# 1.5% from entry, pushing it beyond the typical hunt zone. Widens TP too (RR kept).
-SMART_SL_MIN_DISTANCE_PCT = float(os.getenv("SMART_SL_MIN_DISTANCE_PCT", "0.0"))
 SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
 SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
 
@@ -350,9 +347,9 @@ USE_DEFAULT_MIN_NOTIONAL_FOR_ALL = os.getenv("USE_DEFAULT_MIN_NOTIONAL_FOR_ALL",
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
-TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
-MID_PAIRS = globals().get("MID_PAIRS", ["LINKUSDT", "AVAXUSDT", "NEARUSDT", "ARBUSDT", "AAVEUSDT", "ADAUSDT", "LTCUSDT", "TRXUSDT", "TONUSDT", "WLDUSDT"])
-MID_AGGRESSIVE_PAIRS = globals().get("MID_AGGRESSIVE_PAIRS", ["HYPEUSDT", "SUIUSDT", "WIFUSDT", "1000PEPEUSDT"])
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["LINKUSDT", "AVAXUSDT", "NEARUSDT", "AAVEUSDT", "ADAUSDT", "TRXUSDT"])
+MID_AGGRESSIVE_PAIRS = globals().get("MID_AGGRESSIVE_PAIRS", ["HYPEUSDT", "SUIUSDT", "TONUSDT"])
 VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
 REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
 
@@ -474,37 +471,6 @@ AI_VALIDATOR_STATS = {
     "total_calls": 0,
 }
 
-# === MONTRA: AI_AUTOPATH_CONFIG START ===
-# Auto-path AI validator config: enables AI validator inside should_execute_trade()
-# as last qualitative judgment before risk slot reservation. Default mode = shadow
-# (log decisions, do not block) — promote to "enforce" only after observation period.
-AI_VALIDATOR_AUTOPATH_ENABLED = os.getenv("AI_VALIDATOR_AUTOPATH_ENABLED", "1") == "1"
-AI_VALIDATOR_AUTOPATH_MODE = os.getenv("AI_VALIDATOR_AUTOPATH_MODE", "shadow").lower()
-AI_VALIDATOR_AUTOPATH_MIN_CONFIDENCE = int(os.getenv("AI_VALIDATOR_AUTOPATH_MIN_CONFIDENCE", "70"))
-AI_VALIDATOR_AUTOPATH_CACHE_TTL = int(os.getenv("AI_VALIDATOR_AUTOPATH_CACHE_TTL", "60"))
-
-# Separate stats namespace from manual-endpoint AI_VALIDATOR_STATS so observability
-# of hot-path AI gate doesn't pollute the manual dashboard calls counter.
-AI_VALIDATOR_AUTOPATH_STATS = {
-    "total_calls": 0,
-    "cache_hit": 0,
-    "shadow_block": 0,
-    "shadow_allow": 0,
-    "enforce_block": 0,
-    "enforce_allow": 0,
-    "parse_fail": 0,
-    "api_fail": 0,
-    "disabled_skip": 0,
-}
-
-# Cache keyed by f"{symbol}:{side}:{score_bucket}" with bucket = score // 5 * 5.
-# Same-symbol/same-side signals within 60s usually share a near-identical context;
-# bucketing the score lets re-scans in a cycle reuse the AI verdict instead of
-# burning rate-limit quota. Lock guards against the (rare) concurrent eval case.
-_AI_AUTOPATH_CACHE = {}
-_AI_AUTOPATH_CACHE_LOCK = threading.Lock()
-# === MONTRA: AI_AUTOPATH_CONFIG END ===
-
 def _call_groq_validator(prompt: str) -> str:
     """Call Groq Llama 3.1 8B Instant for trade validation. Returns response text or raises exception."""
     if groq_client is None:
@@ -579,196 +545,6 @@ def ai_validate_trade(prompt: str) -> dict:
                 "error": f"groq:{groq_err_msg} | openai:{openai_err_msg}",
             }
 # === MONTRA: AI_VALIDATOR_DUAL END ===
-
-# === MONTRA: AI_AUTOPATH_HELPER START ===
-def _ai_validate_signal_auto(signal: dict) -> dict:
-    """
-    Hot-path AI validator. Called inside should_execute_trade() AFTER the
-    anti-trap hook and BEFORE risk slot reservation. Asks the AI dual-stack
-    (Groq primary, OpenAI fallback) to spot trap patterns the mechanical
-    detectors might miss (late-cycle continuation, retail breakout chase,
-    session-misaligned targets, weak structural BOS).
-
-    Fail-open semantics by design — on API failure, parse failure, or low
-    confidence we ALLOW. Hard NO TRADE only when AI returns NO TRADE with
-    confidence >= AI_VALIDATOR_AUTOPATH_MIN_CONFIDENCE. This keeps infra
-    issues from blocking valid trades; it is the qualitative final filter,
-    not a primary gate.
-
-    Returns:
-        {
-            "allow": bool,
-            "confidence": int (0-100),
-            "raw": str (truncated),
-            "source": "groq" | "openai" | "error" | "cache" | "disabled",
-            "reason": short code,
-            "cached": bool,
-        }
-    """
-    if not AI_VALIDATOR_AUTOPATH_ENABLED:
-        AI_VALIDATOR_AUTOPATH_STATS["disabled_skip"] += 1
-        return {
-            "allow": True, "confidence": 0, "raw": "",
-            "source": "disabled", "reason": "AUTOPATH_DISABLED", "cached": False,
-        }
-
-    AI_VALIDATOR_AUTOPATH_STATS["total_calls"] += 1
-
-    symbol = signal.get("symbol", "?")
-    side = signal.get("type") or signal.get("side", "?")
-    try:
-        score = float(signal.get("score", 0) or 0)
-    except Exception:
-        score = 0.0
-    # Bucket score by 5 so micro-fluctuations don't bust the cache key.
-    score_bucket = int(score // 5) * 5
-    cache_key = f"{symbol}:{side}:{score_bucket}"
-
-    now_ts = time.time()
-
-    # --- Cache lookup ---
-    with _AI_AUTOPATH_CACHE_LOCK:
-        cached = _AI_AUTOPATH_CACHE.get(cache_key)
-        if cached:
-            ts, decision = cached
-            if (now_ts - ts) <= AI_VALIDATOR_AUTOPATH_CACHE_TTL:
-                AI_VALIDATOR_AUTOPATH_STATS["cache_hit"] += 1
-                out = dict(decision)
-                out["cached"] = True
-                return out
-            else:
-                # expired — drop and continue to live call
-                _AI_AUTOPATH_CACHE.pop(cache_key, None)
-
-    # --- Build trap-focused prompt with anti-trap context inline ---
-    anti_trap = signal.get("anti_trap") or {}
-    eqhl_info = anti_trap.get("eqhl") or {}
-    wick_info = anti_trap.get("wick") or {}
-    session_info = anti_trap.get("session") or {}
-    cluster_info = anti_trap.get("cluster") or {}
-
-    eqhl_reason = eqhl_info.get("reason", "OK")
-    wick_reason = wick_info.get("reason", "OK")
-    session_mod = session_info.get("score_modifier", 0)
-    cluster_bonus = cluster_info.get("bonus", 0)
-
-    price = signal.get("price") or signal.get("entry") or 0
-    rr = signal.get("rr") or signal.get("risk_reward") or 0
-    regime_4h = signal.get("regime_4h") or signal.get("regime") or "UNKNOWN"
-    pair_regime = signal.get("pair_regime") or "UNKNOWN"
-
-    prompt = (
-        "You are a senior risk reviewer giving a final sign-off on a trade.\n"
-        "IMPORTANT CONTEXT: this signal has ALREADY passed strict mechanical "
-        "filters — minimum score 87, risk/reward >= 3.0, confirmed liquidity "
-        "sweep, valid market structure, 4H regime alignment, and a 4-detector "
-        "anti-trap engine. Most signals that reach you are STRUCTURALLY VALID. "
-        "Your job is NOT to find reasons to reject. Default to TRADE. Only "
-        "return NO TRADE when there is a CLEAR, STRONG, SPECIFIC red flag that "
-        "the mechanical filters could have missed (e.g. obvious counter-trend "
-        "entry into strong momentum, or anti-trap context already flagging a "
-        "problem). A merely average setup is still a TRADE.\n\n"
-        f"Signal: {side} {symbol} @ {price} | score={score} | RR={rr}\n"
-        f"4H regime={regime_4h} | pair_regime={pair_regime}\n"
-        f"Anti-trap context: eqhl={eqhl_reason} | wick={wick_reason} | "
-        f"session_mod={session_mod} | cluster_bonus={cluster_bonus}\n"
-        "(eqhl/wick = OK means that detector found no problem.)\n\n"
-        "Confidence = how certain you are in YOUR decision (not how risky the "
-        "trade is). Use the full 0-100 range honestly. A clean setup with no "
-        "red flag is TRADE with HIGH confidence, not NO TRADE.\n"
-        "Respond in EXACTLY this format (no extra text, no markdown):\n"
-        "DECISION: TRADE or NO TRADE\n"
-        "Confidence: <0-100>%\n"
-        "Reason: <short>"
-    )
-
-    # --- Call AI dual stack ---
-    try:
-        res = ai_validate_trade(prompt)
-    except Exception as e:
-        AI_VALIDATOR_AUTOPATH_STATS["api_fail"] += 1
-        decision = {
-            "allow": True, "confidence": 0, "raw": "",
-            "source": "error", "reason": f"API_EXC_{str(e)[:40]}",
-            "cached": False,
-        }
-        with _AI_AUTOPATH_CACHE_LOCK:
-            _AI_AUTOPATH_CACHE[cache_key] = (now_ts, dict(decision))
-        return decision
-
-    raw = (res.get("result") or "").strip()
-    source = res.get("source", "error")
-
-    if source == "error" or not raw:
-        AI_VALIDATOR_AUTOPATH_STATS["api_fail"] += 1
-        decision = {
-            "allow": True, "confidence": 0, "raw": raw[:200],
-            "source": source, "reason": "API_FAIL_ALLOW", "cached": False,
-        }
-        with _AI_AUTOPATH_CACHE_LOCK:
-            _AI_AUTOPATH_CACHE[cache_key] = (now_ts, dict(decision))
-        return decision
-
-    # --- Parse decision + confidence ---
-    raw_upper = raw.upper()
-    is_no_trade = ("NO TRADE" in raw_upper) or ("NO-TRADE" in raw_upper) or ("NOTRADE" in raw_upper)
-
-    confidence = 0
-    try:
-        import re as _re_local
-        m = _re_local.search(r"CONFIDENCE\s*[:=]\s*(\d{1,3})", raw_upper)
-        if m:
-            confidence = max(0, min(100, int(m.group(1))))
-        else:
-            m2 = _re_local.search(r"(\d{1,3})\s*%", raw_upper)
-            if m2:
-                confidence = max(0, min(100, int(m2.group(1))))
-    except Exception:
-        confidence = 0
-
-    # Decision rule:
-    #   NO TRADE + confidence >= threshold  → BLOCK
-    #   NO TRADE + low confidence           → ALLOW (avoid hallucinated block)
-    #   NO TRADE + unparseable confidence   → ALLOW (parse_fail counter)
-    #   TRADE / anything else               → ALLOW
-    if is_no_trade and confidence >= AI_VALIDATOR_AUTOPATH_MIN_CONFIDENCE:
-        allow = False
-        reason = f"AI_NO_TRADE_C{confidence}"
-    elif is_no_trade and confidence > 0:
-        allow = True
-        reason = f"AI_NO_TRADE_LOW_CONF_C{confidence}"
-    elif is_no_trade and confidence == 0:
-        AI_VALIDATOR_AUTOPATH_STATS["parse_fail"] += 1
-        allow = True
-        reason = "AI_PARSE_FAIL_ALLOW"
-    else:
-        allow = True
-        reason = f"AI_OK_C{confidence}"
-
-    decision = {
-        "allow": allow,
-        "confidence": confidence,
-        "raw": raw[:200],
-        "source": source,
-        "reason": reason,
-        "cached": False,
-    }
-
-    # Log EVERY decision (allow + block) in one greppable line so observation
-    # data is complete. grep "AI_AUTOPATH_DECISION" montra.log captures both
-    # sides — block-only logging in the gate hid all the allows.
-    _ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    print(
-        f"📋 AI_AUTOPATH_DECISION [{_ts_utc} UTC] {symbol} {side} score={score} "
-        f"allow={allow} conf={confidence} reason={reason} src={source}",
-        flush=True,
-    )
-
-    with _AI_AUTOPATH_CACHE_LOCK:
-        _AI_AUTOPATH_CACHE[cache_key] = (now_ts, dict(decision))
-
-    return decision
-# === MONTRA: AI_AUTOPATH_HELPER END ===
 
 BINANCE_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "10000"))
 BINANCE_TIME_SYNC_INTERVAL = int(os.getenv("BINANCE_TIME_SYNC_INTERVAL", "900"))
@@ -1356,11 +1132,10 @@ TELEGRAM_ALERT_STATE = {
     },
 }
 
-# ===== AI MEMORY (Firebase deprecated — no-op stack) =====
+# ===== AI MEMORY & FIREBASE =====
 
-# Firebase removed from active stack. Variable retained as None for legacy
-# call sites; firebase_ready() forced False below. No env read, no print.
-FIREBASE_URL = None
+FIREBASE_URL = os.getenv("FIREBASE_URL")
+print("🔥 FIREBASE_URL:", FIREBASE_URL)
 
 # === RL WEIGHTS ===
 rl_weights = {
@@ -1546,9 +1321,7 @@ def clean_url(url):
     return url.rstrip("/")
 
 def firebase_ready():
-    # Firebase deprecated from active stack — always False (no-op silent).
-    # Call sites preserved across codebase; this function is the canonical gate.
-    return False
+    return bool(FIREBASE_URL and FIREBASE_URL.startswith("http"))
     
 def get_session_utc():
     h = time.gmtime().tm_hour
@@ -2023,23 +1796,6 @@ def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_ta
             sl = recent_high + sl_buffer
         risk = sl - entry
         tp_rr = entry - (risk * rr_target)
-
-    # Minimum SL distance floor (widen-only). If structural SL sits closer than
-    # SMART_SL_MIN_DISTANCE_PCT, push it out and recompute risk + TP (RR preserved).
-    if SMART_SL_MIN_DISTANCE_PCT > 0:
-        min_sl_dist = abs(entry) * SMART_SL_MIN_DISTANCE_PCT
-        if side == "BUY":
-            floored_sl = entry - min_sl_dist
-            if floored_sl < sl:          # further from entry → use floor
-                sl = floored_sl
-                risk = entry - sl
-                tp_rr = entry + (risk * rr_target)
-        else:
-            floored_sl = entry + min_sl_dist
-            if floored_sl > sl:          # further from entry → use floor
-                sl = floored_sl
-                risk = sl - entry
-                tp_rr = entry - (risk * rr_target)
 
     if risk <= 0:
         return {"ok": False, "reason": "INVALID_RISK_DISTANCE", "side": side, "entry": entry, "sl": sl, "ob": ob, "atr": atr}
@@ -3539,26 +3295,58 @@ def get_institutional_news_state(symbol="_SYSTEM_", now_ts=None):
 
 
 def save_ai_memory():
-    # No-op silent: Firebase deprecated. Signature preserved for legacy call sites.
-    return
+    if not firebase_ready():
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}/ai_memory.json", json=ai_memory, timeout=5)
+        print("💾 AI memory saved")
+    except Exception as e:
+        print("Save error:", e)
 
 def save_portfolio():
-    # No-op silent: Firebase deprecated. Signature preserved for legacy call sites.
-    return
+    if not firebase_ready():
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}/portfolio.json", json=portfolio_alloc, timeout=5)
+    except Exception as e:
+        print("Save portfolio error:", e)
 
 def load_ai_memory():
-    # No-op silent: Firebase deprecated. ai_memory retains in-memory default
-    # initialized elsewhere in module. Signature preserved for legacy call sites.
-    return
+    global ai_memory
+    if not firebase_ready():
+        print("⚠️ Firebase invalid → fallback mode")
+        return
+    try:
+        res = requests.get(f"{FIREBASE_URL}/ai_memory.json", timeout=5)
+        data = res.json()
+        if data:
+            ai_memory = data
+            print("🧠 AI memory loaded")
+    except Exception as e:
+        print("Load error:", e)
 
 def save_rl_weights():
-    # No-op silent: Firebase deprecated. Signature preserved for legacy call sites.
-    return
+    if not firebase_ready():
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}/rl_weights.json", json=rl_weights, timeout=5)
+        print("⚖️ RL weights saved")
+    except Exception as e:
+        print("Save RL weights error:", e)
 
 def load_rl_weights():
-    # No-op silent: Firebase deprecated. rl_weights retains in-memory default
-    # initialized elsewhere in module. Signature preserved for legacy call sites.
-    return
+    global rl_weights
+    if not firebase_ready():
+        print("⚠️ Firebase invalid → fallback mode")
+        return
+    try:
+        res = requests.get(f"{FIREBASE_URL}/rl_weights.json", timeout=5)
+        data = res.json()
+        if data:
+            rl_weights = data
+            print("⚖️ RL weights loaded")
+    except Exception as e:
+        print("Load RL weights error:", e)
 
 def load_ml_model():
     global ML_MODEL
@@ -6544,48 +6332,6 @@ def should_execute_trade(signal):
                         return False, f"ANTI_TRAP_SCORE_BELOW_FLOOR_{int(adjusted_score)}"
     # === MONTRA: ANTI_TRAP_HOOK_SHOULD_EXECUTE END ===
 
-    # === MONTRA: AI_AUTOPATH_GATE START ===
-    # Last qualitative filter before risk slot reservation. Reads anti-trap
-    # context from signal["anti_trap"] populated above and asks AI to flag
-    # patterns the mechanical detectors might have permitted.
-    if AI_VALIDATOR_AUTOPATH_ENABLED:
-        try:
-            ai_dec = _ai_validate_signal_auto(signal)
-        except Exception as ai_exc:
-            # Defensive: any helper error → fail-open, log, do not block.
-            print(f"⚠️ AI_AUTOPATH helper error {symbol}: {ai_exc}")
-            ai_dec = {
-                "allow": True, "confidence": 0, "raw": "",
-                "source": "error", "reason": f"HELPER_EXC_{str(ai_exc)[:40]}",
-                "cached": False,
-            }
-        signal["ai_autopath"] = ai_dec
-
-        ap_mode = AI_VALIDATOR_AUTOPATH_MODE
-        if not ai_dec.get("allow", True):
-            if ap_mode == "enforce":
-                AI_VALIDATOR_AUTOPATH_STATS["enforce_block"] += 1
-                print(
-                    f"🚫 AI_AUTOPATH ENFORCE BLOCK {symbol} {signal.get('type')} "
-                    f"reason={ai_dec.get('reason')} conf={ai_dec.get('confidence')} "
-                    f"src={ai_dec.get('source')} cached={ai_dec.get('cached')}"
-                )
-                return False, f"AI_AUTOPATH_BLOCK_C{ai_dec.get('confidence', 0)}"
-            else:
-                # shadow mode: log only, do not block
-                AI_VALIDATOR_AUTOPATH_STATS["shadow_block"] += 1
-                print(
-                    f"🔍 AI_AUTOPATH SHADOW BLOCK {symbol} {signal.get('type')} "
-                    f"reason={ai_dec.get('reason')} conf={ai_dec.get('confidence')} "
-                    f"src={ai_dec.get('source')} cached={ai_dec.get('cached')}"
-                )
-        else:
-            if ap_mode == "enforce":
-                AI_VALIDATOR_AUTOPATH_STATS["enforce_allow"] += 1
-            else:
-                AI_VALIDATOR_AUTOPATH_STATS["shadow_allow"] += 1
-    # === MONTRA: AI_AUTOPATH_GATE END ===
-
     slot_ok, slot_reason, slot_detail = can_open_new_trade(symbol, force=True)
     signal["risk_slots"] = slot_detail
     if not slot_ok:
@@ -7627,60 +7373,6 @@ def debug_ai_validator():
         "estimated_openai_cost_usd": round(openai_used * 0.00015, 6),
     }
 # === MONTRA: AI_VALIDATOR_DEBUG_ENDPOINT END ===
-
-
-# === MONTRA: AI_AUTOPATH_DEBUG_ENDPOINT START ===
-@app.get("/debug/ai_autopath")
-def debug_ai_autopath():
-    stats = dict(AI_VALIDATOR_AUTOPATH_STATS)
-    total = stats.get("total_calls", 0) or 0
-    cache_hits = stats.get("cache_hit", 0) or 0
-    shadow_blocks = stats.get("shadow_block", 0) or 0
-    enforce_blocks = stats.get("enforce_block", 0) or 0
-    shadow_allows = stats.get("shadow_allow", 0) or 0
-    enforce_allows = stats.get("enforce_allow", 0) or 0
-
-    block_total = shadow_blocks + enforce_blocks
-    allow_total = shadow_allows + enforce_allows
-    decided_total = block_total + allow_total
-
-    now_ts = time.time()
-    with _AI_AUTOPATH_CACHE_LOCK:
-        cache_snapshot = []
-        items = list(_AI_AUTOPATH_CACHE.items())[:50]
-        for k, (ts, dec) in items:
-            age = round(now_ts - ts, 1)
-            cache_snapshot.append({
-                "key": k,
-                "age_s": age,
-                "expired": age > AI_VALIDATOR_AUTOPATH_CACHE_TTL,
-                "allow": dec.get("allow"),
-                "confidence": dec.get("confidence"),
-                "reason": dec.get("reason"),
-                "source": dec.get("source"),
-            })
-        cache_total = len(_AI_AUTOPATH_CACHE)
-
-    return {
-        "enabled": AI_VALIDATOR_AUTOPATH_ENABLED,
-        "mode": AI_VALIDATOR_AUTOPATH_MODE,
-        "min_confidence": AI_VALIDATOR_AUTOPATH_MIN_CONFIDENCE,
-        "cache_ttl_s": AI_VALIDATOR_AUTOPATH_CACHE_TTL,
-        "stats": stats,
-        "cache_hit_rate": round(cache_hits / total, 3) if total else 0.0,
-        "block_rate": round(block_total / decided_total, 3) if decided_total else 0.0,
-        "cache_size": cache_total,
-        "cache_sample": cache_snapshot,
-    }
-
-
-@app.post("/debug/ai_autopath/clear_cache")
-def debug_ai_autopath_clear_cache():
-    with _AI_AUTOPATH_CACHE_LOCK:
-        size = len(_AI_AUTOPATH_CACHE)
-        _AI_AUTOPATH_CACHE.clear()
-    return {"cleared": size, "ts": time.time()}
-# === MONTRA: AI_AUTOPATH_DEBUG_ENDPOINT END ===
 
 
 # === MONTRA: ANTI_TRAP_DEBUG_ENDPOINTS START ===
