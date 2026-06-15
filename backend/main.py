@@ -347,9 +347,9 @@ USE_DEFAULT_MIN_NOTIONAL_FOR_ALL = os.getenv("USE_DEFAULT_MIN_NOTIONAL_FOR_ALL",
 # ===== PAIR PRIORITY ENGINE =====
 # Tier sekarang diambil dari config.py agar universe scan dan tiering tidak saling
 # bertentangan. Kalau config lama belum punya variabel ini, fallback lama tetap aman.
-TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"])
-MID_PAIRS = globals().get("MID_PAIRS", ["LINKUSDT", "AVAXUSDT", "NEARUSDT", "AAVEUSDT", "ADAUSDT", "TRXUSDT"])
-MID_AGGRESSIVE_PAIRS = globals().get("MID_AGGRESSIVE_PAIRS", ["HYPEUSDT", "SUIUSDT", "TONUSDT"])
+TOP_PAIRS = globals().get("TOP_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+MID_PAIRS = globals().get("MID_PAIRS", ["LINKUSDT", "NEARUSDT", "AVAXUSDT", "LTCUSDT"])
+MID_AGGRESSIVE_PAIRS = globals().get("MID_AGGRESSIVE_PAIRS", ["HYPEUSDT", "SUIUSDT", "1000PEPEUSDT"])
 VALIDATION_ONLY = globals().get("VALIDATION_ONLY", [])
 REMOVE_FROM_CORE = globals().get("REMOVE_FROM_CORE", [])
 
