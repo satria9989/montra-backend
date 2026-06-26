@@ -2081,8 +2081,9 @@ def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_ta
         # Breadcrumb: tells us empirically whether the floor or the structural+ATR
         # distance is the binding constraint for this trade/tier — needed to know
         # whether tiering ATR_BUFFER_MULT is even visible without guessing.
+        _sl_ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         print(
-            f"📐 SL_CALC {symbol} {side} tier={get_pair_tier(symbol)} "
+            f"📐 SL_CALC [{_sl_ts_utc} UTC] {symbol} {side} tier={get_pair_tier(symbol)} "
             f"structural_pct={round(structural_dist_pct * 100, 3)}% "
             f"floor_applied={floor_applied} final_sl_pct={round(abs(entry - sl) / max(abs(entry), 1e-12) * 100, 3)}%",
             flush=True,
