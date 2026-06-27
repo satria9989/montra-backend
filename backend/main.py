@@ -345,6 +345,42 @@ def get_atr_buffer_mult(symbol):
 # treat any past performance claims tied to "the floor" as unconfirmed until
 # re-observed with this code genuinely live.
 SMART_SL_MIN_DISTANCE_PCT = float(os.getenv("SMART_SL_MIN_DISTANCE_PCT", "0.0"))
+
+# Hard MAXIMUM SL distance as fraction of entry — SKIP gate (not clamp).
+# If structural SL distance exceeds the cap, build_precision_trade_plan()
+# returns ok=False with reason SL_TOO_WIDE and the signal is not executed.
+# Rationale (Jun 2026 breadcrumb data): NEAR 7.3% and 1000PEPE 9.3% structural
+# SL produced TP targets so far (~22-32% from entry) they were never reached —
+# both resulted in BE after occupying a slot for 13+ hours. Skip is safer than
+# clamping because a clamped SL has no structural basis and will be hunted.
+# Per-pair override: SMART_SL_MAX_DISTANCE_PCT_<SYMBOL>=0.025
+# 0.0 = disabled (no maximum cap applied).
+SMART_SL_MAX_DISTANCE_PCT_TOP = float(os.getenv("SMART_SL_MAX_DISTANCE_PCT_TOP", "0.0"))
+SMART_SL_MAX_DISTANCE_PCT_MID = float(os.getenv("SMART_SL_MAX_DISTANCE_PCT_MID", "0.0"))
+SMART_SL_MAX_DISTANCE_PCT_MID_AGGRESSIVE = float(os.getenv("SMART_SL_MAX_DISTANCE_PCT_MID_AGGRESSIVE", "0.0"))
+
+def get_sl_max_distance_pct(symbol):
+    """Hybrid: check per-pair override first, then tier default.
+    Mirrors SPREAD_THRESHOLD_* pattern — tier default as fallback,
+    per-pair override only for outliers (e.g. 1000PEPE, NEAR).
+    Returns 0.0 if both are unset (disabled)."""
+    # Per-pair env override: SMART_SL_MAX_DISTANCE_PCT_BTCUSDT etc.
+    per_pair_key = f"SMART_SL_MAX_DISTANCE_PCT_{symbol.upper()}"
+    per_pair_val = os.getenv(per_pair_key)
+    if per_pair_val is not None:
+        try:
+            return float(per_pair_val)
+        except ValueError:
+            pass
+    # Tier default
+    tier = get_pair_tier(symbol)
+    if tier == "TOP":
+        return SMART_SL_MAX_DISTANCE_PCT_TOP
+    if tier == "MID":
+        return SMART_SL_MAX_DISTANCE_PCT_MID
+    if tier == "MID_AGGRESSIVE":
+        return SMART_SL_MAX_DISTANCE_PCT_MID_AGGRESSIVE
+    return 0.0
 # === MONTRA: SMART_SL_TIER_CONFIG END ===
 SMART_TP_USE_FVG_MAGNET = os.getenv("SMART_TP_USE_FVG_MAGNET", "true").lower() == "true"
 SMART_TP_FVG_MAX_RR_MULT = float(os.getenv("SMART_TP_FVG_MAX_RR_MULT", "1.35"))
@@ -2062,6 +2098,24 @@ def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_ta
     # SMART_SL_MIN_DISTANCE_PCT, push it out and recompute risk + TP (RR preserved).
     floor_applied = False
     structural_dist_pct = abs(entry - sl) / max(abs(entry), 1e-12)
+
+    # Maximum SL distance cap (SKIP gate). If structural SL is wider than the cap,
+    # reject this signal entirely — do NOT clamp (a clamped SL has no structural
+    # basis and will be hunted). Returns ok=False so the caller logs SL_TOO_WIDE.
+    sl_max_cap = get_sl_max_distance_pct(symbol)
+    if sl_max_cap > 0 and structural_dist_pct > sl_max_cap:
+        _cap_ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        print(
+            f"🚫 SL_TOO_WIDE [{_cap_ts_utc} UTC] {symbol} {side} tier={get_pair_tier(symbol)} "
+            f"structural_pct={round(structural_dist_pct * 100, 3)}% "
+            f"cap={round(sl_max_cap * 100, 3)}% → SKIP",
+            flush=True,
+        )
+        return {"ok": False, "reason": "SL_TOO_WIDE", "side": side, "entry": entry,
+                "sl": sl, "ob": ob, "atr": atr,
+                "structural_pct": round(structural_dist_pct * 100, 3),
+                "cap_pct": round(sl_max_cap * 100, 3)}
+
     if SMART_SL_MIN_DISTANCE_PCT > 0:
         min_sl_dist = abs(entry) * SMART_SL_MIN_DISTANCE_PCT
         if side == "BUY":
@@ -2078,16 +2132,19 @@ def build_precision_trade_plan(symbol, side, entry, ohlcv, structure=None, rr_ta
                 risk = sl - entry
                 tp_rr = entry - (risk * rr_target)
                 floor_applied = True
-        # Breadcrumb: tells us empirically whether the floor or the structural+ATR
-        # distance is the binding constraint for this trade/tier — needed to know
-        # whether tiering ATR_BUFFER_MULT is even visible without guessing.
-        _sl_ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        print(
-            f"📐 SL_CALC [{_sl_ts_utc} UTC] {symbol} {side} tier={get_pair_tier(symbol)} "
-            f"structural_pct={round(structural_dist_pct * 100, 3)}% "
-            f"floor_applied={floor_applied} final_sl_pct={round(abs(entry - sl) / max(abs(entry), 1e-12) * 100, 3)}%",
-            flush=True,
-        )
+
+    # Breadcrumb: tells us empirically whether the floor or the structural+ATR
+    # distance is the binding constraint for this trade/tier — needed to know
+    # whether tiering ATR_BUFFER_MULT is even visible without guessing.
+    # Also logs max cap for visibility (0.0 = disabled).
+    _sl_ts_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    print(
+        f"📐 SL_CALC [{_sl_ts_utc} UTC] {symbol} {side} tier={get_pair_tier(symbol)} "
+        f"structural_pct={round(structural_dist_pct * 100, 3)}% "
+        f"floor_applied={floor_applied} final_sl_pct={round(abs(entry - sl) / max(abs(entry), 1e-12) * 100, 3)}% "
+        f"cap={round(sl_max_cap * 100, 3) if sl_max_cap > 0 else 'off'}",
+        flush=True,
+    )
 
     if risk <= 0:
         return {"ok": False, "reason": "INVALID_RISK_DISTANCE", "side": side, "entry": entry, "sl": sl, "ob": ob, "atr": atr}
@@ -7736,7 +7793,15 @@ def debug_sl_tiering():
         "mid": SMART_SL_ATR_BUFFER_MULT_MID,
         "mid_aggressive": SMART_SL_ATR_BUFFER_MULT_MID_AGGRESSIVE,
         "min_distance_pct_floor": SMART_SL_MIN_DISTANCE_PCT,
-        "per_pair": {sym: get_atr_buffer_mult(sym) for sym in PAIRS},
+        "max_distance_pct_cap": {
+            "top_default": SMART_SL_MAX_DISTANCE_PCT_TOP,
+            "mid_default": SMART_SL_MAX_DISTANCE_PCT_MID,
+            "mid_aggressive_default": SMART_SL_MAX_DISTANCE_PCT_MID_AGGRESSIVE,
+        },
+        "per_pair": {sym: {
+            "atr_mult": get_atr_buffer_mult(sym),
+            "max_sl_cap": get_sl_max_distance_pct(sym),
+        } for sym in PAIRS},
     }
 # === MONTRA: AI_AUTOPATH_DEBUG_ENDPOINT END ===
 
